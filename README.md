@@ -59,7 +59,7 @@ Refer to the screenshot above.
 ### Toolbar (top)
 
 - **Exposure** — log2 stops, display-only. Doesn't affect what's written.
-- **Scene scale** — meters per DA-2 unit. DA-2 returns scale-invariant relative distance, so this is the user's only knob for "how big is this room actually." Default **100 m/u**; slider range `0.001 .. 1000`.
+- **Scene scale** — meters per depth unit. For DA² (scale-invariant) this is the primary "how big is this room actually" knob; for DAP (metric) it's a fine-tune multiplier. Switching the **Depth** dropdown snaps it to that backend's default (DA² → 100 m/u, DAP → 1.0). Slider range `0.001 .. 1000`.
 - **Yaw offset** — rolls the displayed panorama horizontally (in degrees). Use this to place lights that straddle the seam at u=0/u=W. Quad data stays in **absolute** spherical coords, so changing the offset doesn't move the lights — it only changes what's under the mouse. **Reset** zeroes it.
 - **Show depth** (hotkey **D**) — toggle the equirect view between HDR and a turbo-colormap of the DA-2 distance map. Quad outlines + handles render on top either way, so you can verify each quad sits on a region of consistent depth before baking. First press runs DA-2 in a background thread; subsequent toggles are instant.
 
@@ -68,6 +68,7 @@ Refer to the screenshot above.
 - **List** of all defined quads. Double-click to rename — input is sanitized to USD/Maya/Houdini-friendly identifiers (`spaces → _`, non-`[A-Za-z0-9_]` stripped, no leading digits).
 - **Add quad (click 4 corners)** — hotkey **A**. Enters add mode: cursor becomes a crosshair, four left-clicks place the four corners of a new quad. The 4 corners are auto-sorted CCW so click order doesn't matter. The newly-committed quad is selected and gets draggable vertex handles.
 - **Delete selected** — hotkey **Delete**.
+- **Window / portal** — per-quad checkbox. Normally the rect light is slid in from the quad corners' (wall) depth to the bright region's depth, so it sits on the actual light rather than the wall behind it. Tick this for windows / skylights, where the bright pixels are distant sky through the opening — the rect then stays on the wall plane (flush, portal-friendly).
 
 ### Output panel
 

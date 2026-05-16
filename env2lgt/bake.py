@@ -29,6 +29,9 @@ class QuadSpec:
 
     name: str
     corners_dirs: np.ndarray  # (4, 3) float64
+    # Window/portal: keep the rect at wall depth instead of sliding it in to
+    # the bright region (the "light" is distant sky through the opening).
+    is_window: bool = False
 
 
 @dataclass
@@ -110,7 +113,14 @@ def bake(
         _p(f"  fitting {q.name}", 0.20 + 0.4 * (i + 0.5) / max(1, len(quads)))
         # Geometry from quad corners + median mask depth. No RANSAC on noisy
         # per-pixel depth.
-        fit = rect_from_quad(q.corners_dirs, mask_full, distance, opts.scene_scale)
+        fit = rect_from_quad(
+            q.corners_dirs,
+            mask_full,
+            distance,
+            opts.scene_scale,
+            lum_full=lum_full,
+            treat_as_window=q.is_window,
+        )
 
         color = mean_color_masked(hdr, mask_full)
         power = total_emitted_power_masked(hdr, mask_full, (H, W))
@@ -207,6 +217,7 @@ def bake(
                     "quads": [
                         {
                             "name": q.name,
+                            "is_window": bool(q.is_window),
                             "corners_dirs": [
                                 [float(c) for c in row] for row in q.corners_dirs.tolist()
                             ],

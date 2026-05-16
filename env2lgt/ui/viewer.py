@@ -49,6 +49,8 @@ class LightQuad:
 
     name: str
     corners_dirs: np.ndarray = field(default_factory=lambda: np.zeros((4, 3)))
+    # Window/portal: bake keeps the rect at wall depth (see bake.QuadSpec).
+    is_window: bool = False
 
     @classmethod
     def from_pano_bbox(cls, name: str, x: int, y: int, w: int, h: int, W: int, H: int) -> "LightQuad":

@@ -380,11 +380,49 @@ def _depth_at_dir(distance: np.ndarray, corner_dir: np.ndarray, patch: int = 3) 
     return float(np.median(distance[np.ix_(vs, us)]))
 
 
+def _bright_region_depth(
+    mask_full: np.ndarray,
+    distance: np.ndarray,
+    lum_full: np.ndarray,
+    min_px: int = 16,
+) -> float | None:
+    """Median depth of the *bright* (light-emitting) pixels inside the quad.
+
+    The user draws the quad to engulf the light, so its corners sit on the
+    surrounding wall — sampling depth there places the rect on the wall
+    *behind* the light. The light itself is the bright sub-region of the
+    quad; an Otsu split of the in-mask log-luminance separates it from the
+    dim border. Returns the median distance over that bright region, or
+    None if it can't be isolated (caller falls back to the corner fit).
+    """
+    sel = mask_full > 0
+    n = int(sel.sum())
+    if n < min_px * 2:
+        return None
+    lum_sel = lum_full[sel].astype(np.float64)
+    dist_sel = distance[sel].astype(np.float64)
+    loglum = np.log(np.maximum(lum_sel, 1e-6))
+    lo, hi = float(loglum.min()), float(loglum.max())
+    if hi - lo < 1e-6:
+        return None  # uniform luminance — no light/wall split to make
+    u8 = ((loglum - lo) / (hi - lo) * 255.0).astype(np.uint8).reshape(-1, 1)
+    # Use cv2's own thresholded output, not the returned threshold value:
+    # for a degenerate 2-value histogram Otsu can report threshold 0, and a
+    # `>= 0` test would then select every pixel.
+    _, otsu = cv2.threshold(u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bright = (otsu.ravel() > 0) & np.isfinite(dist_sel) & (dist_sel > 1e-6)
+    if int(bright.sum()) < min_px:
+        return None
+    return float(np.median(dist_sel[bright]))
+
+
 def rect_from_quad(
     corners_dirs: np.ndarray,
     mask_full: np.ndarray,
     distance: np.ndarray,
     scene_scale: float = 1.0,
+    lum_full: np.ndarray | None = None,
+    treat_as_window: bool = False,
 ) -> RectFit:
     """Build a UsdLuxRectLight transform/size from the user's quad.
 
@@ -397,6 +435,14 @@ def rect_from_quad(
 
     This matches the depth-displaced validation mesh (env2lgt.usd.mesh): the
     rect light's plane now coincides with the mesh surface under it.
+
+    Light vs. wall depth: the corners land on the wall *around* the light,
+    so the corner fit sits at wall depth. When `lum_full` is given and the
+    quad isn't flagged `treat_as_window`, the rect is slid inward along the
+    view rays to the bright region's depth (the light itself), keeping the
+    corner-derived orientation. `treat_as_window=True` keeps the wall depth
+    — correct for windows/skylights, which are flush with the wall and where
+    the bright pixels are distant sky.
     """
     corners = np.asarray(corners_dirs, dtype=np.float64).reshape(4, 3)
     corners = corners / (np.linalg.norm(corners, axis=1, keepdims=True) + 1e-12)
@@ -443,6 +489,24 @@ def rect_from_quad(
         # Keep the (u, v, normal) frame right-handed after the flip.
         v_axis = -v_axis
 
+    # Slide the rect from wall depth to the light's depth (see docstring).
+    # The corner fit gives wall-depth geometry; the bright region gives the
+    # light's true distance. Same view rays → linear size scales with depth.
+    mean_depth = float(depths.mean())
+    if not treat_as_window and lum_full is not None:
+        d_light = _bright_region_depth(mask_full, distance, lum_full)
+        if d_light is not None:
+            d_light *= float(scene_scale)
+            d_wall = float(np.linalg.norm(center))
+            if d_wall > 1e-6:
+                # Clamp the slide so a noisy depth read can't fling the rect
+                # to infinity (or onto the camera).
+                s = min(2.0, max(0.1, d_light / d_wall))
+                center = center * s
+                width *= s
+                height *= s
+                mean_depth *= s
+
     return RectFit(
         center=center.astype(np.float32),
         normal=normal.astype(np.float32),
@@ -451,5 +515,5 @@ def rect_from_quad(
         width=max(1e-4, width),
         height=max(1e-4, height),
         inlier_ratio=1.0,                    # by construction
-        mean_distance=float(depths.mean()),
+        mean_distance=mean_depth,
     )
