@@ -8,9 +8,15 @@ Built for VFX lighting pipelines: take an HDRI latlong EXR, mark the practical l
 
 > *Above: the env2lgt main window. A 4K HDRI is loaded; three light quads have been placed on ceiling fixtures (the large yellow one is selected, with its 4 corner handles visible). The right panel shows the quad list, output path, and per-rig export toggles.*
 
-**▶ [Watch the workflow demo](docs/demo.mp4)** *(16 MB mp4 — load EXR, click corners, bake, open in usdview)*
+<!--
+GitHub's README renderer only inlines <video> tags whose src is an absolute
+github.com URL (relative paths get stripped). The raw.githubusercontent.com
+URL below resolves to the same blob committed at docs/demo.mp4.
+-->
 
-<video src="docs/demo.mp4" controls width="100%" muted preload="metadata"></video>
+https://github.com/mexxmillion/env2lgt/raw/main/docs/demo.mp4
+
+*Workflow demo (16 MB) — load EXR, click corners, bake, open in usdview. If your viewer doesn't inline the player, [download / open in a tab](docs/demo.mp4).*
 
 > **Status:** working tool, not feature-complete. End-to-end pipeline is solid; UX still being iterated on.
 
