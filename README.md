@@ -2,7 +2,7 @@
 
 **Convert a single equirectangular HDRI into a physically-positioned USD light rig.**
 
-Built for VFX lighting pipelines: take an HDRI latlong EXR, mark the practical lights with 4 clicks each, and bake out a USD scene containing a `UsdLuxDomeLight` for the environment, one `UsdLuxRectLight` per marked light positioned in world space via monocular panorama depth (DA²), and a depth-displaced `UsdGeomMesh` of the scene for validation. Drop the result into Karma, RenderMan, Storm, or any other USD-aware renderer.
+Built for VFX lighting pipelines: take an HDRI latlong EXR, mark the practical lights with 4 clicks each, and bake out a USD scene containing a `UsdLuxDomeLight` for the environment, one `UsdLuxRectLight` per marked light positioned in world space via monocular panorama depth (DA² or DAP — see [Depth backends](#depth-backends)), and a depth-displaced `UsdGeomMesh` of the scene for validation. Drop the result into Karma, RenderMan, Storm, or any other USD-aware renderer.
 
 ![env2lgt GUI](docs/gui_preview.png)
 
@@ -117,6 +117,31 @@ Per-file output checkboxes. All are independent, so you can bake just the dome, 
 
 ---
 
+## Depth backends
+
+The depth model sits behind a `DepthBackend` protocol ([env2lgt/depth/base.py](env2lgt/depth/base.py)), so it's a config switch rather than a hard dependency. Two backends are available:
+
+| | **DA²** (`da2`) | **DAP** (`dap`) |
+|---|---|---|
+| Repo | [EnVision-Research/DA-2](https://github.com/EnVision-Research/DA-2) | [Insta360-Research-Team/DAP](https://github.com/Insta360-Research-Team/DAP) |
+| License | Apache-2.0 | MIT |
+| Backbone | SphereViT | DINOv3-Large (Meta) |
+| Depth output | scale-invariant (relative) | **metric** (meters) |
+| `scene_scale` role | primary meters-per-unit knob | fine-tune multiplier (default 1.0) |
+| Conda env | `env2lgt-da2` | `env2lgt-dap` |
+
+**Selecting a backend** — three ways, in precedence order:
+
+1. The **Depth** dropdown in the toolbar (per-bake, no restart).
+2. The `depth_backend` key saved in the project file (`*.env2lgt.json`).
+3. The `ENV2LGT_DEPTH_BACKEND` environment variable (`da2` | `dap`), default `da2`.
+
+When a metric backend is selected, `bake.py` records `is_metric` + `depth_backend` in `masks.json` and the `scene_scale` slider becomes a fine-tune multiplier rather than the primary scale control.
+
+> **DAP status:** the backend, registry, UI, and daemon plumbing are complete, but the DAP inference itself (`scripts/dap_infer.py`) is **scaffolded** — model load + forward pass are marked with `TODO(dap-1/2/3)` and must be wired against a real DAP checkout + weights. Until then, selecting `dap` will fail at inference time. See [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md).
+
+---
+
 ## Install
 
 ### Prerequisites
@@ -152,6 +177,18 @@ E:\conda\envs\env2lgt-da2\Scripts\pip install -e E:\models\DA-2\src
 
 :: triton + OpenEXR extras we add on top
 E:\conda\envs\env2lgt-da2\Scripts\pip install -r requirements-da2.txt
+
+:: ─── 3. DAP inference environment (optional) ─────────────────────
+:: Only needed to use the `dap` depth backend. DAP pins a newer torch
+:: than DA-2, so it gets its own env. Exact pins are UNVERIFIED — defer
+:: to DAP's own requirements.
+conda env create -f environment-dap.yml -p E:\conda\envs\env2lgt-dap
+E:\conda\envs\env2lgt-dap\Scripts\pip install ^
+    --index-url https://download.pytorch.org/whl/cu124 ^
+    torch==2.7.1 torchvision==0.22.1
+git clone https://github.com/Insta360-Research-Team/DAP E:\models\DAP
+E:\conda\envs\env2lgt-dap\Scripts\pip install -e E:\models\DAP
+E:\conda\envs\env2lgt-dap\Scripts\pip install -r requirements-dap.txt
 ```
 
 If you want a flat `requirements.txt` workflow for the UI env (e.g., for CI),
@@ -167,9 +204,11 @@ setx TORCH_HOME          "E:\models\torch"
 setx HF_TOKEN            "hf_xxxxxxxxxxxxxxxxxxxxxx"
 setx ENV2LGT_DA2_ENV     "E:\conda\envs\env2lgt-da2"
 setx ENV2LGT_DA2_REPO    "E:\models\DA-2"
+setx ENV2LGT_DAP_ENV     "E:\conda\envs\env2lgt-dap"
+setx ENV2LGT_DAP_REPO    "E:\models\DAP"
 ```
 
-The two `ENV2LGT_*` vars are optional — the runner falls back to `E:\conda\envs\env2lgt-da2` and `E:\models\DA-2` if not set.
+The `ENV2LGT_*` path vars are optional — each runner falls back to `E:\conda\envs\env2lgt-da2` / `E:\models\DA-2` (and the `-dap` equivalents) if not set. `ENV2LGT_DEPTH_BACKEND` (`da2` | `dap`) picks the default backend; it defaults to `da2`.
 
 ### Run
 
@@ -222,7 +261,10 @@ env2lgt/
 ├── cli.py                   `env2lgt-bake` headless command (stub)
 ├── proj.py                  Sphere ↔ equirect ↔ rectilinear math (single source of truth)
 ├── depth/
-│   └── da2_runner.py        Persistent DA-2 daemon manager
+│   ├── base.py              DepthBackend protocol
+│   ├── __init__.py          Backend registry — get_backend() / ENV2LGT_DEPTH_BACKEND
+│   ├── da2_runner.py        DA-2 backend (scale-invariant) — persistent daemon manager
+│   └── dap_runner.py        DAP backend (metric) — persistent daemon manager
 ├── io/
 │   ├── exr.py               OIIO-based latlong load/save
 │   └── tonemap.py           ACES + sRGB display tonemap, turbo depth colormap
@@ -237,6 +279,7 @@ env2lgt/
     └── mesh.py              Depth-displaced UV sphere with emissive dome
 scripts/
 ├── da2_infer.py             Lives inside env2lgt-da2; one-shot OR --serve daemon mode
+├── dap_infer.py             Lives inside env2lgt-dap; one-shot OR --serve daemon mode
 └── batch_bake.py            Batch-bake every EXR in a directory (auto top-N brightness blobs)
 ```
 
@@ -254,7 +297,7 @@ scripts/
 
 ## Roadmap
 
-- [ ] **Swappable depth backend** — abstract the depth model behind a `DepthBackend` protocol and add **DAP** (Insta360, MIT-licensed, metric depth) alongside DA². Full spec in [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md).
+- [x] **Swappable depth backend** — `DepthBackend` protocol + registry, DA²/DAP backends, UI dropdown, project-file key. See [Depth backends](#depth-backends). *Remaining:* wire DAP's actual inference (`scripts/dap_infer.py` `TODO(dap-*)`) against a real checkout + weights, then A/B validate. Spec: [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md).
 - [ ] Auto-detect mode — propose quads from brightness-thresholded connected components, with K-means grouping by brightness so the user can include/exclude "windows" vs "lamps" with one click.
 - [ ] **Load masks.json** — reproduce a previous bake's quad layout for a new render.
 - [ ] Disk + portal lights (in addition to rect).
@@ -268,6 +311,7 @@ scripts/
 ## Acknowledgements
 
 - **DA-2** — [EnVision-Research/DA-2](https://github.com/EnVision-Research/DA-2) ("Depth Anything in Any Direction", arXiv:2509.26618). The SOTA monocular panorama depth model this pipeline relies on. © Tencent Hunyuan / HKUST.
+- **DAP** — [Insta360-Research-Team/DAP](https://github.com/Insta360-Research-Team/DAP) (CVPR 2026, arXiv:2512.16913). MIT-licensed metric panorama depth, DINOv3 backbone — the studio-approvable alternate backend.
 - **OpenUSD** — Pixar / Apple / the OpenUSD community.
 - **PySide6 / Qt6** — The Qt Company.
 - **OpenImageIO / OpenEXR / OpenColorIO** — the VFX foundation libraries every pipeline is built on.
