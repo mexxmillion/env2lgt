@@ -1,8 +1,9 @@
 # Plan: swappable depth backend (DA² → DAP)
 
-> Status: **planning doc for a future session.** DA² work is parked. This
-> document is the spec for adding a depth-backend abstraction and a DAP
-> backend.
+> Status: **implemented and validated** (May 2026). The depth-backend
+> abstraction, both backends, the UI, and the DAP integration are done and
+> in `main`. Steps 1–6 below are complete. See "Validation findings" at the
+> end of this doc for the Step 6 results.
 
 ## Why
 
@@ -116,3 +117,33 @@ The persistent-daemon + JSON-IPC + file-hash cache logic is reused as-is.
   `scene_scale` fine-tune knob still earn its place?
 - Whether to keep DA² installed at all once DAP is validated, or drop it
   to `da2` being an opt-in legacy backend.
+
+## Validation findings (Step 6 — May 2026)
+
+Setup verified on Windows + RTX 3090: `env2lgt-dap` env (Python 3.12,
+torch 2.7.1+cu128), DAP repo at `E:\models\DAP`, `model.pth` (1.46 GB)
+from HuggingFace. Full registry → daemon → inference path produces a
+metric depth EXR end-to-end.
+
+**Structure — DAP vs DA².** Spearman correlation of the two backends'
+depth maps over 6 sample HDRIs: ρ = 0.85–0.99 (phone_shop 0.996,
+small_empty_room 0.991, bell_tower lowest at 0.848). Two independently
+trained models agree strongly on near/far structure — the DAP
+integration is geometrically correct. Side-by-side depth renders confirm
+visually near-identical layout.
+
+**Metric consistency.** Four room-scale HDRIs gave DAP median depths of
+1.73 / 1.75 / 1.98 / 2.20 m — a tight band, as expected from a metric
+model on similar-sized spaces (DA², being scale-invariant, cannot give
+this). p95 spread (2.8–7.7 m) tracks real sightline differences. ~1.8 m
+median camera-to-surface is plausible for an indoor room.
+
+**Open / not yet done.** Absolute calibration against a scene of known
+dimensions — the consistency check passed, but no ground-truth metric
+anchor was available. The `100 m` scale constant in `dap_infer.py`
+(`DAP_METRIC_SCALE`) and the Reinhard EXR→input bridge both looked sound
+in the A/B but were not independently confirmed.
+
+**VRAM open question — resolved.** DAP runs at a fixed 1024×512 input
+(then upsamples), not native 4K, so the ~16 GB estimate doesn't apply;
+inference is ~0.8 s on a 3090. No cube-face / downscale path needed.

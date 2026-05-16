@@ -102,18 +102,18 @@ Per-file output checkboxes. All are independent, so you can bake just the dome, 
 │  ├─ OpenCV 4.13                        image ops                   │
 │  └─ numpy / scipy                                                  │
 │                                                                    │
-│        │   JSON over stdin/stdout (one daemon per session)         │
-│        ▼                                                           │
-│  ┌────────────────────────────────────────────────────────────┐    │
-│  │  env2lgt-da2   (conda env, python 3.12)                    │    │
-│  │  ├─ torch 2.5 + CUDA 12.4                                  │    │
-│  │  ├─ xformers 0.0.28 + triton-windows 3.1                   │    │
-│  │  └─ DA-2 (Depth Anything in Any Direction)                 │    │
-│  └────────────────────────────────────────────────────────────┘    │
-└────────────────────────────────────────────────────────────────────┘
+│        │   JSON over stdin/stdout (one daemon per backend)          │
+│        ▼                                                            │
+│  ┌──────────────────────────────┐  ┌──────────────────────────────┐ │
+│  │ env2lgt-da2  (py 3.12)       │  │ env2lgt-dap  (py 3.12)       │ │
+│  │ ├─ torch 2.5 + CUDA 12.4     │  │ ├─ torch 2.7.1 + CUDA 12.8   │ │
+│  │ ├─ xformers + triton-windows │  │ └─ DAP (DINOv3, metric)      │ │
+│  │ └─ DA-2 (scale-invariant)    │  │                              │ │
+│  └──────────────────────────────┘  └──────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-**Why two envs?** DA-2 pins `torch==2.5.0 + cu124 + xformers==0.0.28.post2`, which conflicts with what the openusd / pyside6 stack wants. Keeping them separate keeps each environment cleanly pip-resolvable and lets the UI release independently of the depth model. The UI talks to a single long-lived DA-2 worker over line-delimited JSON; cold start is ~12 s, every subsequent bake on the same EXR hits the file-hash distance cache and runs in ~1 s.
+**Why separate envs?** DA-2 pins `torch==2.5.0 + cu124 + xformers==0.0.28.post2` and DAP wants `torch==2.7.1`; neither is compatible with the other, nor with what the openusd / pyside6 UI stack wants. Each depth backend gets its own cleanly pip-resolvable conda env, and the UI releases independently of the depth models. The UI talks to a long-lived worker (one per backend, spawned on first use) over line-delimited JSON; cold start is ~12 s for DA-2 / ~6 s for DAP, and every subsequent bake on the same EXR hits the file-hash distance cache and runs in ~1 s.
 
 ---
 
@@ -138,7 +138,7 @@ The depth model sits behind a `DepthBackend` protocol ([env2lgt/depth/base.py](e
 
 When a metric backend is selected, `bake.py` records `is_metric` + `depth_backend` in `masks.json` and the `scene_scale` slider becomes a fine-tune multiplier rather than the primary scale control.
 
-> **DAP status:** wired and **smoke-tested** — the `env2lgt-dap` env + weights are in place and the full registry → daemon → inference path produces a metric depth EXR end-to-end. What remains is a **quality pass**: A/B against DA² and confirm the metric scale on a known-size scene (early runs read small, ~0.8–3.2 m on a 4K test HDRI — the Reinhard tone-flatten bridge and the `100 m` scale constant are the things to check). See [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md).
+> **DAP status:** wired and **validated**. The `env2lgt-dap` env + weights are in place; the full registry → daemon → inference path produces a metric depth EXR end-to-end (~0.8 s on a 3090). An A/B against DA² over 6 HDRIs shows ρ = 0.85–0.99 structural agreement, and DAP's metric output is consistent across similar-scale scenes (room-scale HDRIs cluster at ~1.7–2.2 m median). The one thing still unconfirmed is absolute calibration against a scene of *known* dimensions. Full results in [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md).
 
 ---
 
@@ -300,7 +300,7 @@ scripts/
 
 ## Roadmap
 
-- [x] **Swappable depth backend** — `DepthBackend` protocol + registry, DA²/DAP backends, UI dropdown, project-file key. See [Depth backends](#depth-backends). *Remaining:* wire DAP's actual inference (`scripts/dap_infer.py` `TODO(dap-*)`) against a real checkout + weights, then A/B validate. Spec: [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md).
+- [x] **Swappable depth backend** — `DepthBackend` protocol + registry, DA²/DAP backends, UI dropdown, project-file key, DAP inference wired + validated against DA². See [Depth backends](#depth-backends) and [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md). *Remaining:* absolute metric calibration against a known-size scene.
 - [ ] Auto-detect mode — propose quads from brightness-thresholded connected components, with K-means grouping by brightness so the user can include/exclude "windows" vs "lamps" with one click.
 - [ ] **Load masks.json** — reproduce a previous bake's quad layout for a new render.
 - [ ] Disk + portal lights (in addition to rect).
