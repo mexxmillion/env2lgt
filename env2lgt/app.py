@@ -89,10 +89,10 @@ class MainWindow(QMainWindow):
         self._hdr: np.ndarray | None = None
         self._exr_path: Path | None = None
         self._exposure: float = 0.0
-        # DA-2 returns scale-invariant distance ~[0.3, 1.5]. A median indoor
-        # room is ~3-10 m across, so 10 m/u is a sane default. The user can
-        # adjust per scene via the toolbar slider.
-        self._scene_scale: float = 10.0
+        # DA-2 returns scale-invariant distance ~[0.3, 1.5]. Default at
+        # 100 m/u — typical indoor scenes look right at this scale in
+        # usdview; the user can adjust via the toolbar slider.
+        self._scene_scale: float = 100.0
         self._yaw_offset_deg: float = 0.0
         self._last_usd: Path | None = None
         self._distance: np.ndarray | None = None
@@ -171,12 +171,14 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addWidget(QLabel(" Scene scale "))
         scale_slider = QSlider(Qt.Orientation.Horizontal)
-        scale_slider.setRange(-200, 200)        # tenths of log10(m/u); -200 = 0.01, 0 = 1.0, +200 = 100
-        scale_slider.setValue(100)              # 10 m/u default — sensible for indoor scenes
-        scale_slider.setFixedWidth(180)
+        # Hundredths of log10(m/u). Range = 0.001 .. 1000 m/u so there's
+        # headroom both above and below the default.
+        scale_slider.setRange(-300, 300)
+        scale_slider.setValue(200)              # 10**2 = 100 m/u default
+        scale_slider.setFixedWidth(200)
         scale_slider.valueChanged.connect(self._on_scale)
         tb.addWidget(scale_slider)
-        self._scale_label = QLabel(" 10.00 m/u ")
+        self._scale_label = QLabel(" 100.00 m/u ")
         tb.addWidget(self._scale_label)
 
         tb.addSeparator()
