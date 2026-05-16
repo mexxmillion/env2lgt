@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -17,6 +19,30 @@ from PySide6.QtWidgets import (
 )
 
 from env2lgt.ui.viewer import LightQuad
+
+
+# Match USD prim-name / Maya / Houdini node-name rules: only ASCII letters,
+# digits, and underscore. Names can't start with a digit.
+_INVALID_CHARS_RE = re.compile(r"[^A-Za-z0-9_]")
+
+
+def sanitize_name(s: str) -> str:
+    """Coerce user-entered names to USD/Maya/Houdini-friendly identifiers.
+
+    - Trim surrounding whitespace
+    - Replace internal whitespace with single underscores
+    - Strip any character outside [A-Za-z0-9_]
+    - Prepend '_' if the result starts with a digit (USD prim-name rule)
+    - Return empty string if nothing valid remains (caller should revert)
+    """
+    s = s.strip()
+    s = re.sub(r"\s+", "_", s)              # any whitespace run → single underscore
+    s = _INVALID_CHARS_RE.sub("", s)        # drop everything else
+    if not s:
+        return ""
+    if s[0].isdigit():
+        s = "_" + s
+    return s
 
 
 class LightPanel(QWidget):
@@ -135,15 +161,22 @@ class LightPanel(QWidget):
         if self._suppress_item_changed:
             return
         old_name = item.data(0x0100) or ""
-        new_name = item.text().strip()
+        typed = item.text()
+        new_name = sanitize_name(typed)
         if not new_name or new_name == old_name:
-            # Revert empty or no-op edits.
+            # Empty after sanitize, or no real change — revert visually.
             self._suppress_item_changed = True
             item.setText(old_name)
             self._suppress_item_changed = False
             return
-        # Defer the model update to the app via signal; the app calls back to
-        # rename() with the final accepted name (might mangle on collision).
+        # If sanitization changed what the user typed, reflect the cleaned
+        # value in the list immediately so they can see what's being stored.
+        if new_name != typed:
+            self._suppress_item_changed = True
+            item.setText(new_name)
+            self._suppress_item_changed = False
+        # The app calls back to rename() with the final accepted name (might
+        # get a `_2` suffix on collision).
         self.rename_quad.emit(old_name, new_name)
 
     def _on_delete(self):
