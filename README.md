@@ -266,6 +266,22 @@ scripts/
 
 ## License
 
-Apache-2.0.
+env2lgt is licensed under the **Apache License 2.0** — see [LICENSE](LICENSE)
+for the full text. This is the same license OpenUSD ships under, so the two
+compose cleanly. You can use, modify, and redistribute the code, including
+in commercial / closed-source pipelines, as long as you keep the copyright
+and license notice.
 
-Note: DA-2 weights are governed by their own license — see the [DA-2 repo](https://github.com/EnVision-Research/DA-2) for terms.
+Third-party components retain their own licenses:
+
+| Component | License |
+|---|---|
+| **OpenUSD** | Apache 2.0 |
+| **OpenEXR / Imath / OIIO / OCIO** | BSD-3-Clause |
+| **PySide6 / Qt6** | LGPL-3.0 (linking is fine; no redistribution of modified Qt here) |
+| **OpenCV** | Apache 2.0 |
+| **DA-2 (model + weights)** | See the [DA-2 repo](https://github.com/EnVision-Research/DA-2) — Tencent Hunyuan, weights have their own usage terms |
+| **triton-windows** | MIT |
+
+The DA-2 weights are downloaded at runtime from HuggingFace (`haodongli/DA-2`);
+we don't redistribute them. Check Tencent's terms before commercial deployment.
