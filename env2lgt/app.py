@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QObject, QThread, Qt, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QImage
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
@@ -26,9 +26,12 @@ from PySide6.QtWidgets import (
     QToolBar,
 )
 
+import cv2
+
 from env2lgt.bake import BakeOptions, QuadSpec, bake
 from env2lgt.depth import da2_runner
 from env2lgt.io import depth_to_display_qimage, load_latlong, to_display_qimage
+from env2lgt.io.tonemap import aces_filmic
 from env2lgt.project import (
     Project,
     default_project_path,
@@ -38,6 +41,13 @@ from env2lgt.project import (
 )
 from env2lgt.ui.light_panel import LightPanel
 from env2lgt.ui.viewer import LightQuad, PanoramaViewer
+
+
+# Cap the in-viewer pano width. The full-res HDR is still kept around for
+# bake (which does its own load straight from the EXR file anyway), but the
+# tonemap + exposure scrub work on this downsampled copy so the sliders feel
+# responsive. 2048 is plenty for click precision on a 4K source.
+DISPLAY_MAX_WIDTH = 2048
 
 
 class BakeWorker(QObject):
@@ -93,7 +103,15 @@ class MainWindow(QMainWindow):
         self.resize(1600, 900)
         self.setAcceptDrops(True)
 
-        self._hdr: np.ndarray | None = None
+        self._hdr: np.ndarray | None = None              # full-res HDR (used for bake metadata only)
+        self._hdr_display: np.ndarray | None = None      # downsampled HDR for fast tonemap
+        self._distance: np.ndarray | None = None         # full-res depth (for bake)
+        self._distance_display: np.ndarray | None = None # downsampled depth for fast preview
+        # uint8 LDR cache at the current (view_mode, exposure). Reused across
+        # yaw-slider ticks (np.roll on uint8 is ~20x cheaper than rolling
+        # float32 + retonemapping each time).
+        self._display_cache: np.ndarray | None = None
+        self._cache_key: tuple | None = None
         self._exr_path: Path | None = None
         self._exposure: float = 0.0
         # DA-2 returns scale-invariant distance ~[0.3, 1.5]. Default at
@@ -102,7 +120,6 @@ class MainWindow(QMainWindow):
         self._scene_scale: float = 100.0
         self._yaw_offset_deg: float = 0.0
         self._last_usd: Path | None = None
-        self._distance: np.ndarray | None = None
         self._view_mode: str = "hdr"    # "hdr" or "depth"
         self._depth_thread: QThread | None = None
         self._depth_worker: DepthWorker | None = None
@@ -244,6 +261,20 @@ class MainWindow(QMainWindow):
             if ret != QMessageBox.StandardButton.Yes:
                 return
         self._hdr = hdr
+        # Downsampled display copy so exposure + yaw scrubs stay snappy.
+        H, W, _ = hdr.shape
+        if W > DISPLAY_MAX_WIDTH:
+            new_w = DISPLAY_MAX_WIDTH
+            new_h = max(2, (new_w * H) // W)
+            # Even output size keeps 2:1 latlong aspect well.
+            new_h -= new_h % 2
+            self._hdr_display = cv2.resize(hdr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            self._hdr_display = hdr
+        # Invalidate caches — last EXR's tonemap is meaningless now.
+        self._display_cache = None
+        self._cache_key = None
+        self._distance_display = None
         self._exr_path = path
         # --- reset everything tied to the previous EXR ---
         # Yaw offset back to 0 (a stale offset would confuse quad placement).
@@ -319,26 +350,61 @@ class MainWindow(QMainWindow):
     # ---------- view tweaks ----------
 
     def _refresh_view(self):
-        if self._hdr is None:
+        """Push a QImage to the viewer for the current (mode, exposure, yaw).
+
+        Two-stage caching strategy:
+        - Tonemap (or depth colormap) -> uint8 RGB array, cached in
+          `self._display_cache`. Keyed by (view_mode, exposure) so the
+          expensive part runs only when exposure or mode actually changes.
+        - Yaw offset rolls the cached uint8 (column-wise) and wraps in a
+          QImage. Cheap (~5 ms at 2K) — runs on every yaw-slider tick.
+        """
+        if self._hdr_display is None:
             return
-        H, W, _ = self._hdr.shape
-        # Convert yaw offset (deg) into integer pano-pixel shift. Positive
-        # offset rolls content to the right (the seam moves left).
+
+        cache_key = (
+            self._view_mode,
+            round(self._exposure, 3) if self._view_mode == "hdr" else None,
+        )
+        if self._display_cache is None or self._cache_key != cache_key:
+            if self._view_mode == "depth" and self._distance_display is not None:
+                self._display_cache = self._tonemap_depth_uint8(self._distance_display)
+            else:
+                self._display_cache = self._tonemap_hdr_uint8(
+                    self._hdr_display, self._exposure
+                )
+            self._cache_key = cache_key
+
+        cache = self._display_cache
+        H, W, _ = cache.shape
         offset_px = int(round((self._yaw_offset_deg / 360.0) * W)) % W
-
-        if self._view_mode == "depth" and self._distance is not None:
-            buf = self._distance
-            if offset_px != 0:
-                buf = np.roll(buf, offset_px, axis=1)
-            qimg = depth_to_display_qimage(buf)
+        if offset_px != 0:
+            rolled = np.roll(cache, offset_px, axis=1)
         else:
-            buf = self._hdr
-            if offset_px != 0:
-                buf = np.roll(buf, offset_px, axis=1)
-            qimg = to_display_qimage(buf, exposure=self._exposure)
-
+            rolled = cache
+        rolled = np.ascontiguousarray(rolled)
+        qimg = QImage(rolled.data, W, H, W * 3, QImage.Format.Format_RGB888).copy()
         self.viewer.set_yaw_offset_px(offset_px)
         self.viewer.set_image(qimg)
+
+    @staticmethod
+    def _tonemap_hdr_uint8(hdr: np.ndarray, exposure: float) -> np.ndarray:
+        """ACES filmic tonemap + sRGB clip, returns contiguous (H, W, 3) uint8."""
+        scaled = hdr * (2.0 ** float(exposure))
+        ldr = aces_filmic(scaled)
+        u8 = (ldr * 255.0 + 0.5).astype(np.uint8)
+        return np.ascontiguousarray(u8)
+
+    @staticmethod
+    def _tonemap_depth_uint8(distance: np.ndarray) -> np.ndarray:
+        """Per-image normalized turbo colormap of the distance map."""
+        d = distance.astype(np.float32)
+        lo, hi = float(d.min()), float(d.max())
+        span = max(1e-6, hi - lo)
+        norm = (np.clip((d - lo) / span, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        cm_bgr = cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
+        cm_rgb = cv2.cvtColor(cm_bgr, cv2.COLOR_BGR2RGB)
+        return np.ascontiguousarray(cm_rgb)
 
     def _on_exposure(self, val: int):
         self._exposure = val / 10.0
@@ -357,6 +423,8 @@ class MainWindow(QMainWindow):
     def _on_depth_toggle(self, checked: bool):
         if not checked:
             self._view_mode = "hdr"
+            self._display_cache = None         # invalidate — different mode
+            self._cache_key = None
             self._depth_btn.setText("Show depth")
             self._refresh_view()
             return
@@ -366,6 +434,8 @@ class MainWindow(QMainWindow):
         if self._distance is not None:
             # Already computed (cache hit) — instant switch.
             self._view_mode = "depth"
+            self._display_cache = None         # invalidate — different mode
+            self._cache_key = None
             self._depth_btn.setText("Show HDR")
             self._refresh_view()
             return
@@ -388,6 +458,18 @@ class MainWindow(QMainWindow):
 
     def _on_depth_ready(self, distance):
         self._distance = distance
+        # Build the display-res depth at the same dimensions as _hdr_display
+        # so the cache + roll path is symmetric with HDR mode.
+        if self._hdr_display is not None and distance.shape != self._hdr_display.shape[:2]:
+            h_d, w_d = self._hdr_display.shape[:2]
+            self._distance_display = cv2.resize(
+                distance, (w_d, h_d), interpolation=cv2.INTER_LINEAR
+            )
+        else:
+            self._distance_display = distance
+        # Invalidate any HDR cache so the next refresh picks up depth.
+        self._display_cache = None
+        self._cache_key = None
         self._view_mode = "depth"
         self._depth_btn.setEnabled(True)
         self._depth_btn.setText("Show HDR")
