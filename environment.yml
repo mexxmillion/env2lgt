@@ -1,8 +1,8 @@
 # env2lgt — UI / USD / EXR environment
 #
 # Usage:
-#   conda env create -f environment.yml -p E:\conda\envs\env2lgt
-#   conda activate E:\conda\envs\env2lgt
+#   conda env create -f environment.yml      (creates a named env: env2lgt)
+#   conda activate env2lgt
 #   pip install -e .
 #
 # All the binary-heavy deps (OpenUSD, Qt, OpenEXR, OIIO, OpenColorIO) come

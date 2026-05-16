@@ -1,19 +1,23 @@
 @echo off
-REM env2lgt launcher. Edit the paths below to match your system, then double-click.
+REM env2lgt launcher. Launches the GUI via the `env2lgt` conda env.
+REM
+REM Requires `conda` on PATH. If your DA-2 env / repo / model caches are not
+REM on the default E: paths, set the ENV2LGT_DA2_* and HF_HOME / TORCH_HOME
+REM vars below (or once, system-wide, with `setx`). HF_TOKEN should come from
+REM your user environment — never hardcode it here.
 
 setlocal
-set "ENV2LGT_ENV=E:\conda\envs\env2lgt"
-set "ENV2LGT_DA2_ENV=E:\conda\envs\env2lgt-da2"
-set "ENV2LGT_DA2_REPO=E:\models\DA-2"
-set "HF_HOME=E:\models\huggingface"
-set "TORCH_HOME=E:\models\torch"
-REM HF_TOKEN should come from your user environment (setx) — never hardcode here.
+if not defined ENV2LGT_DA2_ENV  set "ENV2LGT_DA2_ENV=E:\conda\envs\env2lgt-da2"
+if not defined ENV2LGT_DA2_REPO set "ENV2LGT_DA2_REPO=E:\models\DA-2"
+if not defined HF_HOME          set "HF_HOME=E:\models\huggingface"
+if not defined TORCH_HOME       set "TORCH_HOME=E:\models\torch"
 
-if not exist "%ENV2LGT_ENV%\python.exe" (
-    echo ERROR: env2lgt conda env not found at %ENV2LGT_ENV%
+where conda >nul 2>nul
+if errorlevel 1 (
+    echo ERROR: `conda` not found on PATH. Activate conda or open an Anaconda Prompt.
     pause
     exit /b 1
 )
 
-"%ENV2LGT_ENV%\python.exe" -m env2lgt.app %*
+conda run --no-capture-output -n env2lgt python -m env2lgt.app %*
 endlocal

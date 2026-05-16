@@ -132,26 +132,32 @@ The environments are defined in **`environment.yml`** (UI) and
 **`environment-da2.yml`** (depth). Pip extras are pinned in
 **`requirements.txt`** and **`requirements-da2.txt`**.
 
+Both YAML files declare a `name:`, so the commands below create the conda
+envs `env2lgt` and `env2lgt-da2` in your default conda location — no `E:`
+drive required. (If you prefer a specific location, add `-p <path>` to
+`conda env create` and substitute that path for the `-n <name>` flags below.)
+
 ```cmd
 :: ─── 1. UI / USD / EXR environment ───────────────────────────────
-conda env create -f environment.yml -p E:\conda\envs\env2lgt
-conda activate E:\conda\envs\env2lgt
+conda env create -f environment.yml
+conda activate env2lgt
 pip install -e .                                   :: registers `env2lgt` and `env2lgt-bake`
 
 :: ─── 2. DA-2 inference environment ──────────────────────────────
-conda env create -f environment-da2.yml -p E:\conda\envs\env2lgt-da2
+conda env create -f environment-da2.yml
 
 :: torch + xformers from the CUDA 12.4 index (the version DA-2 pins)
-E:\conda\envs\env2lgt-da2\Scripts\pip install ^
+conda run -n env2lgt-da2 pip install ^
     --index-url https://download.pytorch.org/whl/cu124 ^
     torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0 xformers==0.0.28.post2
 
-:: DA-2 itself (resolves the rest of its pinned tree)
-git clone https://github.com/EnVision-Research/DA-2 E:\models\DA-2
-E:\conda\envs\env2lgt-da2\Scripts\pip install -e E:\models\DA-2\src
+:: DA-2 itself (resolves the rest of its pinned tree).
+:: Clone anywhere you like, then point ENV2LGT_DA2_REPO at it (see below).
+git clone https://github.com/EnVision-Research/DA-2
+conda run -n env2lgt-da2 pip install -e DA-2\src
 
 :: triton + OpenEXR extras we add on top
-E:\conda\envs\env2lgt-da2\Scripts\pip install -r requirements-da2.txt
+conda run -n env2lgt-da2 pip install -r requirements-da2.txt
 ```
 
 If you want a flat `requirements.txt` workflow for the UI env (e.g., for CI),
@@ -159,26 +165,32 @@ note that you **still** need conda for `openusd`, `pyside6`, `py-openimageio`,
 and `openexr` — these aren't shippable as pip wheels on Windows in 2026.
 The `requirements.txt` only covers the pure-Python additions.
 
-### Cache locations (one-time)
+### Cache locations + DA-2 paths (one-time)
+
+Set these once with `setx` (paths are examples — point them anywhere with room):
 
 ```cmd
-setx HF_HOME             "E:\models\huggingface"
-setx TORCH_HOME          "E:\models\torch"
+setx HF_HOME             "D:\models\huggingface"
+setx TORCH_HOME          "D:\models\torch"
 setx HF_TOKEN            "hf_xxxxxxxxxxxxxxxxxxxxxx"
-setx ENV2LGT_DA2_ENV     "E:\conda\envs\env2lgt-da2"
-setx ENV2LGT_DA2_REPO    "E:\models\DA-2"
+setx ENV2LGT_DA2_ENV     "<conda envs dir>\env2lgt-da2"
+setx ENV2LGT_DA2_REPO    "<where you cloned DA-2>"
 ```
 
-The two `ENV2LGT_*` vars are optional — the runner falls back to `E:\conda\envs\env2lgt-da2` and `E:\models\DA-2` if not set.
+`ENV2LGT_DA2_ENV` / `ENV2LGT_DA2_REPO` tell the depth runner where the DA-2
+conda env and repo live. If unset, the runner falls back to
+`E:\conda\envs\env2lgt-da2` and `E:\models\DA-2` — so on any machine that
+isn't the original `E:`-drive setup, **set these two**. Run
+`conda info --base` to find your conda envs directory.
 
 ### Run
 
 ```cmd
-conda activate E:\conda\envs\env2lgt
+conda activate env2lgt
 python -m env2lgt.app
 ```
 
-Or the bundled launcher:
+Or the bundled launcher — edit the paths at the top of `launch.cmd` first:
 
 ```cmd
 launch.cmd
