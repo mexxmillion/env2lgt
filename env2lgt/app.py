@@ -29,6 +29,13 @@ from PySide6.QtWidgets import (
 from env2lgt.bake import BakeOptions, QuadSpec, bake
 from env2lgt.depth import da2_runner
 from env2lgt.io import depth_to_display_qimage, load_latlong, to_display_qimage
+from env2lgt.project import (
+    Project,
+    default_project_path,
+    load_project,
+    project_from_app_state,
+    save_project,
+)
 from env2lgt.ui.light_panel import LightPanel
 from env2lgt.ui.viewer import LightQuad, PanoramaViewer
 
@@ -137,6 +144,13 @@ class MainWindow(QMainWindow):
         act_open = QAction("&Open EXR…", self, shortcut="Ctrl+O")
         act_open.triggered.connect(self._open_exr_dialog)
         m_file.addAction(act_open)
+        m_file.addSeparator()
+        act_save_proj = QAction("&Save Project…", self, shortcut="Ctrl+S")
+        act_save_proj.triggered.connect(self._save_project_dialog)
+        m_file.addAction(act_save_proj)
+        act_open_proj = QAction("Open &Project…", self, shortcut="Ctrl+P")
+        act_open_proj.triggered.connect(self._open_project_dialog)
+        m_file.addAction(act_open_proj)
         m_file.addSeparator()
         act_quit = QAction("&Quit", self, shortcut="Ctrl+Q")
         act_quit.triggered.connect(self.close)
@@ -263,6 +277,26 @@ class MainWindow(QMainWindow):
         self._refresh_view()
         h, w, _ = self._hdr.shape
         self.statusBar().showMessage(f"{path.name}  ·  {w}×{h}  ·  float32")
+
+        # Look for a sibling project file and offer to restore.
+        sibling = default_project_path(path)
+        if sibling.exists():
+            ret = QMessageBox.question(
+                self,
+                "Restore project?",
+                f"Found a saved env2lgt project for this EXR:\n  {sibling.name}\n\n"
+                "Restore the quads + settings from it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ret == QMessageBox.StandardButton.Yes:
+                try:
+                    proj = load_project(sibling)
+                    self._apply_project_state(proj)
+                    self.statusBar().showMessage(
+                        f"Restored {len(proj.quads)} quad(s) from {sibling.name}"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    QMessageBox.warning(self, "Load project", f"Failed to read {sibling.name}:\n{e}")
 
     # drag-and-drop
     def dragEnterEvent(self, e):  # noqa: N802
@@ -424,6 +458,119 @@ class MainWindow(QMainWindow):
         self._on_delete_quad(sel)
 
     # ---------- bake ----------
+
+    # ---------- project file (save / open / restore) ----------
+
+    def _save_project_dialog(self):
+        if self._exr_path is None:
+            QMessageBox.information(self, "Save project", "Open an EXR first.")
+            return
+        default = default_project_path(self._exr_path)
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save env2lgt project",
+            str(default),
+            "env2lgt project (*.env2lgt.json);;JSON (*.json);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            self._save_project_to(Path(path))
+            self.statusBar().showMessage(f"Saved: {path}")
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Save project", str(e))
+
+    def _open_project_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open env2lgt project",
+            "",
+            "env2lgt project (*.env2lgt.json *.json);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            proj = load_project(path)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Open project", f"Could not parse {path}:\n{e}")
+            return
+        # Load the EXR the project points to (will reset state). If it's not
+        # at the recorded path, fall back to looking for the same filename
+        # next to the project file.
+        exr_path = Path(proj.source_exr)
+        if not exr_path.is_file():
+            alt = Path(path).parent / exr_path.name
+            if alt.is_file():
+                exr_path = alt
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Open project",
+                    f"Source EXR not found:\n  {proj.source_exr}\n"
+                    "Move/restore the EXR or save a new project.",
+                )
+                return
+        self._load_exr(exr_path)
+        # `_load_exr` also probes for a sibling project and may prompt to
+        # restore from it (could be the same file we just opened, or a different
+        # one). Either way, force-apply the project the user explicitly opened.
+        self._apply_project_state(proj)
+        self.statusBar().showMessage(
+            f"Project loaded: {Path(path).name}  ·  {len(proj.quads)} quad(s)"
+        )
+
+    def _save_project_to(self, path: Path) -> None:
+        if self._exr_path is None:
+            raise RuntimeError("No EXR loaded.")
+        proj = project_from_app_state(
+            source_exr=self._exr_path,
+            quads=self.viewer.quads(),
+            scene_scale=self._scene_scale,
+            yaw_offset_deg=self._yaw_offset_deg,
+            exposure_ev=self._exposure,
+            dome_rotate_y_deg=self.panel.opt_dome_rotate.value(),
+            export_opts=self.panel.export_state(),
+        )
+        save_project(path, proj)
+
+    def _apply_project_state(self, proj: Project) -> None:
+        """Restore quads + scene + export state from a parsed Project. Assumes
+        the matching EXR is already loaded (state cleared by _load_exr)."""
+        # Scene state
+        self._scene_scale = float(proj.scene.scene_scale)
+        self._scale_label.setText(f" {self._scene_scale:.3f} m/u ")
+        self._yaw_offset_deg = float(proj.scene.yaw_offset_deg)
+        self._yaw_label.setText(f" {self._yaw_offset_deg:+6.1f}° ")
+        # Reposition the yaw slider to match (signal-blocked to avoid a redundant refresh).
+        try:
+            val = int(round(self._yaw_offset_deg * 10.0))
+            self._yaw_slider.blockSignals(True)
+            self._yaw_slider.setValue(val)
+            self._yaw_slider.blockSignals(False)
+        except Exception:
+            pass
+        self._exposure = float(proj.scene.exposure_ev)
+        self._exposure_label.setText(f" {self._exposure:+.1f} EV ")
+        # Apply export options (including dome rotation + output path)
+        ex = {
+            "dome": proj.export.dome,
+            "rect": proj.export.rect,
+            "usd": proj.export.usd,
+            "depth_exr": proj.export.depth_exr,
+            "depth_mesh": proj.export.depth_mesh,
+            "masks": proj.export.masks,
+            "output_dir": proj.export.output_dir,
+            "dome_rotate_y_deg": proj.scene.dome_rotate_y_deg,
+        }
+        self.panel.apply_export_state(ex)
+        # Quads
+        for q in proj.quads:
+            lq = LightQuad(name=q.name, corners_dirs=np.asarray(q.corners_dirs, dtype=np.float64))
+            self.viewer.add_quad(lq)
+            self.panel.add_quad(lq)
+        if proj.quads:
+            self.viewer.select_by_name(proj.quads[-1].name)
+        self._refresh_view()
 
     def _on_preview(self):
         """Run the pipeline with all writes off, then show a summary dialog.
@@ -600,6 +747,15 @@ class MainWindow(QMainWindow):
         if usd:
             self._last_usd = Path(usd)
         n = len(summary.get("rect_lights", []))
+        # Auto-save the project next to the source EXR so the user's work
+        # survives a crash / future session. Silent — failures are logged
+        # but don't block the bake summary dialog.
+        if self._exr_path is not None:
+            try:
+                self._save_project_to(default_project_path(self._exr_path))
+            except Exception as e:  # noqa: BLE001
+                import sys
+                print(f"[env2lgt] autosave failed: {e}", file=sys.stderr)
         self.statusBar().showMessage(f"Bake done: {usd}  ({n} rect lights)")
         QMessageBox.information(
             self,

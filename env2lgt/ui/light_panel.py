@@ -234,6 +234,35 @@ class LightPanel(QWidget):
     def output_path(self) -> str:
         return self._out_path_edit.text().strip()
 
+    def export_state(self) -> dict:
+        """Snapshot of all export-option checkboxes + dome rotation +
+        output path. Used by the project-file save path."""
+        return {
+            "dome": self.opt_dome.isChecked(),
+            "rect": self.opt_rect.isChecked(),
+            "usd": self.opt_usd.isChecked(),
+            "depth_exr": self.opt_depth_exr.isChecked(),
+            "depth_mesh": self.opt_depth_mesh.isChecked(),
+            "masks": self.opt_masks.isChecked(),
+            "output_dir": self.output_path(),
+            "dome_rotate_y_deg": self.opt_dome_rotate.value(),
+        }
+
+    def apply_export_state(self, state: dict) -> None:
+        """Restore export-option checkboxes from a saved project."""
+        self.opt_dome.setChecked(bool(state.get("dome", True)))
+        self.opt_rect.setChecked(bool(state.get("rect", True)))
+        self.opt_usd.setChecked(bool(state.get("usd", True)))
+        self.opt_depth_exr.setChecked(bool(state.get("depth_exr", False)))
+        self.opt_depth_mesh.setChecked(bool(state.get("depth_mesh", True)))
+        self.opt_masks.setChecked(bool(state.get("masks", True)))
+        out = state.get("output_dir", "")
+        if out:
+            self.force_set_output_path(out)
+        rot = state.get("dome_rotate_y_deg")
+        if rot is not None:
+            self.opt_dome_rotate.setValue(float(rot))
+
     def set_output_path(self, path: str) -> None:
         # Only auto-populate if the user hasn't already entered something custom.
         if not self._out_path_edit.text().strip():
