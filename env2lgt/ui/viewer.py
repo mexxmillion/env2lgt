@@ -119,6 +119,12 @@ class _VertexHandle(QGraphicsEllipseItem):
             self._owner.on_vertex_dragged(self._index, self.scenePos())
         return super().itemChange(change, value)
 
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        super().mouseReleaseEvent(event)
+        # Snap-to-bright happens on release so the handle follows the mouse
+        # freely during the drag, then locks onto the nearest bright pixel.
+        self._owner.snap_handle(self._index)
+
 
 # ---------- viewer ----------
 
@@ -147,6 +153,12 @@ class PanoramaViewer(QGraphicsView):
         # All quad data remains in absolute spherical coords; we convert
         # display<->absolute at click / render time.
         self._yaw_offset_px = 0
+        # Snap-to-bright: when enabled, placed/dragged vertices jump to the
+        # brightest pixel within `_snap_radius` (in pano/display pixels).
+        # `_lum` is a display-resolution luminance map (set by the app).
+        self._snap_enabled = False
+        self._snap_radius = 24
+        self._lum: np.ndarray | None = None
         self._mode = self.MODE_SELECT
         # Add-mode in-progress vertices and preview.
         self._placing_dirs: list[np.ndarray] = []
@@ -212,6 +224,47 @@ class PanoramaViewer(QGraphicsView):
             self._set_selected(sel)
         if self._W > 0:
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def set_luminance(self, lum: np.ndarray | None) -> None:
+        """Display-resolution luminance map used for snap-to-bright. Pass None
+        to disable snapping (e.g. before an EXR is loaded)."""
+        self._lum = lum
+
+    def set_snap_enabled(self, on: bool) -> None:
+        self._snap_enabled = bool(on)
+
+    def _snap_absolute(self, u_abs: float, v: float) -> tuple[float, float]:
+        """Given an absolute-space pano pixel, return the brightest pixel
+        within `_snap_radius`. Horizontal search wraps the seam; vertical
+        clamps at the poles. No-op if snap is off or no luminance map."""
+        if not self._snap_enabled or self._lum is None:
+            return u_abs, v
+        H, W = self._lum.shape
+        r = self._snap_radius
+        cx = int(round(u_abs)) % W
+        cy = int(round(v))
+        xs = np.arange(cx - r, cx + r + 1) % W
+        ys = np.arange(max(0, cy - r), min(H, cy + r + 1))
+        if xs.size == 0 or ys.size == 0:
+            return u_abs, v
+        patch = self._lum[np.ix_(ys, xs)]
+        iy, ix = np.unravel_index(int(np.argmax(patch)), patch.shape)
+        return float(xs[ix]) + 0.5, float(ys[iy]) + 0.5
+
+    def snap_handle(self, index: int) -> None:
+        """Snap a selected quad's vertex handle to the nearest bright pixel.
+        Called by _VertexHandle on mouse-release."""
+        if not self._snap_enabled or self._lum is None or not self._selected:
+            return
+        if index >= len(self._vertex_handles):
+            return
+        h = self._vertex_handles[index]
+        pos = h.scenePos()
+        u_abs = self._display_to_abs_x(float(pos.x()))
+        u_abs, v = self._snap_absolute(u_abs, float(pos.y()))
+        u_disp = self._abs_to_display_x(u_abs)
+        h.set_pano_pos_silent(QPointF(u_disp, v))
+        self.on_vertex_dragged(index, QPointF(u_disp, v))
 
     def set_yaw_offset_px(self, px: int) -> None:
         """Caller passes the offset they rolled the HDR by. Viewer stores it
@@ -292,22 +345,25 @@ class PanoramaViewer(QGraphicsView):
     # ---------- 4-click placement ----------
 
     def _place_vertex(self, scene_pt: QPointF) -> None:
-        # display pixel -> absolute pano pixel -> spherical dir
+        # display pixel -> absolute pano pixel -> (optional snap) -> spherical dir
         u_disp = float(scene_pt.x())
         v = float(scene_pt.y())
         u_abs = self._display_to_abs_x(u_disp)
+        if self._snap_enabled and self._lum is not None:
+            u_abs, v = self._snap_absolute(u_abs, v)
+            u_disp = self._abs_to_display_x(u_abs)
         yaw, pitch = pix_to_angles(np.array(u_abs), np.array(v), self._W, self._H)
         d = dir_from_angles(yaw, pitch)
         d = np.asarray(d, dtype=np.float64).reshape(3)
         self._placing_dirs.append(d)
-        # marker
+        # marker (placed at the possibly-snapped display position)
         dot = self._scene.addEllipse(
             -HANDLE_R, -HANDLE_R, HANDLE_R * 2, HANDLE_R * 2,
             QPen(QColor(20, 20, 20), 1),
             QBrush(QColor(255, 220, 80)),
         )
         dot.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-        dot.setPos(scene_pt)
+        dot.setPos(QPointF(u_disp, v))
         dot.setZValue(150)
         self._placing_dots.append(dot)
         # path connecting placed points (great-circle approx in equirect)
