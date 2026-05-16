@@ -47,6 +47,12 @@ class BakeOptions:
     # Display-only metadata recorded in masks.json. The bake itself doesn't use
     # this — quad corners are absolute.
     yaw_offset_deg: float = 0.0
+    # Dome light azimuthal compensation around Y, in degrees. Bridges between
+    # our equirect convention and USD/Hydra's dome shader. -180 (= +180) has
+    # been the working value in recent versions of Storm; other renderers
+    # (Karma, RenderMan) may differ. Configurable via the UI so the user
+    # doesn't need a code edit to dial it in.
+    dome_rotate_y_deg: float = -180.0
 
 
 def bake(
@@ -168,6 +174,7 @@ def bake(
             rect_lights=specs,
             meters_per_unit=1.0,
             dome_intensity=1.0,
+            dome_rotate_y_deg=opts.dome_rotate_y_deg,
         )
 
     # ---------- depth mesh USD (validation) ----------

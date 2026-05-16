@@ -7,9 +7,11 @@ import re
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -106,6 +108,29 @@ class LightPanel(QWidget):
         ):
             cb.setChecked(default)
             eb.addWidget(cb)
+        # Dome rotation knob — depends on the target renderer's convention.
+        # Empirically -180° for Storm/usdview. Quick presets buttons next to it.
+        dome_row = QHBoxLayout()
+        dome_row.addWidget(QLabel("Dome rotateY:"))
+        self.opt_dome_rotate = QDoubleSpinBox()
+        self.opt_dome_rotate.setRange(-360.0, 360.0)
+        self.opt_dome_rotate.setSingleStep(90.0)
+        self.opt_dome_rotate.setDecimals(1)
+        self.opt_dome_rotate.setSuffix(" °")
+        self.opt_dome_rotate.setValue(-180.0)
+        self.opt_dome_rotate.setToolTip(
+            "Y rotation applied to the dome light prim so its texture lines up "
+            "with the rect lights. Renderer-dependent (Storm: -180; Karma/RenderMan "
+            "may differ). Use the preset buttons or type a value."
+        )
+        dome_row.addWidget(self.opt_dome_rotate, stretch=1)
+        for preset in (-180.0, -90.0, 0.0, 90.0):
+            btn = QPushButton(f"{int(preset)}°")
+            btn.setFixedWidth(48)
+            btn.clicked.connect(lambda _=False, v=preset: self.opt_dome_rotate.setValue(v))
+            dome_row.addWidget(btn)
+        eb.addLayout(dome_row)
+
         self._preview_btn = QPushButton("Preview (no files)")
         self._preview_btn.clicked.connect(self._on_preview)
         eb.addWidget(self._preview_btn)
@@ -232,6 +257,7 @@ class LightPanel(QWidget):
             "depth_mesh": self.opt_depth_mesh.isChecked(),
             "masks": self.opt_masks.isChecked(),
             "output_dir": self.output_path(),
+            "dome_rotate_y_deg": self.opt_dome_rotate.value(),
             "preview": False,
         }
         self.bake_requested.emit(opts)

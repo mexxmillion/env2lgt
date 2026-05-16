@@ -74,6 +74,7 @@ def write_light_rig(
     rect_lights: list[RectLightSpec],
     meters_per_unit: float = 1.0,
     dome_intensity: float = 1.0,
+    dome_rotate_y_deg: float = -180.0,
 ) -> Path:
     """Author a complete light-rig USD.
 
@@ -98,16 +99,15 @@ def write_light_rig(
         rel = _relative_to(out_path, Path(dome_texture))
         dome.CreateTextureFileAttr(Sdf.AssetPath(rel))
         dome.CreateTextureFormatAttr("latlong")
-    # Convention bridge: USD's `UsdLuxDomeLight` shader has a different
-    # azimuthal origin than our equirect. The required compensation around Y
-    # is **-90°**. Verified visually in usdview against the panorama mesh
-    # (env2lgt.usd.mesh): the mesh + rect lights agree with each other in
-    # world space, and with -90° on the dome the bright fixtures in
-    # dome.exr sit exactly under the matching rect-light prims. If you swap
-    # USD versions (or test in Karma/RenderMan) and the lights drift, this
-    # is the line.
-    dome_xf = UsdGeom.Xformable(dome.GetPrim())
-    dome_xf.AddRotateYOp().Set(-90.0)
+    # Convention bridge: USD/Hydra's `UsdLuxDomeLight` samples the texture
+    # in a different azimuthal frame than our equirect. The required Y
+    # rotation depends on the renderer — empirically `-180°` lines things
+    # up in Storm/usdview, but Karma/RenderMan/etc may differ. The value
+    # is plumbed through from BakeOptions and adjustable from the UI so the
+    # user doesn't need a code edit to dial it in.
+    if dome_rotate_y_deg != 0.0:
+        dome_xf = UsdGeom.Xformable(dome.GetPrim())
+        dome_xf.AddRotateYOp().Set(float(dome_rotate_y_deg))
 
     # Rects
     for lr in rect_lights:

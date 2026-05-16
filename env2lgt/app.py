@@ -571,6 +571,7 @@ class MainWindow(QMainWindow):
             write_mask_json=opts["masks"],
             scene_scale=self._scene_scale,
             yaw_offset_deg=self._yaw_offset_deg,
+            dome_rotate_y_deg=opts.get("dome_rotate_y_deg", -180.0),
         )
 
         self._thread = QThread(self)
