@@ -1,0 +1,12 @@
+# env2lgt — UI / USD / EXR environment (pip-installable subset)
+#
+# IMPORTANT: most of the UI env is conda-only (openusd, pyside6, opencv,
+# openexr, py-openimageio). Install those via conda first; see README.md or
+# environment.yml. This file covers the pure-Python parts so `pip install -r
+# requirements.txt -e .` works inside the conda env.
+#
+# Tested with Python 3.11.
+
+numpy>=1.26
+scipy>=1.11
+Pillow>=10

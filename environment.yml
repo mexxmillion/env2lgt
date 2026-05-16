@@ -1,0 +1,31 @@
+# env2lgt — UI / USD / EXR environment
+#
+# Usage:
+#   conda env create -f environment.yml -p E:\conda\envs\env2lgt
+#   conda activate E:\conda\envs\env2lgt
+#   pip install -e .
+#
+# All the binary-heavy deps (OpenUSD, Qt, OpenEXR, OIIO, OpenColorIO) come
+# from conda-forge wheels — the PyPI side of these is either missing on
+# Windows or stale. PySide6 must be the conda build, not the pip build,
+# because the conda openusd package links against the conda Qt6 runtime.
+
+name: env2lgt
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  # USD + viewer
+  - openusd
+  - pyside6
+  - pyopengl
+  # image I/O
+  - openexr
+  - py-openimageio
+  - opencolorio
+  - opencv
+  # numerics
+  - numpy
+  - scipy
+  - pillow

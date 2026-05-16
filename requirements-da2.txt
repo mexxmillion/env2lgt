@@ -1,0 +1,34 @@
+# env2lgt-da2 — DA-2 inference environment (separate conda env, Python 3.12)
+#
+# DA-2 hard-pins torch 2.5 / xformers 0.0.28 / opencv 4.12 / transformers
+# 4.46 — these conflict with everything else in our UI stack, which is why
+# it lives in its own conda env (called via subprocess).
+#
+# Installation order matters: torch + xformers from the PyTorch index first,
+# then DA-2 itself (which pulls the rest of its pinned tree), then triton +
+# OpenEXR on top.
+#
+# 1) Create the env (do this from outside, not via pip):
+#       conda create -p E:\conda\envs\env2lgt-da2 -c conda-forge python=3.12 pip git
+#
+# 2) Install torch from the CUDA 12.4 index:
+#       pip install --index-url https://download.pytorch.org/whl/cu124 \
+#           torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0 xformers==0.0.28.post2
+#
+# 3) Clone DA-2 and install in editable mode (this resolves the rest):
+#       git clone https://github.com/EnVision-Research/DA-2 E:\models\DA-2
+#       pip install -e E:\models\DA-2\src
+#
+# 4) Top-up extras (these aren't pulled by DA-2's pyproject):
+#       pip install -r requirements-da2.txt
+#
+# Below is just the *extra* pip lines we add on top of DA-2's own pyproject.
+
+# Windows triton build matched to torch 2.5 / CUDA 12.4. Without this,
+# xformers falls back to slower attention (~17% perf cost) and prints a
+# noisy "ModuleNotFoundError: triton" at import.
+triton-windows==3.1.0.post17
+
+# Used by scripts/da2_infer.py to load the source EXR and write the
+# single-channel distance EXR. DA-2 itself doesn't depend on it.
+OpenEXR>=3.4

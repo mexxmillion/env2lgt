@@ -4,7 +4,7 @@
 
 Built for VFX lighting pipelines: take an HDRI latlong EXR, mark the practical lights with 4 clicks each, and bake out a USD scene containing a `UsdLuxDomeLight` for the environment, one `UsdLuxRectLight` per marked light positioned in world space via monocular panorama depth (DA²), and a depth-displaced `UsdGeomMesh` of the scene for validation. Drop the result into Karma, RenderMan, Storm, or any other USD-aware renderer.
 
-![env2lgt GUI](docs/preview.png)
+![env2lgt GUI](doc/gui_preview.png)
 
 > *Above: the env2lgt main window. A 4K HDRI is loaded; three light quads have been placed on ceiling fixtures (the large yellow one is selected, with its 4 corner handles visible). The right panel shows the quad list, output path, and per-rig export toggles.*
 
@@ -118,26 +118,36 @@ Per-file output checkboxes. All are independent, so you can bake just the dome, 
 
 ### Setup
 
-```cmd
-:: 1. UI / USD / EXR environment
-conda create -p E:\conda\envs\env2lgt -c conda-forge python=3.11 ^
-    openusd pyside6 pyopengl ^
-    numpy scipy opencv openexr py-openimageio
-conda activate E:\conda\envs\env2lgt
-pip install -e .
+The environments are defined in **`environment.yml`** (UI) and
+**`environment-da2.yml`** (depth). Pip extras are pinned in
+**`requirements.txt`** and **`requirements-da2.txt`**.
 
-:: 2. DA-2 inference environment
-conda create -p E:\conda\envs\env2lgt-da2 -c conda-forge python=3.12 pip git
-git clone https://github.com/EnVision-Research/DA-2 E:\models\DA-2
+```cmd
+:: ─── 1. UI / USD / EXR environment ───────────────────────────────
+conda env create -f environment.yml -p E:\conda\envs\env2lgt
+conda activate E:\conda\envs\env2lgt
+pip install -e .                                   :: registers `env2lgt` and `env2lgt-bake`
+
+:: ─── 2. DA-2 inference environment ──────────────────────────────
+conda env create -f environment-da2.yml -p E:\conda\envs\env2lgt-da2
+
+:: torch + xformers from the CUDA 12.4 index (the version DA-2 pins)
 E:\conda\envs\env2lgt-da2\Scripts\pip install ^
     --index-url https://download.pytorch.org/whl/cu124 ^
-    torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0
+    torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0 xformers==0.0.28.post2
+
+:: DA-2 itself (resolves the rest of its pinned tree)
+git clone https://github.com/EnVision-Research/DA-2 E:\models\DA-2
 E:\conda\envs\env2lgt-da2\Scripts\pip install -e E:\models\DA-2\src
-:: triton enables xformers' fused attention (~17% faster):
-E:\conda\envs\env2lgt-da2\Scripts\pip install triton-windows==3.1.0.post17
-:: OpenEXR for reading the input panorama inside the DA-2 process:
-E:\conda\envs\env2lgt-da2\Scripts\pip install OpenEXR
+
+:: triton + OpenEXR extras we add on top
+E:\conda\envs\env2lgt-da2\Scripts\pip install -r requirements-da2.txt
 ```
+
+If you want a flat `requirements.txt` workflow for the UI env (e.g., for CI),
+note that you **still** need conda for `openusd`, `pyside6`, `py-openimageio`,
+and `openexr` — these aren't shippable as pip wheels on Windows in 2026.
+The `requirements.txt` only covers the pure-Python additions.
 
 ### Cache locations (one-time)
 

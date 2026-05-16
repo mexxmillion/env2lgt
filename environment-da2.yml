@@ -1,0 +1,25 @@
+# env2lgt-da2 — DA-2 inference environment
+#
+# This file ONLY creates an empty Python 3.12 conda env with pip and git.
+# DA-2 + torch + xformers + extras come from pip (see requirements-da2.txt
+# and README.md). They can't be expressed in this yaml because torch needs
+# the CUDA 12.4 index and DA-2 lives in a private git repo as `pip install -e`.
+#
+# Usage:
+#   conda env create -f environment-da2.yml -p E:\conda\envs\env2lgt-da2
+#   conda activate E:\conda\envs\env2lgt-da2
+#
+#   :: torch + DA-2 (see requirements-da2.txt for the why)
+#   pip install --index-url https://download.pytorch.org/whl/cu124 ^
+#       torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0 xformers==0.0.28.post2
+#   git clone https://github.com/EnVision-Research/DA-2 E:\models\DA-2
+#   pip install -e E:\models\DA-2\src
+#   pip install -r requirements-da2.txt
+
+name: env2lgt-da2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - git
