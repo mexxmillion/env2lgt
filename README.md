@@ -138,7 +138,7 @@ The depth model sits behind a `DepthBackend` protocol ([env2lgt/depth/base.py](e
 
 When a metric backend is selected, `bake.py` records `is_metric` + `depth_backend` in `masks.json` and the `scene_scale` slider becomes a fine-tune multiplier rather than the primary scale control.
 
-> **DAP status:** the backend, registry, UI, and daemon plumbing are complete, but the DAP inference itself (`scripts/dap_infer.py`) is **scaffolded** — model load + forward pass are marked with `TODO(dap-1/2/3)` and must be wired against a real DAP checkout + weights. Until then, selecting `dap` will fail at inference time. See [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md).
+> **DAP status:** the backend, registry, UI, daemon plumbing, and the DAP inference path (`scripts/dap_infer.py`) are all wired against DAP's reference `test/infer.py`. It is **not yet validated end-to-end** — that needs the `env2lgt-dap` conda env built and the DAP weights downloaded (see Install). Once those exist, A/B it against DA² per [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md).
 
 ---
 
@@ -187,8 +187,12 @@ E:\conda\envs\env2lgt-dap\Scripts\pip install ^
     --index-url https://download.pytorch.org/whl/cu124 ^
     torch==2.7.1 torchvision==0.22.1
 git clone https://github.com/Insta360-Research-Team/DAP E:\models\DAP
-E:\conda\envs\env2lgt-dap\Scripts\pip install -e E:\models\DAP
+E:\conda\envs\env2lgt-dap\Scripts\pip install -r E:\models\DAP\requirements.txt
 E:\conda\envs\env2lgt-dap\Scripts\pip install -r requirements-dap.txt
+
+:: DAP weights — download model.pth from HuggingFace into a folder of
+:: your choice, then point ENV2LGT_DAP_WEIGHTS at that folder.
+::   https://huggingface.co/Insta360-Research/DAP-weights
 ```
 
 If you want a flat `requirements.txt` workflow for the UI env (e.g., for CI),
@@ -206,9 +210,10 @@ setx ENV2LGT_DA2_ENV     "E:\conda\envs\env2lgt-da2"
 setx ENV2LGT_DA2_REPO    "E:\models\DA-2"
 setx ENV2LGT_DAP_ENV     "E:\conda\envs\env2lgt-dap"
 setx ENV2LGT_DAP_REPO    "E:\models\DAP"
+setx ENV2LGT_DAP_WEIGHTS "E:\models\DAP-weights"
 ```
 
-The `ENV2LGT_*` path vars are optional — each runner falls back to `E:\conda\envs\env2lgt-da2` / `E:\models\DA-2` (and the `-dap` equivalents) if not set. `ENV2LGT_DEPTH_BACKEND` (`da2` | `dap`) picks the default backend; it defaults to `da2`.
+The `ENV2LGT_*_ENV` / `ENV2LGT_*_REPO` path vars are optional — each runner falls back to `E:\conda\envs\env2lgt-da2` / `E:\models\DA-2` (and the `-dap` equivalents) if not set. **`ENV2LGT_DAP_WEIGHTS`** must point at the folder holding DAP's `model.pth` (no sensible default — the path baked into DAP's `config/infer.yaml` is the authors' own machine). `ENV2LGT_DEPTH_BACKEND` (`da2` | `dap`) picks the default backend; it defaults to `da2`.
 
 ### Run
 
