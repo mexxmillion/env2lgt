@@ -1,28 +1,43 @@
 # env2lgt-dap — DAP inference environment (separate conda env, Python 3.12)
 #
 # DAP (https://github.com/Insta360-Research-Team/DAP, CVPR 2026) uses a
-# DINOv3-Large backbone and pins a newer torch than DA-2, so — like DA-2 —
-# it lives in its own conda env, called via subprocess from
-# env2lgt.depth.dap_runner.
+# DINOv3 backbone and a newer torch than DA-2, so — like DA-2 — it lives in
+# its own conda env, called via subprocess from env2lgt.depth.dap_runner.
 #
-# The exact pins below are UNVERIFIED — DAP's own setup is authoritative.
-# Treat this as the install recipe to confirm against the DAP repo, not a
-# locked manifest. The doc estimate is ~16 GB VRAM at 4K.
+# This list is the *verified inference* subset — enough to load DAP's model
+# and run a forward pass. DAP's own requirements.txt additionally pulls
+# gradio / open3d / tensorboardX / pyexr, which are only needed for its demo
+# and eval scripts; we skip them.
 #
-# 1) Create the env (from outside, not via pip):
-#       conda create -p E:\conda\envs\env2lgt-dap -c conda-forge python=3.12 pip git
+# Install order (verified on Windows + RTX 3090, May 2026):
 #
-# 2) Install torch from the CUDA wheel index (pin per DAP's requirements):
-#       pip install --index-url https://download.pytorch.org/whl/cu124 \
+# 1) Create the env:
+#       conda create -p E:\conda\envs\env2lgt-dap -c conda-forge python=3.12 pip
+#
+# 2) torch — the CUDA build from PyTorch's index. The plain PyPI wheel is
+#    CPU-only on Windows, so the --index-url is required:
+#       pip install --index-url https://download.pytorch.org/whl/cu128 \
 #           torch==2.7.1 torchvision==0.22.1
 #
-# 3) Clone DAP and install in editable mode (resolves the rest of its tree):
+# 3) Clone DAP and install these requirements:
 #       git clone https://github.com/Insta360-Research-Team/DAP E:\models\DAP
-#       pip install -e E:\models\DAP
-#
-# 4) Top-up extras below (not pulled by DAP's own setup):
 #       pip install -r requirements-dap.txt
+#
+# 4) Download DAP's model.pth from HuggingFace and point ENV2LGT_DAP_WEIGHTS
+#    at the folder holding it:
+#       https://huggingface.co/Insta360-Research/DAP-weights
+
+opencv-python
+matplotlib
+huggingface_hub
+einops
+safetensors
+pyyaml
+
+# DAP's DINOv3 backbone imports a hubconf that transitively needs these.
+torchmetrics==1.8.2
+mmengine
 
 # Used by scripts/dap_infer.py to load the source EXR and write the
-# single-channel distance EXR. DAP itself doesn't depend on it.
+# single-channel distance EXR.
 OpenEXR>=3.4

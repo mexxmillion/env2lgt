@@ -174,14 +174,17 @@ def _run_one(model, device, input_hw, input_path: Path, output_path: Path) -> di
     # DAP returns {"pred_depth", "pred_mask"}: normalised depth + a validity
     # mask. Masked-out pixels (sky / invalid) get pushed to the far value so
     # bake.py's depth mesh + unprojection don't pull them onto the origin.
+    # The mask is applied on the numpy copy — the model's tensors are
+    # inference-mode tensors and can't take an in-place update here.
     if isinstance(outputs, dict) and "pred_depth" in outputs:
-        pred_depth = outputs["pred_depth"]
+        pred = outputs["pred_depth"][0].detach().float().cpu().squeeze().numpy().copy()
         if "pred_mask" in outputs:
-            invalid = (1 - outputs["pred_mask"]) > 0.5
-            pred_depth[invalid] = 1.0  # 1.0 normalised == far (100 m)
-        pred = pred_depth[0].detach().float().cpu().squeeze().numpy()
+            # DAP's test/infer.py convention: pred_mask >= 0.5 marks
+            # invalid/sky pixels — push those to the far value.
+            mask = outputs["pred_mask"][0].detach().float().cpu().squeeze().numpy()
+            pred[mask >= 0.5] = 1.0  # 1.0 normalised == far (100 m)
     else:
-        pred = outputs[0].detach().float().cpu().squeeze().numpy()
+        pred = outputs[0].detach().float().cpu().squeeze().numpy().copy()
     if pred.ndim != 2:
         raise RuntimeError(f"unexpected DAP output shape: {pred.shape}")
 

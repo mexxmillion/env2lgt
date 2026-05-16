@@ -1,20 +1,22 @@
 # env2lgt-dap — DAP inference environment
 #
 # Like environment-da2.yml, this ONLY creates an empty Python conda env with
-# pip and git. torch + DAP + DINOv3 deps come from pip (see requirements-dap.txt
-# and README.md) because torch needs the CUDA wheel index and DAP lives in a
-# git repo installed as `pip install -e`.
+# pip. torch + DAP's DINOv3 deps come from pip (see requirements-dap.txt)
+# because torch needs the CUDA wheel index.
 #
 # Usage:
 #   conda env create -f environment-dap.yml -p E:\conda\envs\env2lgt-dap
 #   conda activate E:\conda\envs\env2lgt-dap
 #
-#   :: torch (DAP pins ~2.7.1 — UNTESTED, adjust to whatever DAP's repo wants)
-#   pip install --index-url https://download.pytorch.org/whl/cu124 ^
+#   :: torch — CUDA build from PyTorch's index (plain PyPI wheel is CPU-only
+#   :: on Windows). Verified with torch 2.7.1 + cu128 on an RTX 3090.
+#   pip install --index-url https://download.pytorch.org/whl/cu128 ^
 #       torch==2.7.1 torchvision==0.22.1
 #   git clone https://github.com/Insta360-Research-Team/DAP E:\models\DAP
-#   pip install -e E:\models\DAP
 #   pip install -r requirements-dap.txt
+#
+# DAP itself is NOT pip-installed — dap_runner.py adds the repo to sys.path
+# and runs it in place. Then download model.pth (see requirements-dap.txt).
 
 name: env2lgt-dap
 channels:

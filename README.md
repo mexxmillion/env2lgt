@@ -138,7 +138,7 @@ The depth model sits behind a `DepthBackend` protocol ([env2lgt/depth/base.py](e
 
 When a metric backend is selected, `bake.py` records `is_metric` + `depth_backend` in `masks.json` and the `scene_scale` slider becomes a fine-tune multiplier rather than the primary scale control.
 
-> **DAP status:** the backend, registry, UI, daemon plumbing, and the DAP inference path (`scripts/dap_infer.py`) are all wired against DAP's reference `test/infer.py`. It is **not yet validated end-to-end** — that needs the `env2lgt-dap` conda env built and the DAP weights downloaded (see Install). Once those exist, A/B it against DA² per [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md).
+> **DAP status:** wired and **smoke-tested** — the `env2lgt-dap` env + weights are in place and the full registry → daemon → inference path produces a metric depth EXR end-to-end. What remains is a **quality pass**: A/B against DA² and confirm the metric scale on a known-size scene (early runs read small, ~0.8–3.2 m on a 4K test HDRI — the Reinhard tone-flatten bridge and the `100 m` scale constant are the things to check). See [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md).
 
 ---
 
@@ -180,14 +180,12 @@ E:\conda\envs\env2lgt-da2\Scripts\pip install -r requirements-da2.txt
 
 :: ─── 3. DAP inference environment (optional) ─────────────────────
 :: Only needed to use the `dap` depth backend. DAP pins a newer torch
-:: than DA-2, so it gets its own env. Exact pins are UNVERIFIED — defer
-:: to DAP's own requirements.
+:: than DA-2, so it gets its own env. Verified with torch 2.7.1 + cu128.
 conda env create -f environment-dap.yml -p E:\conda\envs\env2lgt-dap
 E:\conda\envs\env2lgt-dap\Scripts\pip install ^
-    --index-url https://download.pytorch.org/whl/cu124 ^
+    --index-url https://download.pytorch.org/whl/cu128 ^
     torch==2.7.1 torchvision==0.22.1
 git clone https://github.com/Insta360-Research-Team/DAP E:\models\DAP
-E:\conda\envs\env2lgt-dap\Scripts\pip install -r E:\models\DAP\requirements.txt
 E:\conda\envs\env2lgt-dap\Scripts\pip install -r requirements-dap.txt
 
 :: DAP weights — download model.pth from HuggingFace into a folder of
