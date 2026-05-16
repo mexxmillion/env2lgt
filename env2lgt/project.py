@@ -39,6 +39,7 @@ class SceneState:
     yaw_offset_deg: float = 0.0
     exposure_ev: float = 0.0
     dome_rotate_y_deg: float = -180.0
+    depth_backend: str = "da2"  # "da2" (scale-invariant) | "dap" (metric)
 
 
 @dataclass
@@ -128,6 +129,7 @@ def project_from_app_state(
     yaw_offset_deg: float,
     exposure_ev: float,
     dome_rotate_y_deg: float,
+    depth_backend: str = "da2",
     export_opts: dict | None = None,
 ) -> Project:
     """Convenience constructor used by the app on save."""
@@ -139,6 +141,7 @@ def project_from_app_state(
             yaw_offset_deg=float(yaw_offset_deg),
             exposure_ev=float(exposure_ev),
             dome_rotate_y_deg=float(dome_rotate_y_deg),
+            depth_backend=str(depth_backend),
         ),
         quads=[
             QuadState(

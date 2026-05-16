@@ -1,0 +1,28 @@
+# env2lgt-dap — DAP inference environment (separate conda env, Python 3.12)
+#
+# DAP (https://github.com/Insta360-Research-Team/DAP, CVPR 2026) uses a
+# DINOv3-Large backbone and pins a newer torch than DA-2, so — like DA-2 —
+# it lives in its own conda env, called via subprocess from
+# env2lgt.depth.dap_runner.
+#
+# The exact pins below are UNVERIFIED — DAP's own setup is authoritative.
+# Treat this as the install recipe to confirm against the DAP repo, not a
+# locked manifest. The doc estimate is ~16 GB VRAM at 4K.
+#
+# 1) Create the env (from outside, not via pip):
+#       conda create -p E:\conda\envs\env2lgt-dap -c conda-forge python=3.12 pip git
+#
+# 2) Install torch from the CUDA wheel index (pin per DAP's requirements):
+#       pip install --index-url https://download.pytorch.org/whl/cu124 \
+#           torch==2.7.1 torchvision==0.22.1
+#
+# 3) Clone DAP and install in editable mode (resolves the rest of its tree):
+#       git clone https://github.com/Insta360-Research-Team/DAP E:\models\DAP
+#       pip install -e E:\models\DAP
+#
+# 4) Top-up extras below (not pulled by DAP's own setup):
+#       pip install -r requirements-dap.txt
+
+# Used by scripts/dap_infer.py to load the source EXR and write the
+# single-channel distance EXR. DAP itself doesn't depend on it.
+OpenEXR>=3.4

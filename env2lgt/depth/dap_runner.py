@@ -1,22 +1,23 @@
-"""DA-2 depth backend — persistent inference daemon.
+"""DAP depth backend — persistent inference daemon.
 
-DA-2 inference itself is ~150ms on a 3090, but starting a fresh Python +
-loading the model costs ~13 seconds. To avoid that on every bake, we spawn
-*one* worker process per backend instance and reuse it via line-delimited
-JSON over stdin/stdout.
+DAP ([Insta360-Research-Team/DAP](https://github.com/Insta360-Research-Team/DAP),
+CVPR 2026) is a studio-approvable alternative to DA-2: MIT-licensed, DINOv3
+backbone. It produces **metric** depth, so `is_metric = True` — `bake.py`
+treats `scene_scale` as a fine-tune multiplier rather than the primary knob.
 
-`Da2Backend` implements the `DepthBackend` protocol (`env2lgt.depth.base`).
-DA-2 produces **scale-invariant** depth, so `is_metric = False` — `bake.py`
-keeps `scene_scale` as the primary meters-per-unit knob.
+`DapBackend` mirrors `Da2Backend`'s daemon manager: one worker process per
+instance, line-delimited JSON over stdin/stdout, lazy spawn, respawn on
+crash. The daemon runs `scripts/dap_infer.py` inside the `env2lgt-dap`
+conda env. Get an instance via `env2lgt.depth.get_backend("dap")`.
 
-The daemon is started lazily on the first `estimate_depth` call. If it
-crashes, the next call respawns it. Get an instance via
-`env2lgt.depth.get_backend("da2")`.
+NOTE: this is integration scaffolding. The daemon/IPC/cache plumbing here is
+complete and backend-agnostic, but the actual DAP model load + inference
+lives in `scripts/dap_infer.py`, which has TODO markers for the wiring that
+must be done against a real DAP checkout + weights.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
@@ -26,84 +27,59 @@ from pathlib import Path
 
 import numpy as np
 
-import OpenImageIO as oiio  # type: ignore[import-not-found]
+from env2lgt.depth.da2_runner import _hash_file, _read_distance_exr
 
-
-_DEFAULT_DA2_ENV_CANDIDATES = (
-    r"E:\conda\envs\env2lgt-da2",
-    r"C:\conda\envs\env2lgt-da2",
+_DEFAULT_DAP_ENV_CANDIDATES = (
+    r"E:\conda\envs\env2lgt-dap",
+    r"C:\conda\envs\env2lgt-dap",
 )
-_DEFAULT_DA2_REPO_CANDIDATES = (
-    r"E:\models\DA-2",
-    r"C:\models\DA-2",
+_DEFAULT_DAP_REPO_CANDIDATES = (
+    r"E:\models\DAP",
+    r"C:\models\DAP",
 )
 
 
 # ---------- env path discovery ----------
 
-def _da2_python() -> Path:
-    env = os.environ.get("ENV2LGT_DA2_ENV")
+def _dap_python() -> Path:
+    env = os.environ.get("ENV2LGT_DAP_ENV")
     if env:
         py = Path(env) / "python.exe"
         if py.exists():
             return py
-        raise RuntimeError(f"ENV2LGT_DA2_ENV is set to {env} but no python.exe there.")
-    for cand in _DEFAULT_DA2_ENV_CANDIDATES:
+        raise RuntimeError(f"ENV2LGT_DAP_ENV is set to {env} but no python.exe there.")
+    for cand in _DEFAULT_DAP_ENV_CANDIDATES:
         py = Path(cand) / "python.exe"
         if py.exists():
             return py
     raise RuntimeError(
-        "Could not locate the DA-2 conda env. Set ENV2LGT_DA2_ENV to the env directory, "
-        f"or create it at one of: {', '.join(_DEFAULT_DA2_ENV_CANDIDATES)}"
+        "Could not locate the DAP conda env. Create it from environment-dap.yml, "
+        "then set ENV2LGT_DAP_ENV to the env directory, or use one of: "
+        f"{', '.join(_DEFAULT_DAP_ENV_CANDIDATES)}"
     )
 
 
-def _da2_repo() -> Path:
-    repo = os.environ.get("ENV2LGT_DA2_REPO")
+def _dap_repo() -> Path:
+    repo = os.environ.get("ENV2LGT_DAP_REPO")
     if repo and Path(repo).is_dir():
         return Path(repo)
-    for cand in _DEFAULT_DA2_REPO_CANDIDATES:
+    for cand in _DEFAULT_DAP_REPO_CANDIDATES:
         if Path(cand).is_dir():
             return Path(cand)
     raise RuntimeError(
-        "Could not locate the DA-2 repo (configs/infer.json). Set ENV2LGT_DA2_REPO or "
-        f"clone the repo to one of: {', '.join(_DEFAULT_DA2_REPO_CANDIDATES)}"
+        "Could not locate the DAP repo. Clone https://github.com/Insta360-Research-Team/DAP "
+        "and set ENV2LGT_DAP_REPO, or clone to one of: "
+        f"{', '.join(_DEFAULT_DAP_REPO_CANDIDATES)}"
     )
-
-
-# ---------- shared helpers ----------
-
-def _hash_file(path: Path, chunk: int = 1 << 20) -> str:
-    h = hashlib.sha1()
-    with path.open("rb") as f:
-        while True:
-            buf = f.read(chunk)
-            if not buf:
-                break
-            h.update(buf)
-    return h.hexdigest()[:16]
-
-
-def _read_distance_exr(path: Path) -> np.ndarray:
-    inp = oiio.ImageInput.open(str(path))
-    if inp is None:
-        raise IOError(f"Could not read DA-2 output {path}: {oiio.geterror()}")
-    try:
-        spec = inp.spec()
-        pixels = inp.read_image(format="float")
-    finally:
-        inp.close()
-    arr = np.asarray(pixels, dtype=np.float32).reshape(spec.height, spec.width, spec.nchannels)
-    return arr[..., 0] if arr.shape[-1] > 1 else arr.squeeze(-1)
 
 
 # ---------- backend ----------
 
-class Da2Backend:
-    """DepthBackend backed by a persistent DA-2 inference daemon."""
+class DapBackend:
+    """DepthBackend backed by a persistent DAP inference daemon."""
 
-    name = "da2"
-    is_metric = False
+    name = "dap"
+    is_metric = True
 
     def __init__(self) -> None:
         self._daemon: subprocess.Popen | None = None
@@ -115,32 +91,31 @@ class Da2Backend:
     @staticmethod
     def _drain_stderr(proc: subprocess.Popen) -> None:
         """Drain stderr in a background thread so the daemon doesn't block on a
-        full pipe. Lines are echoed to our own stderr with a [da2-daemon] tag."""
+        full pipe. Lines are echoed to our own stderr with a [dap-daemon] tag."""
         try:
             for line in proc.stderr:  # type: ignore[union-attr]
                 if not line:
                     break
-                sys.stderr.write(f"[da2-daemon] {line.rstrip()}\n")
+                sys.stderr.write(f"[dap-daemon] {line.rstrip()}\n")
             sys.stderr.flush()
         except Exception:  # noqa: BLE001
             pass
 
     def _spawn_daemon(self) -> subprocess.Popen:
-        py = _da2_python()
-        repo = _da2_repo()
-        config_path = repo / "configs" / "infer.json"
-        helper = Path(__file__).resolve().parents[2] / "scripts" / "da2_infer.py"
+        py = _dap_python()
+        repo = _dap_repo()
+        helper = Path(__file__).resolve().parents[2] / "scripts" / "dap_infer.py"
         if not helper.exists():
-            raise RuntimeError(f"DA-2 helper script not found at {helper}")
+            raise RuntimeError(f"DAP helper script not found at {helper}")
 
         env = os.environ.copy()
-        env["ENV2LGT_DA2_REPO"] = str(repo)
-        env.setdefault("PYTHONPATH", str(repo / "src"))
+        env["ENV2LGT_DAP_REPO"] = str(repo)
+        env.setdefault("PYTHONPATH", str(repo))
         env.setdefault("HF_HOME", os.environ.get("HF_HOME", r"E:\models\huggingface"))
         env["PYTHONUNBUFFERED"] = "1"
 
         proc = subprocess.Popen(
-            [str(py), str(helper), "--serve", "--config", str(config_path)],
+            [str(py), str(helper), "--serve", "--repo", str(repo)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -148,23 +123,21 @@ class Da2Backend:
             text=True,
             bufsize=1,
         )
-        # Drain stderr so the daemon never blocks on a full pipe.
         self._stderr_drain_thread = threading.Thread(
             target=self._drain_stderr, args=(proc,), daemon=True
         )
         self._stderr_drain_thread.start()
 
-        # Wait for the {"ready": true} line.
         ready_line = proc.stdout.readline()  # type: ignore[union-attr]
         if not ready_line:
             rc = proc.poll()
-            raise RuntimeError(f"DA-2 daemon exited before signalling ready (rc={rc})")
+            raise RuntimeError(f"DAP daemon exited before signalling ready (rc={rc})")
         try:
             msg = json.loads(ready_line)
         except json.JSONDecodeError:
-            raise RuntimeError(f"DA-2 daemon sent non-JSON line: {ready_line!r}")
+            raise RuntimeError(f"DAP daemon sent non-JSON line: {ready_line!r}")
         if not msg.get("ready"):
-            raise RuntimeError(f"DA-2 daemon error: {msg}")
+            raise RuntimeError(f"DAP daemon error: {msg}")
         return proc
 
     def _get_daemon(self) -> subprocess.Popen:
@@ -199,11 +172,10 @@ class Da2Backend:
     def estimate_depth(
         self, exr_path: str | Path, cache_dir: str | Path | None = None
     ) -> np.ndarray:
-        """Run DA-2 on `exr_path`, return distance (H, W) float32.
+        """Run DAP on `exr_path`, return *metric* depth (H, W) float32.
 
-        Caches the result by file hash next to the EXR (or in `cache_dir`).
-        Persists the daemon across calls — first call pays ~14s cold start,
-        later calls are ~200ms total.
+        Cached by file hash next to the EXR (or in `cache_dir`). The cache
+        key carries a `.dap.` tag so DA-2 and DAP results never collide.
         """
         exr_path = Path(exr_path).resolve()
         if not exr_path.is_file():
@@ -211,7 +183,7 @@ class Da2Backend:
         file_hash = _hash_file(exr_path)
         cache_dir = Path(cache_dir) if cache_dir else exr_path.parent
         cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = cache_dir / f"{exr_path.stem}.{file_hash}.distance.exr"
+        cache_path = cache_dir / f"{exr_path.stem}.{file_hash}.dap.distance.exr"
 
         if cache_path.exists():
             return _read_distance_exr(cache_path)
@@ -223,10 +195,10 @@ class Da2Backend:
         resp_line = daemon.stdout.readline()  # type: ignore[union-attr]
         if not resp_line:
             rc = daemon.poll()
-            raise RuntimeError(f"DA-2 daemon exited mid-request (rc={rc})")
+            raise RuntimeError(f"DAP daemon exited mid-request (rc={rc})")
         resp = json.loads(resp_line)
         if not resp.get("ok"):
             raise RuntimeError(
-                f"DA-2 inference failed: {resp.get('error')}\n{resp.get('trace', '')}"
+                f"DAP inference failed: {resp.get('error')}\n{resp.get('trace', '')}"
             )
         return _read_distance_exr(cache_path)

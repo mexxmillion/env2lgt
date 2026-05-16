@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from env2lgt.depth.da2_runner import estimate_depth
+from env2lgt.depth import get_backend
 from env2lgt.io.exr import load_latlong, save_exr
 from env2lgt.lights.extract import (
     _output_size_for_quad,
@@ -39,6 +39,10 @@ class BakeOptions:
     write_depth_exr: bool = False
     write_depth_mesh: bool = False
     write_mask_json: bool = True
+    # Depth backend: "da2" (scale-invariant) or "dap" (metric). For metric
+    # backends `scene_scale` is a fine-tune multiplier rather than the
+    # primary meters-per-unit knob.
+    depth_backend: str = "da2"
     scene_scale: float = 1.0
     intensity_normalization: float = 1.0
     mask_dilate_px: int = 4
@@ -75,8 +79,9 @@ def bake(
     hdr = load_latlong(exr_path)
     H, W, _ = hdr.shape
 
-    _p("estimating depth (DA-2)", 0.10)
-    distance = estimate_depth(exr_path, cache_dir=out_dir)
+    backend = get_backend(opts.depth_backend)
+    _p(f"estimating depth ({backend.name.upper()})", 0.10)
+    distance = backend.estimate_depth(exr_path, cache_dir=out_dir)
     if distance.shape != (H, W):
         import cv2
 
@@ -197,6 +202,8 @@ def bake(
                 {
                     "yaw_offset_deg": float(opts.yaw_offset_deg),
                     "scene_scale": float(opts.scene_scale),
+                    "depth_backend": backend.name,
+                    "is_metric": bool(backend.is_metric),
                     "quads": [
                         {
                             "name": q.name,
@@ -215,6 +222,8 @@ def bake(
     return {
         "panorama": str(exr_path),
         "output_dir": str(out_dir),
+        "depth_backend": backend.name,
+        "is_metric": bool(backend.is_metric),
         "usd": str(usd_path) if usd_path else None,
         "dome": str(dome_tex_path) if dome_tex_path else None,
         "mesh": str(mesh_path) if mesh_path else None,

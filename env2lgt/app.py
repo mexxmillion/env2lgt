@@ -15,6 +15,7 @@ from PySide6.QtCore import QObject, QThread, Qt, Signal
 from PySide6.QtGui import QAction, QImage
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDockWidget,
     QFileDialog,
     QLabel,
@@ -29,7 +30,7 @@ from PySide6.QtWidgets import (
 import cv2
 
 from env2lgt.bake import BakeOptions, QuadSpec, bake
-from env2lgt.depth import da2_runner
+from env2lgt.depth import AVAILABLE_BACKENDS, get_backend, shutdown_all
 from env2lgt.io import depth_to_display_qimage, load_latlong, to_display_qimage
 from env2lgt.io.tonemap import aces_filmic
 from env2lgt.project import (
@@ -78,18 +79,21 @@ class BakeWorker(QObject):
 
 
 class DepthWorker(QObject):
-    """Background DA-2 run, used by the 'Show depth' toolbar toggle."""
+    """Background depth run, used by the 'Show depth' toolbar toggle."""
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, exr_path: str, cache_dir: str):
+    def __init__(self, exr_path: str, cache_dir: str, backend: str = "da2"):
         super().__init__()
         self._exr_path = exr_path
         self._cache_dir = cache_dir
+        self._backend = backend
 
     def run(self):
         try:
-            d = da2_runner.estimate_depth(self._exr_path, cache_dir=self._cache_dir)
+            d = get_backend(self._backend).estimate_depth(
+                self._exr_path, cache_dir=self._cache_dir
+            )
             self.finished.emit(d)
         except Exception as e:  # noqa: BLE001
             import traceback
@@ -118,6 +122,7 @@ class MainWindow(QMainWindow):
         # 100 m/u — typical indoor scenes look right at this scale in
         # usdview; the user can adjust via the toolbar slider.
         self._scene_scale: float = 100.0
+        self._depth_backend: str = "da2"
         self._yaw_offset_deg: float = 0.0
         self._last_usd: Path | None = None
         self._view_mode: str = "hdr"    # "hdr" or "depth"
@@ -227,6 +232,18 @@ class MainWindow(QMainWindow):
         yaw_reset_btn = QPushButton("Reset")
         yaw_reset_btn.clicked.connect(lambda: self._yaw_slider.setValue(0))
         tb.addWidget(yaw_reset_btn)
+
+        tb.addSeparator()
+        tb.addWidget(QLabel(" Depth "))
+        self._backend_combo = QComboBox()
+        _backend_labels = {"da2": "DA²", "dap": "DAP"}
+        for b in AVAILABLE_BACKENDS:
+            self._backend_combo.addItem(_backend_labels.get(b, b.upper()), b)
+        self._backend_combo.setCurrentIndex(
+            max(0, self._backend_combo.findData(self._depth_backend))
+        )
+        self._backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+        tb.addWidget(self._backend_combo)
 
         tb.addSeparator()
         self._depth_btn = QPushButton("Show depth")
@@ -415,6 +432,21 @@ class MainWindow(QMainWindow):
         self._scene_scale = float(10 ** (val / 100.0))
         self._scale_label.setText(f" {self._scene_scale:.3f} m/u ")
 
+    def _on_backend_changed(self, _idx: int):
+        name = self._backend_combo.currentData()
+        if name == self._depth_backend:
+            return
+        self._depth_backend = name
+        # The cached depth belongs to the previous backend — drop it.
+        self._distance = None
+        self._distance_display = None
+        if self._view_mode == "depth":
+            # Recompute under the new backend (toggle handler respawns the run).
+            self._display_cache = None
+            self._cache_key = None
+            self._on_depth_toggle(self._depth_btn.isChecked())
+        self.statusBar().showMessage(f"Depth backend: {self._backend_combo.currentText()}")
+
     def _on_yaw_offset(self, val: int):
         self._yaw_offset_deg = val / 10.0
         self._yaw_label.setText(f" {self._yaw_offset_deg:+6.1f}° ")
@@ -444,7 +476,9 @@ class MainWindow(QMainWindow):
         self._depth_btn.setEnabled(False)
         cache_dir = self._exr_path.parent / ".env2lgt_cache"
         self._depth_thread = QThread(self)
-        self._depth_worker = DepthWorker(str(self._exr_path), str(cache_dir))
+        self._depth_worker = DepthWorker(
+            str(self._exr_path), str(cache_dir), self._depth_backend
+        )
         self._depth_worker.moveToThread(self._depth_thread)
         self._depth_thread.started.connect(self._depth_worker.run)
         self._depth_worker.finished.connect(self._on_depth_ready)
@@ -453,7 +487,9 @@ class MainWindow(QMainWindow):
         self._depth_worker.failed.connect(self._depth_thread.quit)
         self._depth_thread.finished.connect(self._depth_worker.deleteLater)
         self._depth_thread.finished.connect(self._depth_thread.deleteLater)
-        self.statusBar().showMessage("Running DA-2 for depth view…")
+        self.statusBar().showMessage(
+            f"Running {self._backend_combo.currentText()} for depth view…"
+        )
         self._depth_thread.start()
 
     def _on_depth_ready(self, distance):
@@ -611,6 +647,7 @@ class MainWindow(QMainWindow):
             yaw_offset_deg=self._yaw_offset_deg,
             exposure_ev=self._exposure,
             dome_rotate_y_deg=self.panel.opt_dome_rotate.value(),
+            depth_backend=self._depth_backend,
             export_opts=self.panel.export_state(),
         )
         save_project(path, proj)
@@ -633,6 +670,16 @@ class MainWindow(QMainWindow):
             pass
         self._exposure = float(proj.scene.exposure_ev)
         self._exposure_label.setText(f" {self._exposure:+.1f} EV ")
+        # Depth backend (tolerate an unknown name from a newer/edited project).
+        backend = (proj.scene.depth_backend or "da2").strip().lower()
+        if backend not in AVAILABLE_BACKENDS:
+            backend = "da2"
+        self._depth_backend = backend
+        idx = self._backend_combo.findData(backend)
+        if idx >= 0:
+            self._backend_combo.blockSignals(True)
+            self._backend_combo.setCurrentIndex(idx)
+            self._backend_combo.blockSignals(False)
         # Apply export options (including dome rotation + output path)
         ex = {
             "dome": proj.export.dome,
@@ -677,6 +724,7 @@ class MainWindow(QMainWindow):
             write_depth_exr=False,
             write_depth_mesh=False,
             write_mask_json=False,
+            depth_backend=self._depth_backend,
             scene_scale=self._scene_scale,
             yaw_offset_deg=self._yaw_offset_deg,
         )
@@ -798,6 +846,7 @@ class MainWindow(QMainWindow):
             write_depth_exr=opts["depth_exr"],
             write_depth_mesh=opts["depth_mesh"],
             write_mask_json=opts["masks"],
+            depth_backend=self._depth_backend,
             scene_scale=self._scene_scale,
             yaw_offset_deg=self._yaw_offset_deg,
             dome_rotate_y_deg=opts.get("dome_rotate_y_deg", -180.0),
@@ -851,9 +900,9 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Bake failed", msg)
 
     def closeEvent(self, event):  # noqa: N802
-        # Politely kill the DA-2 daemon before Qt exits.
+        # Politely kill any depth-backend daemon before Qt exits.
         try:
-            da2_runner.shutdown()
+            shutdown_all()
         except Exception:
             pass
         super().closeEvent(event)
