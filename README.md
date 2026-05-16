@@ -4,7 +4,7 @@
 
 Built for VFX lighting pipelines: take an HDRI latlong EXR, mark the practical lights with 4 clicks each, and bake out a USD scene containing a `UsdLuxDomeLight` for the environment, one `UsdLuxRectLight` per marked light positioned in world space via monocular panorama depth (DA²), and a depth-displaced `UsdGeomMesh` of the scene for validation. Drop the result into Karma, RenderMan, Storm, or any other USD-aware renderer.
 
-![env2lgt GUI](doc/gui_preview.png)
+![env2lgt GUI](docs/gui_preview.png)
 
 > *Above: the env2lgt main window. A 4K HDRI is loaded; three light quads have been placed on ceiling fixtures (the large yellow one is selected, with its 4 corner handles visible). The right panel shows the quad list, output path, and per-rig export toggles.*
 
