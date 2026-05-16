@@ -6,14 +6,14 @@
 # the CUDA 12.4 index and DA-2 lives in a private git repo as `pip install -e`.
 #
 # Usage:
-#   conda env create -f environment-da2.yml -p E:\conda\envs\env2lgt-da2
-#   conda activate E:\conda\envs\env2lgt-da2
+#   conda env create -f environment-da2.yml   (creates a named env: env2lgt-da2)
+#   conda activate env2lgt-da2
 #
 #   :: torch + DA-2 (see requirements-da2.txt for the why)
 #   pip install --index-url https://download.pytorch.org/whl/cu124 ^
 #       torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0 xformers==0.0.28.post2
-#   git clone https://github.com/EnVision-Research/DA-2 E:\models\DA-2
-#   pip install -e E:\models\DA-2\src
+#   git clone https://github.com/EnVision-Research/DA-2 DA-2
+#   pip install -e DA-2\src
 #   pip install -r requirements-da2.txt
 
 name: env2lgt-da2

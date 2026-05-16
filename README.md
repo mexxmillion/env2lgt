@@ -158,36 +158,43 @@ The environments are defined in **`environment.yml`** (UI) and
 **`environment-da2.yml`** (depth). Pip extras are pinned in
 **`requirements.txt`** and **`requirements-da2.txt`**.
 
+Both YAML files declare a `name:`, so the commands below create the conda
+envs `env2lgt` and `env2lgt-da2` in your default conda location — no `E:`
+drive required. (If you prefer a specific location, add `-p <path>` to
+`conda env create` and substitute that path for the `-n <name>` flags below.)
+
 ```cmd
 :: ─── 1. UI / USD / EXR environment ───────────────────────────────
-conda env create -f environment.yml -p E:\conda\envs\env2lgt
-conda activate E:\conda\envs\env2lgt
+conda env create -f environment.yml
+conda activate env2lgt
 pip install -e .                                   :: registers `env2lgt` and `env2lgt-bake`
 
 :: ─── 2. DA-2 inference environment ──────────────────────────────
-conda env create -f environment-da2.yml -p E:\conda\envs\env2lgt-da2
+conda env create -f environment-da2.yml
 
 :: torch + xformers from the CUDA 12.4 index (the version DA-2 pins)
-E:\conda\envs\env2lgt-da2\Scripts\pip install ^
+conda run -n env2lgt-da2 pip install ^
     --index-url https://download.pytorch.org/whl/cu124 ^
     torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0 xformers==0.0.28.post2
 
-:: DA-2 itself (resolves the rest of its pinned tree)
-git clone https://github.com/EnVision-Research/DA-2 E:\models\DA-2
-E:\conda\envs\env2lgt-da2\Scripts\pip install -e E:\models\DA-2\src
+:: DA-2 itself (resolves the rest of its pinned tree).
+:: Clone anywhere you like, then point ENV2LGT_DA2_REPO at it (see below).
+git clone https://github.com/EnVision-Research/DA-2
+conda run -n env2lgt-da2 pip install -e DA-2\src
 
 :: triton + OpenEXR extras we add on top
-E:\conda\envs\env2lgt-da2\Scripts\pip install -r requirements-da2.txt
+conda run -n env2lgt-da2 pip install -r requirements-da2.txt
 
 :: ─── 3. DAP inference environment (optional) ─────────────────────
 :: Only needed to use the `dap` depth backend. DAP pins a newer torch
 :: than DA-2, so it gets its own env. Verified with torch 2.7.1 + cu128.
-conda env create -f environment-dap.yml -p E:\conda\envs\env2lgt-dap
-E:\conda\envs\env2lgt-dap\Scripts\pip install ^
+conda env create -f environment-dap.yml
+conda run -n env2lgt-dap pip install ^
     --index-url https://download.pytorch.org/whl/cu128 ^
     torch==2.7.1 torchvision==0.22.1
-git clone https://github.com/Insta360-Research-Team/DAP E:\models\DAP
-E:\conda\envs\env2lgt-dap\Scripts\pip install -r requirements-dap.txt
+:: Clone DAP anywhere, then point ENV2LGT_DAP_REPO at it (see below).
+git clone https://github.com/Insta360-Research-Team/DAP
+conda run -n env2lgt-dap pip install -r requirements-dap.txt
 
 :: DAP weights — download model.pth from HuggingFace into a folder of
 :: your choice, then point ENV2LGT_DAP_WEIGHTS at that folder.
@@ -199,29 +206,38 @@ note that you **still** need conda for `openusd`, `pyside6`, `py-openimageio`,
 and `openexr` — these aren't shippable as pip wheels on Windows in 2026.
 The `requirements.txt` only covers the pure-Python additions.
 
-### Cache locations (one-time)
+### Cache locations + DA-2 paths (one-time)
+
+Set these once with `setx` (paths are examples — point them anywhere with room):
 
 ```cmd
-setx HF_HOME             "E:\models\huggingface"
-setx TORCH_HOME          "E:\models\torch"
+setx HF_HOME             "D:\models\huggingface"
+setx TORCH_HOME          "D:\models\torch"
 setx HF_TOKEN            "hf_xxxxxxxxxxxxxxxxxxxxxx"
-setx ENV2LGT_DA2_ENV     "E:\conda\envs\env2lgt-da2"
-setx ENV2LGT_DA2_REPO    "E:\models\DA-2"
-setx ENV2LGT_DAP_ENV     "E:\conda\envs\env2lgt-dap"
-setx ENV2LGT_DAP_REPO    "E:\models\DAP"
-setx ENV2LGT_DAP_WEIGHTS "E:\models\DAP-weights"
+setx ENV2LGT_DA2_ENV     "<conda envs dir>\env2lgt-da2"
+setx ENV2LGT_DA2_REPO    "<where you cloned DA-2>"
+setx ENV2LGT_DAP_ENV     "<conda envs dir>\env2lgt-dap"
+setx ENV2LGT_DAP_REPO    "<where you cloned DAP>"
+setx ENV2LGT_DAP_WEIGHTS "<folder holding DAP model.pth>"
 ```
 
-The `ENV2LGT_*_ENV` / `ENV2LGT_*_REPO` path vars are optional — each runner falls back to `E:\conda\envs\env2lgt-da2` / `E:\models\DA-2` (and the `-dap` equivalents) if not set. **`ENV2LGT_DAP_WEIGHTS`** must point at the folder holding DAP's `model.pth` (no sensible default — the path baked into DAP's `config/infer.yaml` is the authors' own machine). `ENV2LGT_DEPTH_BACKEND` (`da2` | `dap`) picks the default backend; it defaults to `da2`.
+`ENV2LGT_*_ENV` / `ENV2LGT_*_REPO` tell each depth runner where its conda
+env and repo live. If unset, the runners fall back to `E:\conda\envs\...`
+and `E:\models\...` — so on any machine that isn't the original `E:`-drive
+setup, **set these**. Run `conda info --base` to find your conda envs
+directory. **`ENV2LGT_DAP_WEIGHTS`** must point at the folder holding DAP's
+`model.pth` (no sensible default — the path baked into DAP's
+`config/infer.yaml` is the authors' own machine). `ENV2LGT_DEPTH_BACKEND`
+(`da2` | `dap`) picks the default backend; it defaults to `da2`.
 
 ### Run
 
 ```cmd
-conda activate E:\conda\envs\env2lgt
+conda activate env2lgt
 python -m env2lgt.app
 ```
 
-Or the bundled launcher:
+Or the bundled launcher — edit the paths at the top of `launch.cmd` first:
 
 ```cmd
 launch.cmd

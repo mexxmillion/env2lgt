@@ -122,10 +122,6 @@ def bake(
             treat_as_window=q.is_window,
         )
 
-        color = mean_color_masked(hdr, mask_full)
-        power = total_emitted_power_masked(hdr, mask_full, (H, W))
-        intensity = float(power) * float(opts.intensity_normalization)
-
         # Texture: rectilinear projection onto the quad surface so that, when
         # mapped 1:1 onto the flat UsdLuxRectLight, it reproduces what the
         # camera sees in the panorama.
@@ -135,6 +131,19 @@ def bake(
             tex = sample_rect_texture(hdr, q.corners_dirs, out_h, out_w)
             tex_path = out_dir / f"{q.name}.exr"
             save_exr(tex_path, tex)
+
+        # UsdLuxRectLight emits intensity * color * textureFile. With a texture,
+        # the texture already carries the scene-linear HDR radiance, so leave
+        # intensity at 1 and color white — otherwise exposure is double-applied
+        # and the (tinted) mean color remaps the texture's chromaticity. Without
+        # a texture, fall back to the integrated-power proxy + mean color.
+        if tex_path is not None:
+            color = np.ones(3, dtype=np.float32)
+            intensity = 1.0
+        else:
+            color = mean_color_masked(hdr, mask_full)
+            power = total_emitted_power_masked(hdr, mask_full, (H, W))
+            intensity = float(power) * float(opts.intensity_normalization)
 
         specs.append(
             RectLightSpec(
