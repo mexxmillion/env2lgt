@@ -29,6 +29,9 @@ class QuadSpec:
 
     name: str
     corners_dirs: np.ndarray  # (4, 3) float64
+    # Window/portal: keep the rect at wall depth instead of fitting it to the
+    # bright region (the "light" is distant sky through the opening).
+    is_window: bool = False
 
 
 @dataclass
@@ -103,9 +106,16 @@ def bake(
         rasterized_masks.append(mask_full)
 
         _p(f"  fitting {q.name}", 0.20 + 0.4 * (i + 0.5) / max(1, len(quads)))
-        # Geometry from quad corners + median mask depth. No RANSAC on noisy
-        # per-pixel depth.
-        fit = rect_from_quad(q.corners_dirs, mask_full, distance, opts.scene_scale)
+        # Rect plane fit from the light's bright region (corners only set the
+        # angular footprint). Windows fall back to a per-corner-depth fit.
+        fit = rect_from_quad(
+            q.corners_dirs,
+            mask_full,
+            distance,
+            opts.scene_scale,
+            lum_full=lum_full,
+            treat_as_window=q.is_window,
+        )
 
         # Texture: rectilinear projection onto the quad surface so that, when
         # mapped 1:1 onto the flat UsdLuxRectLight, it reproduces what the
@@ -209,6 +219,7 @@ def bake(
                     "quads": [
                         {
                             "name": q.name,
+                            "is_window": bool(q.is_window),
                             "corners_dirs": [
                                 [float(c) for c in row] for row in q.corners_dirs.tolist()
                             ],

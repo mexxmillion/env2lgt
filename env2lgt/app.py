@@ -140,6 +140,7 @@ class MainWindow(QMainWindow):
         self.panel.delete_quad.connect(self._on_delete_quad)
         self.panel.select_quad.connect(self._on_panel_selected)
         self.panel.rename_quad.connect(self._on_rename_quad)
+        self.panel.window_toggled.connect(self._on_window_toggled)
         self.panel.add_quad_requested.connect(self._on_add_quad_requested)
         self.panel.bake_requested.connect(self._on_bake)
         self.panel.preview_requested.connect(self._on_preview)
@@ -487,9 +488,22 @@ class MainWindow(QMainWindow):
 
     # ---------- quad lifecycle ----------
 
+    def _quad_by_name(self, name: str) -> LightQuad | None:
+        return next((q for q in self.viewer.quads() if q.name == name), None)
+
+    def _refresh_window_checkbox(self, name: str) -> None:
+        q = self._quad_by_name(name) if name else None
+        self.panel.set_window_checkbox(name if q else "", bool(q.is_window) if q else False)
+
+    def _on_window_toggled(self, name: str, checked: bool):
+        q = self._quad_by_name(name)
+        if q is not None:
+            q.is_window = bool(checked)
+
     def _on_quad_committed(self, q: LightQuad):
         self.panel.add_quad(q)
         self.panel.set_selected(q.name)
+        self._refresh_window_checkbox(q.name)
 
     def _on_add_quad_requested(self):
         if self._hdr is None:
@@ -515,14 +529,17 @@ class MainWindow(QMainWindow):
     def _on_quad_selected(self, name: str):
         # Coming from viewer click
         self.panel.set_selected(name or None)
+        self._refresh_window_checkbox(name)
 
     def _on_panel_selected(self, name: str):
         # Coming from panel list — sync the visual highlight in viewer
         self.viewer._set_selected(name or None)
+        self._refresh_window_checkbox(name)
 
     def _on_delete_quad(self, name: str):
         self.viewer.remove_quad(name)
         self.panel.remove_quad(name)
+        self._refresh_window_checkbox(self.viewer.selected() or "")
 
     def _on_rename_quad(self, old_name: str, new_name: str):
         actual = self.viewer.rename_quad(old_name, new_name)
@@ -647,7 +664,11 @@ class MainWindow(QMainWindow):
         self.panel.apply_export_state(ex)
         # Quads
         for q in proj.quads:
-            lq = LightQuad(name=q.name, corners_dirs=np.asarray(q.corners_dirs, dtype=np.float64))
+            lq = LightQuad(
+                name=q.name,
+                corners_dirs=np.asarray(q.corners_dirs, dtype=np.float64),
+                is_window=bool(getattr(q, "is_window", False)),
+            )
             self.viewer.add_quad(lq)
             self.panel.add_quad(lq)
         if proj.quads:
@@ -669,7 +690,10 @@ class MainWindow(QMainWindow):
         # cache lands somewhere reusable. We disable every write_* so nothing
         # else gets written.
         cache_dir = self._exr_path.parent / ".env2lgt_cache"
-        quad_specs = [QuadSpec(name=q.name, corners_dirs=q.corners_dirs) for q in quads]
+        quad_specs = [
+            QuadSpec(name=q.name, corners_dirs=q.corners_dirs, is_window=q.is_window)
+            for q in quads
+        ]
         opts = BakeOptions(
             write_dome=False,
             write_rects=False,
@@ -790,7 +814,10 @@ class MainWindow(QMainWindow):
                     return
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        quad_specs = [QuadSpec(name=q.name, corners_dirs=q.corners_dirs) for q in quads]
+        quad_specs = [
+            QuadSpec(name=q.name, corners_dirs=q.corners_dirs, is_window=q.is_window)
+            for q in quads
+        ]
         bake_opts = BakeOptions(
             write_dome=opts["dome"],
             write_rects=opts["rect"],
