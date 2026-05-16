@@ -1,0 +1,57 @@
+# --- secrets / tokens (must never commit) ---
+.env
+.env.*
+*.token
+*hf_*token*
+**/huggingface/token
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+*.egg
+
+# --- venvs / conda local installs ---
+.venv/
+venv/
+env/
+
+# --- caches we keep on E: (never commit, never check in by accident) ---
+hf_cache/
+torch_cache/
+.cache/
+
+# --- model weights & data ---
+weights/
+models/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# --- runtime outputs ---
+output/
+outputs/
+out/
+*.exr
+*.usd
+*.usda
+*.usdc
+*.usdz
+*.ply
+
+# --- editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- not in scope but generated ---
+*.log
