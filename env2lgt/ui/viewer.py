@@ -119,11 +119,6 @@ class _VertexHandle(QGraphicsEllipseItem):
             self._owner.on_vertex_dragged(self._index, self.scenePos())
         return super().itemChange(change, value)
 
-    def mousePressEvent(self, event):  # noqa: N802
-        super().mousePressEvent(event)
-        # New drag — clear any stale magnetic snap lock.
-        self._owner.begin_vertex_drag()
-
 
 # ---------- viewer ----------
 
@@ -152,16 +147,6 @@ class PanoramaViewer(QGraphicsView):
         # All quad data remains in absolute spherical coords; we convert
         # display<->absolute at click / render time.
         self._yaw_offset_px = 0
-        # Snap-to-bright: when enabled, placed/dragged vertices jump to the
-        # brightest pixel within `_snap_radius` (in pano/display pixels).
-        # `_lum` is a display-resolution luminance map (set by the app).
-        self._snap_enabled = False
-        self._snap_radius = 24           # catch radius (px)
-        self._snap_release_radius = 56   # hysteresis: drag this far from a
-        #                                  lock to break free during a drag
-        self._snap_threshold = 0.0       # min luminance to count as "a light"
-        self._lum: np.ndarray | None = None
-        self._drag_snap_target: tuple[float, float] | None = None
         # Middle-mouse pan state.
         self._panning = False
         self._pan_last: QPointF | None = None
@@ -230,76 +215,6 @@ class PanoramaViewer(QGraphicsView):
             self._set_selected(sel)
         if self._W > 0:
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-
-    def set_luminance(self, lum: np.ndarray | None) -> None:
-        """Display-resolution luminance map used for snap-to-bright. Pass None
-        to disable snapping (e.g. before an EXR is loaded)."""
-        self._lum = lum
-        if lum is not None:
-            # A snap target must be a genuine light, not a moderately-lit
-            # wall. Use the 99th-percentile luminance OR 8% of the peak,
-            # whichever is higher — lights are the brightest ~1% of pixels
-            # and always far above a wall. This is also the cutoff that
-            # makes the magnetic snap *release* when dragged off a fixture.
-            self._snap_threshold = max(
-                float(np.percentile(lum, 99.0)),
-                0.08 * float(lum.max()),
-            )
-        else:
-            self._snap_threshold = 0.0
-
-    def set_snap_enabled(self, on: bool) -> None:
-        self._snap_enabled = bool(on)
-
-    def begin_vertex_drag(self) -> None:
-        """Called when a vertex handle is grabbed — clears the magnetic lock
-        so each drag starts fresh."""
-        self._drag_snap_target = None
-
-    def _snap_absolute(self, u_abs: float, v: float) -> tuple[float, float]:
-        """Brightest pixel within `_snap_radius` of (u_abs, v). Returns the
-        input unchanged if snap is off, there's no luminance map, or nothing
-        in range is bright enough to be a light. Horizontal search wraps the
-        seam; vertical clamps at the poles."""
-        if not self._snap_enabled or self._lum is None:
-            return u_abs, v
-        H, W = self._lum.shape
-        r = self._snap_radius
-        cx = int(round(u_abs)) % W
-        cy = int(round(v))
-        xs = np.arange(cx - r, cx + r + 1) % W
-        ys = np.arange(max(0, cy - r), min(H, cy + r + 1))
-        if xs.size == 0 or ys.size == 0:
-            return u_abs, v
-        patch = self._lum[np.ix_(ys, xs)]
-        iy, ix = np.unravel_index(int(np.argmax(patch)), patch.shape)
-        if float(patch[iy, ix]) < self._snap_threshold:
-            return u_abs, v          # nothing bright nearby — no snap
-        return float(xs[ix]) + 0.5, float(ys[iy]) + 0.5
-
-    def _magnetic_snap(self, u_abs: float, v: float) -> tuple[float, float]:
-        """Hysteresis snap used *during* a vertex drag. Once locked to a
-        bright pixel the handle stays stuck to it until the cursor is dragged
-        more than `_snap_release_radius` away; only then does it break free
-        and start looking for a new lock. This lets you fine-tune an
-        imperfect snap by pulling the handle clear of the fixture."""
-        if not self._snap_enabled or self._lum is None:
-            return u_abs, v
-        W = self._lum.shape[1]
-        if self._drag_snap_target is not None:
-            tx, ty = self._drag_snap_target
-            dx = abs(u_abs - tx)
-            dx = min(dx, W - dx)                       # wrap-aware
-            dist = (dx * dx + (v - ty) ** 2) ** 0.5
-            if dist <= self._snap_release_radius:
-                return tx, ty                          # stay locked
-            self._drag_snap_target = None              # pulled free
-        # Not locked — look for a new catch.
-        su, sv = self._snap_absolute(u_abs, v)
-        if su != u_abs or sv != v:
-            self._drag_snap_target = (su, sv)
-            return su, sv
-        return u_abs, v
 
     def set_yaw_offset_px(self, px: int) -> None:
         """Caller passes the offset they rolled the HDR by. Viewer stores it
@@ -409,18 +324,15 @@ class PanoramaViewer(QGraphicsView):
     # ---------- 4-click placement ----------
 
     def _place_vertex(self, scene_pt: QPointF) -> None:
-        # display pixel -> absolute pano pixel -> (optional snap) -> spherical dir
+        # display pixel -> absolute pano pixel -> spherical dir
         u_disp = float(scene_pt.x())
         v = float(scene_pt.y())
         u_abs = self._display_to_abs_x(u_disp)
-        if self._snap_enabled and self._lum is not None:
-            u_abs, v = self._snap_absolute(u_abs, v)
-            u_disp = self._abs_to_display_x(u_abs)
         yaw, pitch = pix_to_angles(np.array(u_abs), np.array(v), self._W, self._H)
         d = dir_from_angles(yaw, pitch)
         d = np.asarray(d, dtype=np.float64).reshape(3)
         self._placing_dirs.append(d)
-        # marker (placed at the possibly-snapped display position)
+        # marker
         dot = self._scene.addEllipse(
             -HANDLE_R, -HANDLE_R, HANDLE_R * 2, HANDLE_R * 2,
             QPen(QColor(20, 20, 20), 1),
@@ -567,15 +479,6 @@ class PanoramaViewer(QGraphicsView):
         u_disp = float(np.clip(scene_pos.x(), 0.0, self._W - 1))
         v = float(np.clip(scene_pos.y(), 0.0, self._H - 1))
         u_abs = self._display_to_abs_x(u_disp)
-        # Magnetic snap *during* the drag (hysteresis — see _magnetic_snap).
-        if self._snap_enabled and self._lum is not None:
-            su_abs, sv = self._magnetic_snap(u_abs, v)
-            if su_abs != u_abs or sv != v:
-                u_abs, v = su_abs, sv
-                if index < len(self._vertex_handles):
-                    self._vertex_handles[index].set_pano_pos_silent(
-                        self._abs_to_display_x(u_abs), v
-                    )
         yaw, pitch = pix_to_angles(np.array(u_abs), np.array(v), self._W, self._H)
         d = dir_from_angles(yaw, pitch)
         d = np.asarray(d, dtype=np.float64).reshape(3)

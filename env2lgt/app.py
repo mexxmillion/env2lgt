@@ -235,16 +235,6 @@ class MainWindow(QMainWindow):
         self._depth_btn.toggled.connect(self._on_depth_toggle)
         tb.addWidget(self._depth_btn)
 
-        self._snap_btn = QPushButton("Snap to bright")
-        self._snap_btn.setCheckable(True)
-        self._snap_btn.setShortcut("S")
-        self._snap_btn.setToolTip(
-            "When on, placing or dragging a quad vertex snaps it to the "
-            "brightest pixel within ~24 px — locks corners onto light edges."
-        )
-        self._snap_btn.toggled.connect(self.viewer.set_snap_enabled)
-        tb.addWidget(self._snap_btn)
-
     # ---------- file loading ----------
 
     def _open_exr_dialog(self):
@@ -285,13 +275,6 @@ class MainWindow(QMainWindow):
         self._display_cache = None
         self._cache_key = None
         self._distance_display = None
-        # Luminance map (display res) for snap-to-bright. BT.709 weights.
-        lum = (
-            0.2126 * self._hdr_display[..., 0]
-            + 0.7152 * self._hdr_display[..., 1]
-            + 0.0722 * self._hdr_display[..., 2]
-        ).astype(np.float32)
-        self.viewer.set_luminance(lum)
         self._exr_path = path
         # --- reset everything tied to the previous EXR ---
         # Yaw offset back to 0 (a stale offset would confuse quad placement).
