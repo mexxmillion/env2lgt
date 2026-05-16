@@ -51,6 +51,7 @@ class LightPanel(QWidget):
     delete_quad = Signal(str)
     select_quad = Signal(str)
     rename_quad = Signal(str, str)   # old_name, new_name
+    window_toggled = Signal(str, bool)  # quad name, is_window
     add_quad_requested = Signal()
     bake_requested = Signal(dict)
     preview_requested = Signal()
@@ -76,6 +77,18 @@ class LightPanel(QWidget):
         del_btn = QPushButton("Delete selected")
         del_btn.clicked.connect(self._on_delete)
         lb.addWidget(del_btn)
+        # Per-quad window/portal flag — applies to the selected quad.
+        self._sel_name = ""
+        self._window_cb = QCheckBox("Window / portal — sit on wall depth")
+        self._window_cb.setToolTip(
+            "For windows / skylights: keep the rect light on the wall plane "
+            "instead of sliding it in to the bright region (the bright pixels "
+            "are distant sky seen through the opening). Lets the rect double "
+            "as a portal."
+        )
+        self._window_cb.setEnabled(False)
+        self._window_cb.toggled.connect(self._on_window_toggled)
+        lb.addWidget(self._window_cb)
         layout.addWidget(list_box)
 
         out_box = QGroupBox("Output", self)
@@ -187,6 +200,18 @@ class LightPanel(QWidget):
     def _on_selection_changed(self):
         item = self._list.currentItem()
         self.select_quad.emit(item.data(0x0100) if item else "")
+
+    def set_window_checkbox(self, name: str, is_window: bool) -> None:
+        """Point the window checkbox at `name` (empty string → disabled)."""
+        self._sel_name = name or ""
+        self._window_cb.blockSignals(True)
+        self._window_cb.setEnabled(bool(name))
+        self._window_cb.setChecked(bool(is_window))
+        self._window_cb.blockSignals(False)
+
+    def _on_window_toggled(self, checked: bool):
+        if self._sel_name:
+            self.window_toggled.emit(self._sel_name, checked)
 
     def _on_item_changed(self, item: QListWidgetItem):
         if self._suppress_item_changed:

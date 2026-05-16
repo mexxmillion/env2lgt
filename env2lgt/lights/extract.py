@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from env2lgt.proj import angles_from_dir, angles_to_pix
+from env2lgt.proj import angles_from_dir, angles_to_pix, dir_from_angles, pix_to_angles
 
 
 @dataclass
@@ -380,76 +380,161 @@ def _depth_at_dir(distance: np.ndarray, corner_dir: np.ndarray, patch: int = 3) 
     return float(np.median(distance[np.ix_(vs, us)]))
 
 
-def rect_from_quad(
-    corners_dirs: np.ndarray,
-    mask_full: np.ndarray,
-    distance: np.ndarray,
-    scene_scale: float = 1.0,
-) -> RectFit:
-    """Build a UsdLuxRectLight transform/size from the user's quad.
-
-    Per-corner depth: each of the 4 corner rays is lifted to world space at
-    *its own* depth (sampled at that corner's pano pixel). Because the depths
-    differ, the 4 points follow the actual scene surface rather than sitting
-    on a sphere of constant radius — so a ceiling light's 4 corners land in a
-    horizontal plane and the fitted normal points straight down, instead of
-    radially back toward the camera origin.
-
-    This matches the depth-displaced validation mesh (env2lgt.usd.mesh): the
-    rect light's plane now coincides with the mesh surface under it.
-    """
-    corners = np.asarray(corners_dirs, dtype=np.float64).reshape(4, 3)
-    corners = corners / (np.linalg.norm(corners, axis=1, keepdims=True) + 1e-12)
-
-    # Mask-median depth — used only as a fallback for corners that read a
-    # bad (non-positive / NaN) depth value.
-    sel = mask_full > 0
-    mask_med = float(np.median(distance[sel])) if np.any(sel) else 1.0
-
-    # Per-corner depth.
-    depths = np.empty(4, dtype=np.float64)
-    for i in range(4):
-        d = _depth_at_dir(distance, corners[i])
-        if not np.isfinite(d) or d <= 1e-6:
-            d = mask_med
-        depths[i] = d
-    depths *= float(scene_scale)
-
-    # Lift each corner to its own depth → points on the real surface.
-    pts = corners * depths[:, None]          # (4, 3)
+def _fit_from_4points(pts: np.ndarray) -> tuple:
+    """Parallelogram + camera-facing normal from 4 ordered corner points
+    (TL, TR, BR, BL). Returns (center, normal, u_axis, v_axis, width, height)."""
     center = pts.mean(axis=0)
-
-    # Parallelogram fit: average opposite edges. Corner order is TL, TR, BR, BL.
+    # Average opposite edges → robust parallelogram axes.
     u_edge = 0.5 * ((pts[1] - pts[0]) + (pts[2] - pts[3]))
     v_edge = 0.5 * ((pts[3] - pts[0]) + (pts[2] - pts[1]))
     width = float(np.linalg.norm(u_edge))
     height = float(np.linalg.norm(v_edge))
     u_axis = u_edge / (width + 1e-12)
     v_axis = v_edge / (height + 1e-12)
-
-    # Surface normal = u x v (perpendicular to the fitted plane through the
-    # 4 real-depth corners). Flip so it points back toward the scene interior
-    # (the camera/origin side) — that's the emission direction for the light.
     normal = np.cross(u_axis, v_axis)
     nlen = np.linalg.norm(normal)
     if nlen < 1e-9:
-        # Degenerate quad (collinear corners) — fall back to radial normal.
-        normal = -corners.mean(axis=0)
-        normal /= np.linalg.norm(normal) + 1e-12
+        # Degenerate (collinear) — fall back to a radial normal.
+        normal = -center / (np.linalg.norm(center) + 1e-12)
     else:
         normal /= nlen
+    # Flip so the normal points back toward the camera/origin — the emission
+    # direction. Keep the (u, v, normal) frame right-handed after the flip.
     if float(center @ normal) > 0.0:
         normal = -normal
-        # Keep the (u, v, normal) frame right-handed after the flip.
         v_axis = -v_axis
+    return center, normal, u_axis, v_axis, max(1e-4, width), max(1e-4, height)
 
+
+def _corner_depths(
+    corners: np.ndarray, mask_full: np.ndarray, distance: np.ndarray, scene_scale: float
+) -> np.ndarray:
+    """Per-corner depth (× scene_scale), with a mask-median fallback for
+    corners that read a bad (non-positive / NaN) depth."""
+    sel = mask_full > 0
+    mask_med = float(np.median(distance[sel])) if np.any(sel) else 1.0
+    depths = np.empty(4, dtype=np.float64)
+    for i in range(4):
+        d = _depth_at_dir(distance, corners[i])
+        if not np.isfinite(d) or d <= 1e-6:
+            d = mask_med
+        depths[i] = d
+    return depths * float(scene_scale)
+
+
+def _bright_region_plane(
+    mask_full: np.ndarray,
+    distance: np.ndarray,
+    lum_full: np.ndarray,
+    scene_scale: float,
+    min_px: int = 64,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Fit a plane to the 3D points of the *bright* (light) pixels in the quad.
+
+    The user engulfs the light, so the quad corners sit on a mix of background
+    surfaces (wall, floor, the stand) — a fit through them is both too far and
+    mis-tilted. The light itself is the bright sub-region: an Otsu split of the
+    in-mask log-luminance isolates it, those pixels are lifted to 3D by their
+    depth, and a RANSAC plane is fit. Returns (centroid, unit normal), or None
+    if the bright region can't be isolated / fit.
+    """
+    sel = mask_full > 0
+    if int(sel.sum()) < min_px * 2:
+        return None
+    ys, xs = np.where(sel)
+    lum_sel = lum_full[sel].astype(np.float64)
+    dist_sel = distance[sel].astype(np.float64)
+    loglum = np.log(np.maximum(lum_sel, 1e-6))
+    lo, hi = float(loglum.min()), float(loglum.max())
+    if hi - lo < 1e-6:
+        return None  # uniform luminance — no light/wall split to make
+    u8 = ((loglum - lo) / (hi - lo) * 255.0).astype(np.uint8).reshape(-1, 1)
+    # Use cv2's thresholded output, not the returned threshold: for a
+    # degenerate 2-value histogram Otsu can report threshold 0, and a `>= 0`
+    # test would then select every pixel.
+    _, otsu = cv2.threshold(u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bright = (otsu.ravel() > 0) & np.isfinite(dist_sel) & (dist_sel > 1e-6)
+    if int(bright.sum()) < min_px:
+        return None
+    by, bx, bd = ys[bright], xs[bright], dist_sel[bright]
+    if by.size > 4000:  # cap point count for the RANSAC fit
+        idx = np.random.default_rng(0).choice(by.size, 4000, replace=False)
+        by, bx, bd = by[idx], bx[idx], bd[idx]
+    H, W = distance.shape
+    yaw, pitch = pix_to_angles(bx.astype(np.float64), by.astype(np.float64), W, H)
+    dirs = dir_from_angles(yaw, pitch)                       # (N, 3)
+    pts = dirs * (bd[:, None] * float(scene_scale))
+    centroid, normal, inliers = ransac_plane(pts)
+    if int(inliers.sum()) < min_px:
+        return None
+    return centroid, normal / (np.linalg.norm(normal) + 1e-12)
+
+
+def rect_from_quad(
+    corners_dirs: np.ndarray,
+    mask_full: np.ndarray,
+    distance: np.ndarray,
+    scene_scale: float = 1.0,
+    lum_full: np.ndarray | None = None,
+    treat_as_window: bool = False,
+) -> RectFit:
+    """Build a UsdLuxRectLight transform/size from the user's quad.
+
+    The user draws the quad to *engulf* a light, so its 4 corners sit on
+    whatever is behind/around it — wall, floor, the light stand. Fitting the
+    rect directly through those corner points is unreliable: it lands at the
+    background's depth and, when the corners straddle different surfaces,
+    picks up a spurious tilt.
+
+    So for an ordinary light, the rect plane (position *and* orientation)
+    comes from the light itself: the bright sub-region of the quad is fit
+    with a RANSAC plane (`_bright_region_plane`), and the 4 corner rays are
+    projected onto that plane to give the rect's extent. The quad still
+    defines the angular footprint; the light surface defines where/how it sits.
+
+    `treat_as_window=True` (or a missing `lum_full`, or a bright region too
+    small to fit) falls back to the per-corner-depth fit — correct for
+    windows/skylights, which are flush with the wall and whose bright pixels
+    are distant sky.
+    """
+    corners = np.asarray(corners_dirs, dtype=np.float64).reshape(4, 3)
+    corners = corners / (np.linalg.norm(corners, axis=1, keepdims=True) + 1e-12)
+
+    # --- light-plane fit: orientation + position from the light surface ---
+    if not treat_as_window and lum_full is not None:
+        plane = _bright_region_plane(mask_full, distance, lum_full, scene_scale)
+        if plane is not None:
+            centroid, pn = plane
+            plane_d = float(centroid @ pn)
+            denom = corners @ pn
+            if np.all(np.abs(denom) > 1e-6):
+                t = plane_d / denom
+                if np.all(t > 0):
+                    # Project each corner ray onto the light plane.
+                    proj = corners * t[:, None]
+                    center, normal, u_axis, v_axis, width, height = _fit_from_4points(proj)
+                    return RectFit(
+                        center=center.astype(np.float32),
+                        normal=normal.astype(np.float32),
+                        u_axis=u_axis.astype(np.float32),
+                        v_axis=v_axis.astype(np.float32),
+                        width=width,
+                        height=height,
+                        inlier_ratio=1.0,
+                        mean_distance=float(np.linalg.norm(center)),
+                    )
+
+    # --- fallback / window: per-corner depth fit ---
+    depths = _corner_depths(corners, mask_full, distance, scene_scale)
+    pts = corners * depths[:, None]
+    center, normal, u_axis, v_axis, width, height = _fit_from_4points(pts)
     return RectFit(
         center=center.astype(np.float32),
         normal=normal.astype(np.float32),
         u_axis=u_axis.astype(np.float32),
         v_axis=v_axis.astype(np.float32),
-        width=max(1e-4, width),
-        height=max(1e-4, height),
-        inlier_ratio=1.0,                    # by construction
+        width=width,
+        height=height,
+        inlier_ratio=1.0,
         mean_distance=float(depths.mean()),
     )

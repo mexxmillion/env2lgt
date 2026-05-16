@@ -31,6 +31,7 @@ PROJECT_SUFFIX = ".env2lgt.json"
 class QuadState:
     name: str
     corners_dirs: list[list[float]]  # (4, 3) — float-list-of-lists for JSON
+    is_window: bool = False
 
 
 @dataclass
@@ -108,7 +109,11 @@ def load_project(path: str | Path) -> Project:
     scene = SceneState(**_filt(scene_raw, {f.name for f in SceneState.__dataclass_fields__.values()}))  # type: ignore[attr-defined]
     export = ExportState(**_filt(export_raw, {f.name for f in ExportState.__dataclass_fields__.values()}))  # type: ignore[attr-defined]
     quads = [
-        QuadState(name=q["name"], corners_dirs=[[float(c) for c in row] for row in q["corners_dirs"]])
+        QuadState(
+            name=q["name"],
+            corners_dirs=[[float(c) for c in row] for row in q["corners_dirs"]],
+            is_window=bool(q.get("is_window", False)),
+        )
         for q in raw.get("quads", [])
     ]
     return Project(
@@ -144,6 +149,7 @@ def project_from_app_state(
             QuadState(
                 name=q.name,
                 corners_dirs=[[float(c) for c in row] for row in np.asarray(q.corners_dirs).tolist()],
+                is_window=bool(getattr(q, "is_window", False)),
             )
             for q in quads
         ],
