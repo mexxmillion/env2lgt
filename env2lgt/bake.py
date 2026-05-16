@@ -20,6 +20,7 @@ from env2lgt.lights.extract import (
 from env2lgt.lights.inpaint import edge_extend
 from env2lgt.proj import rasterize_spherical_quad
 from env2lgt.usd.lightrig import RectLightSpec, write_light_rig
+from env2lgt.usd.mesh import write_panorama_mesh
 
 
 @dataclass
@@ -169,6 +170,17 @@ def bake(
             dome_intensity=1.0,
         )
 
+    # ---------- depth mesh USD (validation) ----------
+    mesh_path: Path | None = None
+    if opts.write_depth_mesh:
+        _p("writing depth mesh USD", 0.96)
+        mesh_path = write_panorama_mesh(
+            out_dir / "panorama_geo.usda",
+            distance=distance,
+            dome_texture=dome_tex_path,
+            scene_scale=opts.scene_scale,
+        )
+
     # ---------- mask sidecar ----------
     if opts.write_mask_json:
         import json
@@ -198,6 +210,7 @@ def bake(
         "output_dir": str(out_dir),
         "usd": str(usd_path) if usd_path else None,
         "dome": str(dome_tex_path) if dome_tex_path else None,
+        "mesh": str(mesh_path) if mesh_path else None,
         "rect_lights": [s.name for s in specs],
         "rect_fits": summaries,
     }

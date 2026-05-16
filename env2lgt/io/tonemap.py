@@ -2,7 +2,7 @@
 
 This is for *display only* — the underlying float buffer is never modified.
 Operators implemented: linear exposure + ACES Filmic approximation (Krzysztof
-Narkowicz) + sRGB encode.
+Narkowicz) + sRGB encode. Also a turbo-colormap helper for the depth view.
 """
 
 from __future__ import annotations
@@ -40,3 +40,27 @@ def to_display_qimage(hdr: np.ndarray, exposure: float = 0.0, use_aces: bool = T
     u8 = np.ascontiguousarray(u8)
     h, w, _ = u8.shape
     return QImage(u8.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
+
+
+def depth_to_display_qimage(distance: np.ndarray, invert: bool = False) -> QImage:
+    """Turbo-colormap a per-pixel distance map for visual inspection.
+
+    `distance` is (H, W) float32 from DA-2. Range is per-image normalized
+    (DA-2's output is scale-invariant). `invert` flips so near=hot when True.
+    """
+    import cv2
+
+    if distance.ndim != 2:
+        raise ValueError(f"Expected (H, W), got {distance.shape}")
+    d = distance.astype(np.float32)
+    lo, hi = float(d.min()), float(d.max())
+    span = max(1e-6, hi - lo)
+    norm = (d - lo) / span
+    if invert:
+        norm = 1.0 - norm
+    u8 = (np.clip(norm, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    cm_bgr = cv2.applyColorMap(u8, cv2.COLORMAP_TURBO)
+    cm_rgb = cv2.cvtColor(cm_bgr, cv2.COLOR_BGR2RGB)
+    cm_rgb = np.ascontiguousarray(cm_rgb)
+    h, w, _ = cm_rgb.shape
+    return QImage(cm_rgb.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()

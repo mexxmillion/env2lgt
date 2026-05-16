@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 
 from env2lgt.bake import BakeOptions, QuadSpec, bake
 from env2lgt.depth import da2_runner
-from env2lgt.io import load_latlong, to_display_qimage
+from env2lgt.io import depth_to_display_qimage, load_latlong, to_display_qimage
 from env2lgt.ui.light_panel import LightPanel
 from env2lgt.ui.viewer import LightQuad, PanoramaViewer
 
@@ -60,6 +60,25 @@ class BakeWorker(QObject):
             self.failed.emit(f"{e}\n\n{traceback.format_exc()}")
 
 
+class DepthWorker(QObject):
+    """Background DA-2 run, used by the 'Show depth' toolbar toggle."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, exr_path: str, cache_dir: str):
+        super().__init__()
+        self._exr_path = exr_path
+        self._cache_dir = cache_dir
+
+    def run(self):
+        try:
+            d = da2_runner.estimate_depth(self._exr_path, cache_dir=self._cache_dir)
+            self.finished.emit(d)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            self.failed.emit(f"{e}\n\n{traceback.format_exc()}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -76,6 +95,10 @@ class MainWindow(QMainWindow):
         self._scene_scale: float = 10.0
         self._yaw_offset_deg: float = 0.0
         self._last_usd: Path | None = None
+        self._distance: np.ndarray | None = None
+        self._view_mode: str = "hdr"    # "hdr" or "depth"
+        self._depth_thread: QThread | None = None
+        self._depth_worker: DepthWorker | None = None
         self._worker: BakeWorker | None = None
         self._thread: QThread | None = None
 
@@ -172,6 +195,13 @@ class MainWindow(QMainWindow):
         yaw_reset_btn.clicked.connect(lambda: self._yaw_slider.setValue(0))
         tb.addWidget(yaw_reset_btn)
 
+        tb.addSeparator()
+        self._depth_btn = QPushButton("Show depth")
+        self._depth_btn.setCheckable(True)
+        self._depth_btn.setShortcut("D")
+        self._depth_btn.toggled.connect(self._on_depth_toggle)
+        tb.addWidget(self._depth_btn)
+
     # ---------- file loading ----------
 
     def _open_exr_dialog(self):
@@ -208,6 +238,15 @@ class MainWindow(QMainWindow):
         self._yaw_offset_deg = 0.0
         if hasattr(self, "_yaw_label"):
             self._yaw_label.setText("  0.0° ")
+        # Drop cached depth — it's for the previous EXR.
+        self._distance = None
+        self._view_mode = "hdr"
+        if hasattr(self, "_depth_btn"):
+            self._depth_btn.blockSignals(True)
+            self._depth_btn.setChecked(False)
+            self._depth_btn.setEnabled(True)
+            self._depth_btn.setText("Show depth")
+            self._depth_btn.blockSignals(False)
         self.viewer.reset_image()
         # rebuild panel list cleanly
         for name in list(self.viewer._quads.keys()):  # _quads cleared above; loop is no-op but safe
@@ -247,14 +286,18 @@ class MainWindow(QMainWindow):
         # Convert yaw offset (deg) into integer pano-pixel shift. Positive
         # offset rolls content to the right (the seam moves left).
         offset_px = int(round((self._yaw_offset_deg / 360.0) * W)) % W
-        if offset_px != 0:
-            display_hdr = np.roll(self._hdr, offset_px, axis=1)
+
+        if self._view_mode == "depth" and self._distance is not None:
+            buf = self._distance
+            if offset_px != 0:
+                buf = np.roll(buf, offset_px, axis=1)
+            qimg = depth_to_display_qimage(buf)
         else:
-            display_hdr = self._hdr
-        qimg = to_display_qimage(display_hdr, exposure=self._exposure)
-        # Tell the viewer the current display offset BEFORE handing it the image,
-        # so when it re-projects existing quads onto the new pixmap it uses the
-        # right transform.
+            buf = self._hdr
+            if offset_px != 0:
+                buf = np.roll(buf, offset_px, axis=1)
+            qimg = to_display_qimage(buf, exposure=self._exposure)
+
         self.viewer.set_yaw_offset_px(offset_px)
         self.viewer.set_image(qimg)
 
@@ -271,6 +314,55 @@ class MainWindow(QMainWindow):
         self._yaw_offset_deg = val / 10.0
         self._yaw_label.setText(f" {self._yaw_offset_deg:+6.1f}° ")
         self._refresh_view()
+
+    def _on_depth_toggle(self, checked: bool):
+        if not checked:
+            self._view_mode = "hdr"
+            self._depth_btn.setText("Show depth")
+            self._refresh_view()
+            return
+        if self._exr_path is None or self._hdr is None:
+            self._depth_btn.setChecked(False)
+            return
+        if self._distance is not None:
+            # Already computed (cache hit) — instant switch.
+            self._view_mode = "depth"
+            self._depth_btn.setText("Show HDR")
+            self._refresh_view()
+            return
+        # Need to compute — kick off background DA-2.
+        self._depth_btn.setText("Computing depth…")
+        self._depth_btn.setEnabled(False)
+        cache_dir = self._exr_path.parent / ".env2lgt_cache"
+        self._depth_thread = QThread(self)
+        self._depth_worker = DepthWorker(str(self._exr_path), str(cache_dir))
+        self._depth_worker.moveToThread(self._depth_thread)
+        self._depth_thread.started.connect(self._depth_worker.run)
+        self._depth_worker.finished.connect(self._on_depth_ready)
+        self._depth_worker.failed.connect(self._on_depth_failed)
+        self._depth_worker.finished.connect(self._depth_thread.quit)
+        self._depth_worker.failed.connect(self._depth_thread.quit)
+        self._depth_thread.finished.connect(self._depth_worker.deleteLater)
+        self._depth_thread.finished.connect(self._depth_thread.deleteLater)
+        self.statusBar().showMessage("Running DA-2 for depth view…")
+        self._depth_thread.start()
+
+    def _on_depth_ready(self, distance):
+        self._distance = distance
+        self._view_mode = "depth"
+        self._depth_btn.setEnabled(True)
+        self._depth_btn.setText("Show HDR")
+        self.statusBar().showMessage(
+            f"Depth ready  ·  range [{distance.min():.3f}, {distance.max():.3f}] (DA-2 scale-invariant)"
+        )
+        self._refresh_view()
+
+    def _on_depth_failed(self, msg: str):
+        self._distance = None
+        self._depth_btn.setEnabled(True)
+        self._depth_btn.setChecked(False)
+        self._depth_btn.setText("Show depth")
+        QMessageBox.critical(self, "Depth failed", msg)
 
     # ---------- quad lifecycle ----------
 
