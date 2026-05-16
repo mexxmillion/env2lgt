@@ -37,6 +37,10 @@ _DEFAULT_DAP_REPO_CANDIDATES = (
     r"E:\models\DAP",
     r"C:\models\DAP",
 )
+_DEFAULT_DAP_WEIGHTS_CANDIDATES = (
+    r"E:\models\DAP-weights",
+    r"C:\models\DAP-weights",
+)
 
 
 # ---------- env path discovery ----------
@@ -70,6 +74,22 @@ def _dap_repo() -> Path:
         "Could not locate the DAP repo. Clone https://github.com/Insta360-Research-Team/DAP "
         "and set ENV2LGT_DAP_REPO, or clone to one of: "
         f"{', '.join(_DEFAULT_DAP_REPO_CANDIDATES)}"
+    )
+
+
+def _dap_weights() -> Path:
+    """Locate the directory holding DAP's model.pth."""
+    w = os.environ.get("ENV2LGT_DAP_WEIGHTS")
+    if w and (Path(w) / "model.pth").is_file():
+        return Path(w)
+    for cand in _DEFAULT_DAP_WEIGHTS_CANDIDATES:
+        if (Path(cand) / "model.pth").is_file():
+            return Path(cand)
+    raise RuntimeError(
+        "Could not locate DAP weights (model.pth). Download from "
+        "https://huggingface.co/Insta360-Research/DAP-weights and set "
+        "ENV2LGT_DAP_WEIGHTS to the directory containing it, or place it at "
+        f"one of: {', '.join(_DEFAULT_DAP_WEIGHTS_CANDIDATES)}"
     )
 
 
@@ -110,6 +130,7 @@ class DapBackend:
 
         env = os.environ.copy()
         env["ENV2LGT_DAP_REPO"] = str(repo)
+        env["ENV2LGT_DAP_WEIGHTS"] = str(_dap_weights())
         env.setdefault("PYTHONPATH", str(repo))
         env.setdefault("HF_HOME", os.environ.get("HF_HOME", r"E:\models\huggingface"))
         env["PYTHONUNBUFFERED"] = "1"
