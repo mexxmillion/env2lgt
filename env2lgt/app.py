@@ -229,8 +229,8 @@ class MainWindow(QMainWindow):
                 return
         self._hdr = hdr
         self._exr_path = path
-        # Reset yaw offset when loading a new EXR — quad placements are
-        # absolute so they wouldn't drift, but a stale offset is confusing.
+        # --- reset everything tied to the previous EXR ---
+        # Yaw offset back to 0 (a stale offset would confuse quad placement).
         if hasattr(self, "_yaw_slider"):
             self._yaw_slider.blockSignals(True)
             self._yaw_slider.setValue(0)
@@ -247,12 +247,15 @@ class MainWindow(QMainWindow):
             self._depth_btn.setEnabled(True)
             self._depth_btn.setText("Show depth")
             self._depth_btn.blockSignals(False)
+        # Last bake's USD is no longer applicable.
+        self._last_usd = None
+        # Clear quads everywhere — viewer state, panel list, viewer's stored dict.
+        # IMPORTANT: viewer.reset_image() empties self.viewer._quads, so we
+        # can't iterate it afterwards to remove panel entries. Just clear the
+        # panel list directly.
         self.viewer.reset_image()
-        # rebuild panel list cleanly
-        for name in list(self.viewer._quads.keys()):  # _quads cleared above; loop is no-op but safe
-            self.panel.remove_quad(name)
-        # Reset the output path to the default for this EXR (always — every new EXR
-        # gets its own default; user can still override after).
+        self.panel.clear_quads()
+        # Reset output path to default for this EXR.
         default_out = str(path.parent / f"{path.stem}_lightrig")
         self.panel.force_set_output_path(default_out)
         self._refresh_view()

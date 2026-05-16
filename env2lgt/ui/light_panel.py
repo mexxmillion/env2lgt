@@ -142,6 +142,12 @@ class LightPanel(QWidget):
                 self._list.takeItem(i)
                 return
 
+    def clear_quads(self) -> None:
+        """Drop every entry. Used when loading a new EXR."""
+        self._suppress_item_changed = True
+        self._list.clear()
+        self._suppress_item_changed = False
+
     def set_selected(self, name: str | None) -> None:
         self._list.blockSignals(True)
         if not name:
