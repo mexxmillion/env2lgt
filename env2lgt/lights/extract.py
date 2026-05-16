@@ -366,6 +366,20 @@ def sample_rect_texture(
 
 # ---------- rect-light geometry directly from quad corners ----------
 
+def _depth_at_dir(distance: np.ndarray, corner_dir: np.ndarray, patch: int = 3) -> float:
+    """Sample the depth map along `corner_dir`. Returns the median of a small
+    pixel patch (noise-robust). Horizontal wrap handled for seam-spanning
+    corners; vertical clamped at the poles."""
+    H, W = distance.shape
+    yaw, pitch = angles_from_dir(np.asarray(corner_dir, dtype=np.float64))
+    u, v = angles_to_pix(yaw, pitch, W, H)
+    ui = int(round(float(np.asarray(u))))
+    vi = int(round(float(np.asarray(v))))
+    us = [(ui + dx) % W for dx in range(-patch, patch + 1)]
+    vs = [min(max(vi + dy, 0), H - 1) for dy in range(-patch, patch + 1)]
+    return float(np.median(distance[np.ix_(vs, us)]))
+
+
 def rect_from_quad(
     corners_dirs: np.ndarray,
     mask_full: np.ndarray,
@@ -374,33 +388,38 @@ def rect_from_quad(
 ) -> RectFit:
     """Build a UsdLuxRectLight transform/size from the user's quad.
 
-    Strategy: estimate a single radial distance D from the depth map inside
-    the mask (median of valid pixels — robust to outliers). Each corner ray
-    lifted to 3D at distance D gives 4 coplanar-ish world points; we fit a
-    parallelogram (averaging opposite edges) → center, U/V axes, width,
-    height, normal.
+    Per-corner depth: each of the 4 corner rays is lifted to world space at
+    *its own* depth (sampled at that corner's pano pixel). Because the depths
+    differ, the 4 points follow the actual scene surface rather than sitting
+    on a sphere of constant radius — so a ceiling light's 4 corners land in a
+    horizontal plane and the fitted normal points straight down, instead of
+    radially back toward the camera origin.
 
-    This makes the rect-light size *exactly the user's quad*, with only the
-    overall position depending on depth.
+    This matches the depth-displaced validation mesh (env2lgt.usd.mesh): the
+    rect light's plane now coincides with the mesh surface under it.
     """
     corners = np.asarray(corners_dirs, dtype=np.float64).reshape(4, 3)
     corners = corners / (np.linalg.norm(corners, axis=1, keepdims=True) + 1e-12)
 
-    # Median distance under the mask (robust to depth blips at edges).
+    # Mask-median depth — used only as a fallback for corners that read a
+    # bad (non-positive / NaN) depth value.
     sel = mask_full > 0
-    if np.any(sel):
-        D = float(np.median(distance[sel])) * float(scene_scale)
-    else:
-        # Fallback: probe along the mean corner direction
-        c_dir = corners.mean(axis=0)
-        c_dir /= np.linalg.norm(c_dir) + 1e-12
-        D = float(scene_scale)
+    mask_med = float(np.median(distance[sel])) if np.any(sel) else 1.0
 
-    pts = corners * D                       # shape (4, 3); world-space corner positions
+    # Per-corner depth.
+    depths = np.empty(4, dtype=np.float64)
+    for i in range(4):
+        d = _depth_at_dir(distance, corners[i])
+        if not np.isfinite(d) or d <= 1e-6:
+            d = mask_med
+        depths[i] = d
+    depths *= float(scene_scale)
+
+    # Lift each corner to its own depth → points on the real surface.
+    pts = corners * depths[:, None]          # (4, 3)
     center = pts.mean(axis=0)
 
-    # Parallelogram fit: average top/bottom for U, average left/right for V.
-    # Corner index convention from the bake (TL, TR, BR, BL).
+    # Parallelogram fit: average opposite edges. Corner order is TL, TR, BR, BL.
     u_edge = 0.5 * ((pts[1] - pts[0]) + (pts[2] - pts[3]))
     v_edge = 0.5 * ((pts[3] - pts[0]) + (pts[2] - pts[1]))
     width = float(np.linalg.norm(u_edge))
@@ -408,17 +427,21 @@ def rect_from_quad(
     u_axis = u_edge / (width + 1e-12)
     v_axis = v_edge / (height + 1e-12)
 
-    # Normal = u x v; flip so it points back toward the camera (origin).
+    # Surface normal = u x v (perpendicular to the fitted plane through the
+    # 4 real-depth corners). Flip so it points back toward the scene interior
+    # (the camera/origin side) — that's the emission direction for the light.
     normal = np.cross(u_axis, v_axis)
     nlen = np.linalg.norm(normal)
     if nlen < 1e-9:
-        # Degenerate quad — fall back to mean-dir as normal.
+        # Degenerate quad (collinear corners) — fall back to radial normal.
         normal = -corners.mean(axis=0)
         normal /= np.linalg.norm(normal) + 1e-12
     else:
         normal /= nlen
     if float(center @ normal) > 0.0:
         normal = -normal
+        # Keep the (u, v, normal) frame right-handed after the flip.
+        v_axis = -v_axis
 
     return RectFit(
         center=center.astype(np.float32),
@@ -428,5 +451,5 @@ def rect_from_quad(
         width=max(1e-4, width),
         height=max(1e-4, height),
         inlier_ratio=1.0,                    # by construction
-        mean_distance=D,
+        mean_distance=float(depths.mean()),
     )

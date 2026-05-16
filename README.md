@@ -254,6 +254,7 @@ scripts/
 
 ## Roadmap
 
+- [ ] **Swappable depth backend** — abstract the depth model behind a `DepthBackend` protocol and add **DAP** (Insta360, MIT-licensed, metric depth) alongside DA². Full spec in [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md).
 - [ ] Auto-detect mode — propose quads from brightness-thresholded connected components, with K-means grouping by brightness so the user can include/exclude "windows" vs "lamps" with one click.
 - [ ] **Load masks.json** — reproduce a previous bake's quad layout for a new render.
 - [ ] Disk + portal lights (in addition to rect).
