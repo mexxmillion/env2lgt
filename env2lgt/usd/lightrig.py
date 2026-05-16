@@ -98,16 +98,15 @@ def write_light_rig(
         rel = _relative_to(out_path, Path(dome_texture))
         dome.CreateTextureFileAttr(Sdf.AssetPath(rel))
         dome.CreateTextureFormatAttr("latlong")
-    # Convention bridge: our equirect places +Z (back) at column 0 and -Z
-    # (forward) at column W/2. USD's `UsdLuxDomeLight` shader samples by
-    #   u = atan2(-dir.x, dir.z) / 2pi + 0.5
-    # which puts -Z at u=0 and +X at u=0.75 — a constant 180° azimuthal
-    # offset from ours. We compensate by rotating the dome itself 180° around
-    # Y so the texture columns line up with the world directions of the
-    # extracted rect lights. (Empirically verified by eyeballing in usdview;
-    # if you ever swap USD versions and the lights drift, this is the line.)
+    # Convention bridge: USD's `UsdLuxDomeLight` shader has a different
+    # azimuthal origin than our equirect. The total compensation rotation
+    # required for textures + rect lights to line up in usdview is **270°
+    # around Y** (equivalent to -90°). Verified by eyeballing the result:
+    # bright fixtures in the dome texture sit exactly under the matching
+    # rect-light prims. If you swap USD versions (or test in a non-Storm
+    # renderer like Karma) and the lights drift, this is the line.
     dome_xf = UsdGeom.Xformable(dome.GetPrim())
-    dome_xf.AddRotateYOp().Set(180.0)
+    dome_xf.AddRotateYOp().Set(270.0)
 
     # Rects
     for lr in rect_lights:
