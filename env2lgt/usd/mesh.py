@@ -30,6 +30,9 @@ def write_panorama_mesh(
     segments_lat: int = 128,
     radius_floor: float = 0.0,
     use_emissive: bool = True,
+    geom_inflation: float = 1.0,
+    open_sky: bool = True,
+    sky_depth_frac: float = 0.45,
 ) -> Path:
     """Author the depth-displaced sphere mesh USD.
 
@@ -48,6 +51,15 @@ def write_panorama_mesh(
     use_emissive : when True, the dome texture drives emissiveColor so the
         mesh self-lights in usdview without needing the dome light to render.
         When False, the texture drives diffuseColor (mesh needs lighting).
+    geom_inflation : radial scale (>= 1.0) pushing every vertex outward, so the
+        mesh sits just behind the rect lights instead of coplanar with them.
+        1.0 disables; 1.025 ≈ 2.5% bigger.
+    open_sky : when True, the sky faces are dropped, leaving the mesh open so
+        the real dome / 3D sky shows through. The sky is found as the far
+        region (depth above `sky_depth_frac` of the normalised depth range)
+        that connects to the zenith — so a far building that doesn't reach
+        straight up is not mistaken for sky.
+    sky_depth_frac : normalised-depth cutoff (0..1) for the far/sky split.
     """
     from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 
@@ -89,7 +101,7 @@ def write_panorama_mesh(
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_WRAP,
     )
-    radius = depths * float(scene_scale)
+    radius = depths * float(scene_scale) * float(geom_inflation)
     if radius_floor > 0:
         radius = np.maximum(radius, float(radius_floor))
 
@@ -107,8 +119,30 @@ def write_panorama_mesh(
     v1 = (ifg * n_lon + jfg + 1)
     v2 = ((ifg + 1) * n_lon + jfg + 1)
     v3 = ((ifg + 1) * n_lon + jfg)
-    face_indices = np.stack([v0, v1, v2, v3], axis=-1).reshape(-1).astype(np.int32)
-    face_counts = np.full(segments_lat * segments_lon, 4, dtype=np.int32)
+    quads = np.stack([v0, v1, v2, v3], axis=-1).reshape(-1, 4)
+
+    # Open-sky: drop the sky faces so the mesh has a hole there and the real
+    # dome shows through. The sky is the far region that connects to the
+    # zenith (top row of the equirect) — a far building that doesn't reach
+    # straight up stays. A face goes only if all 4 vertices are sky, keeping
+    # the horizon rim intact.
+    if open_sky:
+        d = depths.astype(np.float64)
+        lo = float(np.percentile(d, 1.0))
+        hi = float(np.percentile(d, 99.9))
+        norm = np.clip((d - lo) / max(hi - lo, 1e-9), 0.0, 1.0)
+        far = (norm > float(sky_depth_frac)).astype(np.uint8)
+        _, labels = cv2.connectedComponents(far)
+        top = [int(v) for v in np.unique(labels[0, :]) if v != 0]
+        sky_v = np.isin(labels, top) if top else far.astype(bool)
+        face_sky = (
+            sky_v[ifg, jfg] & sky_v[ifg, jfg + 1]
+            & sky_v[ifg + 1, jfg + 1] & sky_v[ifg + 1, jfg]
+        ).reshape(-1)
+        quads = quads[~face_sky]
+
+    face_indices = quads.reshape(-1).astype(np.int32)
+    face_counts = np.full(quads.shape[0], 4, dtype=np.int32)
 
     # ---------- write USD ----------
     stage = Usd.Stage.CreateNew(str(out_path))
@@ -126,9 +160,16 @@ def write_panorama_mesh(
     mesh.CreateDoubleSidedAttr(True)
     # Backface culling on the inside of the sphere is annoying for inspection.
 
-    # Extent (Gf.Vec3f requires python floats, not numpy float32 scalars)
-    bbox_min = [float(v) for v in points_flat.min(axis=0)]
-    bbox_max = [float(v) for v in points_flat.max(axis=0)]
+    # Extent (Gf.Vec3f requires python floats, not numpy float32 scalars).
+    # Measure over referenced vertices only — dropped sky verts sit at huge
+    # radius and would otherwise blow up the bounding box.
+    ext_pts = (
+        points_flat[np.unique(face_indices)]
+        if open_sky and face_indices.size
+        else points_flat
+    )
+    bbox_min = [float(v) for v in ext_pts.min(axis=0)]
+    bbox_max = [float(v) for v in ext_pts.max(axis=0)]
     mesh.CreateExtentAttr(Vt.Vec3fArray([Gf.Vec3f(*bbox_min), Gf.Vec3f(*bbox_max)]))
 
     # st primvar (per-vertex)
