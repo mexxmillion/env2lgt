@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -16,11 +17,28 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from env2lgt.ui.viewer import LightQuad
+
+
+# Item-data roles used on the quad-list rows.
+_ROLE_NAME = 0x0100   # canonical name (tracks renames)
+_ROLE_LOCK = 0x0101   # last-seen lock check-state (distinguishes lock vs rename)
+
+# Default auto-detect parameters — the single source of truth, used both to
+# initialise the spinboxes and to restore them via the Reset button.
+_DETECT_DEFAULTS = {
+    "threshold": 3.0,    # %
+    "max_lights": 12,
+    "blur": 1.0,         # degrees
+    "min_size": 1.0,     # degrees
+    "merge": 1.0,        # degrees
+    "floor": True,
+}
 
 
 # Match USD prim-name / Maya / Houdini node-name rules: only ASCII letters,
@@ -52,7 +70,10 @@ class LightPanel(QWidget):
     select_quad = Signal(str)
     rename_quad = Signal(str, str)   # old_name, new_name
     window_toggled = Signal(str, bool)  # quad name, is_window
+    lock_toggled = Signal(str, bool)    # quad name, locked
     add_quad_requested = Signal()
+    propose_quads_requested = Signal(dict)  # auto-detect params
+    key_preview_changed = Signal(bool)      # show/update the key-mask preview
     bake_requested = Signal(dict)
     preview_requested = Signal()
 
@@ -77,6 +98,9 @@ class LightPanel(QWidget):
         del_btn = QPushButton("Delete selected")
         del_btn.clicked.connect(self._on_delete)
         lb.addWidget(del_btn)
+
+        lb.addWidget(self._build_autodetect_group())
+
         # Per-quad window/portal flag — applies to the selected quad.
         self._sel_name = ""
         self._window_cb = QCheckBox("Window / portal — sit on wall depth")
@@ -116,11 +140,20 @@ class LightPanel(QWidget):
             (self.opt_rect, True),
             (self.opt_usd, True),
             (self.opt_depth_exr, False),
-            (self.opt_depth_mesh, False),
+            (self.opt_depth_mesh, True),
             (self.opt_masks, True),
         ):
             cb.setChecked(default)
             eb.addWidget(cb)
+        # Depth-mesh sub-option: drop the sky faces for outdoor scenes.
+        self.opt_open_sky = QCheckBox("    ↳ Open sky (drop far/sky faces)")
+        self.opt_open_sky.setChecked(True)
+        self.opt_open_sky.setToolTip(
+            "For outdoor scenes: delete the depth-mesh faces that sit at "
+            "infinity (the sky), leaving the mesh open so the real dome / 3D "
+            "sky shows through. Only affects the depth mesh USD."
+        )
+        eb.addWidget(self.opt_open_sky)
         # Dome rotation knob — depends on the target renderer's convention.
         # Empirically -180° for Storm/usdview. Quick presets buttons next to it.
         dome_row = QHBoxLayout()
@@ -144,6 +177,25 @@ class LightPanel(QWidget):
             dome_row.addWidget(btn)
         eb.addLayout(dome_row)
 
+        # Depth-mesh inflation — scales the estimated geometry slightly outward
+        # so it doesn't sit coplanar with (and z-fight / intersect) the rect
+        # lights, which are placed on the actual light surfaces.
+        geom_row = QHBoxLayout()
+        geom_row.addWidget(QLabel("Geometry inflation:"))
+        self.opt_geom_inflation = QDoubleSpinBox()
+        self.opt_geom_inflation.setRange(0.0, 25.0)
+        self.opt_geom_inflation.setSingleStep(0.5)
+        self.opt_geom_inflation.setDecimals(1)
+        self.opt_geom_inflation.setSuffix(" %")
+        self.opt_geom_inflation.setValue(2.5)
+        self.opt_geom_inflation.setToolTip(
+            "Scale the estimated depth mesh outward by this percentage so it "
+            "sits just behind the rect lights instead of intersecting them. "
+            "2–3% is usually enough."
+        )
+        geom_row.addWidget(self.opt_geom_inflation, stretch=1)
+        eb.addLayout(geom_row)
+
         self._preview_btn = QPushButton("Preview (no files)")
         self._preview_btn.clicked.connect(self._on_preview)
         eb.addWidget(self._preview_btn)
@@ -154,12 +206,172 @@ class LightPanel(QWidget):
 
         layout.addStretch(1)
 
+    # ---------- auto-detect ----------
+
+    def _build_autodetect_group(self) -> QGroupBox:
+        """'Auto-detect lights' group — detection params sit right above the
+        'Propose quads' button, always visible (no collapse)."""
+        box = QGroupBox("Auto-detect lights", self)
+        outer = QVBoxLayout(box)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+
+        self.det_threshold = QDoubleSpinBox()
+        self.det_threshold.setRange(0.0, 100.0)
+        self.det_threshold.setDecimals(0)
+        self.det_threshold.setSingleStep(5.0)
+        self.det_threshold.setValue(_DETECT_DEFAULTS["threshold"])
+        self.det_threshold.setSuffix(" %")
+        self.det_threshold.setToolTip(
+            "Luma key: threshold as a percentage of the scene's brightest "
+            "luminance. Pixels above it form a flat white blob. Lower engulfs "
+            "more of each light (down its gradient to the dim edges); higher "
+            "keeps only the hottest core."
+        )
+        form.addRow("Brightness", self.det_threshold)
+
+        self.det_max = QSpinBox()
+        self.det_max.setRange(1, 64)
+        self.det_max.setValue(_DETECT_DEFAULTS["max_lights"])
+        self.det_max.setToolTip(
+            "Keep at most this many proposals — the brightest win. Lights "
+            "below the cap simply stay baked into the dome."
+        )
+        form.addRow("Max lights", self.det_max)
+
+        self.det_blur = QDoubleSpinBox()
+        self.det_blur.setRange(0.0, 10.0)
+        self.det_blur.setDecimals(1)
+        self.det_blur.setSingleStep(0.5)
+        self.det_blur.setValue(_DETECT_DEFAULTS["blur"])
+        self.det_blur.setSuffix(" °")
+        self.det_blur.setToolTip(
+            "Blur before blob detection. Higher = blobbier — bridges window "
+            "panes, sheer curtains and beam shadows so the quad engulfs the "
+            "whole light instead of fragmenting."
+        )
+        form.addRow("Blur", self.det_blur)
+
+        self.det_min_size = QDoubleSpinBox()
+        self.det_min_size.setRange(0.0, 45.0)
+        self.det_min_size.setDecimals(1)
+        self.det_min_size.setSingleStep(0.5)
+        self.det_min_size.setValue(_DETECT_DEFAULTS["min_size"])
+        self.det_min_size.setSuffix(" °")
+        self.det_min_size.setToolTip(
+            "Discard bright blobs smaller than this angular diameter "
+            "(filters specular sparkle / hot pixels)."
+        )
+        form.addRow("Min size", self.det_min_size)
+
+        self.det_merge = QDoubleSpinBox()
+        self.det_merge.setRange(0.0, 90.0)
+        self.det_merge.setDecimals(1)
+        self.det_merge.setSingleStep(0.5)
+        self.det_merge.setValue(_DETECT_DEFAULTS["merge"])
+        self.det_merge.setSuffix(" °")
+        self.det_merge.setToolTip(
+            "Merge lights whose centres are within this angular distance into "
+            "a single quad — use it to group clusters like a row of ceiling "
+            "spots or a lit-up tree. 0 keeps every light separate."
+        )
+        form.addRow("Merge dist", self.det_merge)
+        outer.addLayout(form)
+
+        self.det_floor = QCheckBox("Suppress floor reflections")
+        self.det_floor.setChecked(_DETECT_DEFAULTS["floor"])
+        self.det_floor.setToolTip(
+            "Ignore bright blobs pointing well below the horizon — usually "
+            "sun / light reflections on the floor. Wall mirrors and other "
+            "near-horizon reflections are kept."
+        )
+        outer.addWidget(self.det_floor)
+
+        self.det_preview = QCheckBox("Show key mask")
+        self.det_preview.setToolTip(
+            "Overlay the luma-key mask on the panorama so you can see what the "
+            "Brightness / Blur knobs select — dial Brightness until the mask "
+            "covers the lights without flooding walls or clipping the light."
+        )
+        self.det_preview.toggled.connect(self.key_preview_changed)
+        outer.addWidget(self.det_preview)
+        # Live-update the preview while dragging Brightness / Blur.
+        for sb in (self.det_threshold, self.det_blur):
+            sb.valueChanged.connect(
+                lambda _=0: self.key_preview_changed.emit(self.det_preview.isChecked())
+            )
+
+        btn_row = QHBoxLayout()
+        self._propose_btn = QPushButton("Propose quads")
+        self._propose_btn.setToolTip(
+            "Detect lights and add them as quads. Locked quads are kept as-is; "
+            "other auto-proposed quads are replaced. Your hand-placed quads are "
+            "never touched."
+        )
+        self._propose_btn.clicked.connect(self._on_propose)
+        btn_row.addWidget(self._propose_btn, stretch=1)
+        self._det_reset_btn = QPushButton("Reset")
+        self._det_reset_btn.setToolTip("Restore the detection parameters to their defaults.")
+        self._det_reset_btn.setFixedWidth(64)
+        self._det_reset_btn.clicked.connect(self._reset_detect_params)
+        btn_row.addWidget(self._det_reset_btn)
+        outer.addLayout(btn_row)
+        return box
+
+    def _reset_detect_params(self):
+        """Restore every auto-detect control to its default."""
+        self.det_threshold.setValue(_DETECT_DEFAULTS["threshold"])
+        self.det_max.setValue(_DETECT_DEFAULTS["max_lights"])
+        self.det_blur.setValue(_DETECT_DEFAULTS["blur"])
+        self.det_min_size.setValue(_DETECT_DEFAULTS["min_size"])
+        self.det_merge.setValue(_DETECT_DEFAULTS["merge"])
+        self.det_floor.setChecked(_DETECT_DEFAULTS["floor"])
+
+    def detect_params(self) -> dict:
+        """Current auto-detect parameters as a kwargs-style dict."""
+        return {
+            "threshold": self.det_threshold.value() / 100.0,
+            "blur_deg": self.det_blur.value(),
+            "max_quads": self.det_max.value(),
+            "min_diameter_deg": self.det_min_size.value(),
+            "merge_distance_deg": self.det_merge.value(),
+            "suppress_floor": self.det_floor.isChecked(),
+        }
+
+    def _on_propose(self):
+        self.propose_quads_requested.emit(self.detect_params())
+
+    # ---------- quad list ----------
+
     def add_quad(self, q: LightQuad) -> None:
         self._suppress_item_changed = True
         item = QListWidgetItem(q.name)
-        item.setData(0x0100, q.name)  # canonical name, used to track renames
-        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+        item.setData(_ROLE_NAME, q.name)  # canonical name, used to track renames
+        item.setFlags(
+            item.flags()
+            | Qt.ItemFlag.ItemIsEditable
+            | Qt.ItemFlag.ItemIsUserCheckable
+        )
+        # The row's checkbox is the lock toggle.
+        state = Qt.CheckState.Checked if getattr(q, "locked", False) else Qt.CheckState.Unchecked
+        item.setCheckState(state)
+        item.setData(_ROLE_LOCK, state)
+        item.setToolTip("Checkbox = lock. Locked quads survive 'Propose quads'.")
         self._list.addItem(item)
+        self._suppress_item_changed = False
+
+    def set_quad_locked(self, name: str, locked: bool) -> None:
+        """Reflect a lock change that originated elsewhere (e.g. auto-lock on
+        edit) onto the row's checkbox, without re-emitting lock_toggled."""
+        self._suppress_item_changed = True
+        state = Qt.CheckState.Checked if locked else Qt.CheckState.Unchecked
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if it.data(_ROLE_NAME) == name:
+                it.setCheckState(state)
+                it.setData(_ROLE_LOCK, state)
+                break
         self._suppress_item_changed = False
 
     def rename(self, old_name: str, new_name: str) -> None:
@@ -168,15 +380,15 @@ class LightPanel(QWidget):
         self._suppress_item_changed = True
         for i in range(self._list.count()):
             it = self._list.item(i)
-            if it.data(0x0100) == old_name:
+            if it.data(_ROLE_NAME) == old_name:
                 it.setText(new_name)
-                it.setData(0x0100, new_name)
+                it.setData(_ROLE_NAME, new_name)
                 break
         self._suppress_item_changed = False
 
     def remove_quad(self, name: str) -> None:
         for i in range(self._list.count()):
-            if self._list.item(i).data(0x0100) == name:
+            if self._list.item(i).data(_ROLE_NAME) == name:
                 self._list.takeItem(i)
                 return
 
@@ -192,14 +404,14 @@ class LightPanel(QWidget):
             self._list.clearSelection()
         else:
             for i in range(self._list.count()):
-                if self._list.item(i).data(0x0100) == name:
+                if self._list.item(i).data(_ROLE_NAME) == name:
                     self._list.setCurrentRow(i)
                     break
         self._list.blockSignals(False)
 
     def _on_selection_changed(self):
         item = self._list.currentItem()
-        self.select_quad.emit(item.data(0x0100) if item else "")
+        self.select_quad.emit(item.data(_ROLE_NAME) if item else "")
 
     def set_window_checkbox(self, name: str, is_window: bool) -> None:
         """Point the window checkbox at `name` (empty string → disabled)."""
@@ -216,7 +428,16 @@ class LightPanel(QWidget):
     def _on_item_changed(self, item: QListWidgetItem):
         if self._suppress_item_changed:
             return
-        old_name = item.data(0x0100) or ""
+        # itemChanged fires for both rename edits and lock checkbox toggles.
+        # A change in check state means the user toggled the lock.
+        cur_lock = item.checkState()
+        if cur_lock != item.data(_ROLE_LOCK):
+            item.setData(_ROLE_LOCK, cur_lock)
+            self.lock_toggled.emit(
+                item.data(_ROLE_NAME) or "", cur_lock == Qt.CheckState.Checked
+            )
+            return
+        old_name = item.data(_ROLE_NAME) or ""
         typed = item.text()
         new_name = sanitize_name(typed)
         if not new_name or new_name == old_name:
@@ -239,7 +460,7 @@ class LightPanel(QWidget):
         item = self._list.currentItem()
         if item is None:
             return
-        self.delete_quad.emit(item.data(0x0100))
+        self.delete_quad.emit(item.data(_ROLE_NAME))
 
     def _on_add_clicked(self):
         # Only emit on transition to checked; if user clicks again, cancel.
@@ -271,6 +492,8 @@ class LightPanel(QWidget):
             "masks": self.opt_masks.isChecked(),
             "output_dir": self.output_path(),
             "dome_rotate_y_deg": self.opt_dome_rotate.value(),
+            "geom_inflation_pct": self.opt_geom_inflation.value(),
+            "open_sky": self.opt_open_sky.isChecked(),
         }
 
     def apply_export_state(self, state: dict) -> None:
@@ -287,6 +510,10 @@ class LightPanel(QWidget):
         rot = state.get("dome_rotate_y_deg")
         if rot is not None:
             self.opt_dome_rotate.setValue(float(rot))
+        infl = state.get("geom_inflation_pct")
+        if infl is not None:
+            self.opt_geom_inflation.setValue(float(infl))
+        self.opt_open_sky.setChecked(bool(state.get("open_sky", True)))
 
     def set_output_path(self, path: str) -> None:
         # Only auto-populate if the user hasn't already entered something custom.
@@ -312,6 +539,8 @@ class LightPanel(QWidget):
             "masks": self.opt_masks.isChecked(),
             "output_dir": self.output_path(),
             "dome_rotate_y_deg": self.opt_dome_rotate.value(),
+            "geom_inflation_pct": self.opt_geom_inflation.value(),
+            "open_sky": self.opt_open_sky.isChecked(),
             "preview": False,
         }
         self.bake_requested.emit(opts)

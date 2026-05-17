@@ -32,6 +32,8 @@ class QuadState:
     name: str
     corners_dirs: list[list[float]]  # (4, 3) — float-list-of-lists for JSON
     is_window: bool = False
+    source: str = "user"   # "user" (4-click) | "auto" (proposed)
+    locked: bool = False   # protected from "Propose quads" re-runs
 
 
 @dataclass
@@ -52,9 +54,13 @@ class ExportState:
     rect: bool = True
     usd: bool = True
     depth_exr: bool = False
-    depth_mesh: bool = False
+    depth_mesh: bool = True
     masks: bool = True
     output_dir: str = ""
+    # Depth-mesh radial inflation, as a percentage (UI surfaces it as a %).
+    geom_inflation_pct: float = 2.5
+    # Drop the depth mesh's far/sky faces (open-sky, for outdoor scenes).
+    open_sky: bool = True
 
 
 @dataclass
@@ -114,6 +120,8 @@ def load_project(path: str | Path) -> Project:
             name=q["name"],
             corners_dirs=[[float(c) for c in row] for row in q["corners_dirs"]],
             is_window=bool(q.get("is_window", False)),
+            source=str(q.get("source", "user")),
+            locked=bool(q.get("locked", False)),
         )
         for q in raw.get("quads", [])
     ]
@@ -153,6 +161,8 @@ def project_from_app_state(
                 name=q.name,
                 corners_dirs=[[float(c) for c in row] for row in np.asarray(q.corners_dirs).tolist()],
                 is_window=bool(getattr(q, "is_window", False)),
+                source=str(getattr(q, "source", "user")),
+                locked=bool(getattr(q, "locked", False)),
             )
             for q in quads
         ],
@@ -164,5 +174,7 @@ def project_from_app_state(
             depth_mesh=bool(e.get("depth_mesh", True)),
             masks=bool(e.get("masks", True)),
             output_dir=str(e.get("output_dir", "")),
+            geom_inflation_pct=float(e.get("geom_inflation_pct", 2.5)),
+            open_sky=bool(e.get("open_sky", True)),
         ),
     )

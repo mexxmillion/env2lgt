@@ -51,6 +51,12 @@ class LightQuad:
     corners_dirs: np.ndarray = field(default_factory=lambda: np.zeros((4, 3)))
     # Window/portal: bake keeps the rect at wall depth (see bake.QuadSpec).
     is_window: bool = False
+    # Provenance: "user" (4-click placed) or "auto" (proposed by detect).
+    source: str = "user"
+    # Locked quads are never removed/replaced by "Propose quads". The lock is
+    # set explicitly via the list lock toggle, and automatically the first time
+    # an auto quad's vertices are edited (so a refinement survives a re-run).
+    locked: bool = False
 
     @classmethod
     def from_pano_bbox(cls, name: str, x: int, y: int, w: int, h: int, W: int, H: int) -> "LightQuad":
@@ -128,7 +134,10 @@ class PanoramaViewer(QGraphicsView):
     quad_committed = Signal(LightQuad)  # new quad finished (4-click placement)
     quad_modified = Signal(str)         # name of quad whose vertices were edited
     quad_selected = Signal(str)         # name; empty string to deselect
+    quad_lock_changed = Signal(str, bool)  # name, locked — auto-lock on edit
     add_mode_changed = Signal(bool)
+    pixel_probed = Signal(int, int)     # absolute pano pixel (display res) under cursor
+    probe_left = Signal()               # cursor left the panorama
 
     MODE_SELECT = "select"
     MODE_ADD = "add"
@@ -141,6 +150,9 @@ class PanoramaViewer(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setBackgroundBrush(QColor(20, 20, 20))
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Track motion without a pressed button so the pixel probe updates live.
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
         self._bg_item = None
         self._W = 0
         self._H = 0
@@ -163,6 +175,9 @@ class PanoramaViewer(QGraphicsView):
         self._selected: str | None = None
         # Vertex handles for the currently selected quad (rebuilt on selection change).
         self._vertex_handles: list[_VertexHandle] = []
+        # Auto-detect key-mask preview overlay (an RGBA QImage, display res).
+        self._key_overlay_img: QImage | None = None
+        self._key_overlay_item = None
 
     # ---------- mode ----------
 
@@ -204,6 +219,7 @@ class PanoramaViewer(QGraphicsView):
         self._scene.clear()
         self._quad_items.clear()
         self._vertex_handles.clear()
+        self._key_overlay_item = None
         self._placing_dots = []
         self._placing_path = None
         pix = QPixmap.fromImage(qimg)
@@ -211,12 +227,33 @@ class PanoramaViewer(QGraphicsView):
         self._scene.setSceneRect(QRectF(pix.rect()))
         self._W = pix.width()
         self._H = pix.height()
+        self._refresh_key_overlay()
         for name, q in had_quads.items():
             self._add_quad_item(q)
         if sel and sel in self._quads:
             self._set_selected(sel)
         if self._W > 0:
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    # ---------- auto-detect key-mask overlay ----------
+
+    def set_key_overlay(self, qimg: QImage) -> None:
+        """Show an RGBA mask overlay (display-res) above the panorama."""
+        self._key_overlay_img = qimg
+        self._refresh_key_overlay()
+
+    def clear_key_overlay(self) -> None:
+        self._key_overlay_img = None
+        self._refresh_key_overlay()
+
+    def _refresh_key_overlay(self) -> None:
+        if self._key_overlay_item is not None:
+            self._scene.removeItem(self._key_overlay_item)
+            self._key_overlay_item = None
+        if self._key_overlay_img is not None and self._bg_item is not None:
+            item = self._scene.addPixmap(QPixmap.fromImage(self._key_overlay_img))
+            item.setZValue(5)  # above the pano, below quads (z=10)
+            self._key_overlay_item = item
 
     def set_yaw_offset_px(self, px: int) -> None:
         """Caller passes the offset they rolled the HDR by. Viewer stores it
@@ -252,6 +289,8 @@ class PanoramaViewer(QGraphicsView):
         self._W = self._H = 0
         self._bg_item = None
         self._selected = None
+        self._key_overlay_img = None
+        self._key_overlay_item = None
 
     def wheelEvent(self, event):  # noqa: N802
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
@@ -306,7 +345,19 @@ class PanoramaViewer(QGraphicsView):
             vbar.setValue(vbar.value() - int(delta.y()))
             event.accept()
             return
+        # Pixel probe: report the absolute pano pixel under the cursor.
+        if self._bg_item is not None:
+            sp = self.mapToScene(event.position().toPoint())
+            if self._scene.sceneRect().contains(sp):
+                u_abs = self._display_to_abs_x(float(sp.x()))
+                self.pixel_probed.emit(int(u_abs), int(sp.y()))
+            else:
+                self.probe_left.emit()
         super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):  # noqa: N802
+        self.probe_left.emit()
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):  # noqa: N802
         if event.button() == Qt.MouseButton.MiddleButton and self._panning:
@@ -436,6 +487,18 @@ class PanoramaViewer(QGraphicsView):
     def get_quad(self, name: str) -> LightQuad | None:
         return self._quads.get(name)
 
+    def set_quad_locked(self, name: str, locked: bool) -> None:
+        """Update a quad's lock flag and refresh its outline color."""
+        q = self._quads.get(name)
+        if q is None:
+            return
+        q.locked = bool(locked)
+        item = self._quad_items.get(name)
+        if item is not None and name != self._selected:
+            col = self._quad_color(q)
+            item.setPen(QPen(col, 2))
+            item.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(), 50)))
+
     def rename_quad(self, old_name: str, new_name: str) -> str:
         """Rename a quad. If `new_name` collides, suffix _2/_3/... is added.
         Returns the actual new name used. No-ops if old_name doesn't exist."""
@@ -485,6 +548,11 @@ class PanoramaViewer(QGraphicsView):
         d = dir_from_angles(yaw, pitch)
         d = np.asarray(d, dtype=np.float64).reshape(3)
         q.corners_dirs[index] = d
+        # Editing an auto-proposed quad locks it, so the refinement isn't
+        # discarded the next time "Propose quads" runs.
+        if q.source == "auto" and not q.locked:
+            q.locked = True
+            self.quad_lock_changed.emit(q.name, True)
         # re-render the path (handles already moved); don't recreate handles —
         # we want the dragged handle to stay under the mouse.
         self._refresh_quad_path(q)
@@ -492,12 +560,23 @@ class PanoramaViewer(QGraphicsView):
 
     # ---------- internals ----------
 
+    @staticmethod
+    def _quad_color(q: LightQuad) -> QColor:
+        """Outline color by provenance: cyan = user, orange = unconfirmed
+        auto proposal, green = locked (kept across re-propose)."""
+        if q.source == "auto" and not q.locked:
+            return QColor(255, 150, 40)
+        if q.locked:
+            return QColor(80, 230, 120)
+        return QColor(60, 220, 255)
+
     def _add_quad_item(self, q: LightQuad):
         if self._W <= 0 or self._H <= 0:
             return
         path = self._great_circle_path(list(q.corners_dirs), closed=True)
-        pen = QPen(QColor(60, 220, 255), 2)
-        brush = QBrush(QColor(60, 220, 255, 50))
+        col = self._quad_color(q)
+        pen = QPen(col, 2)
+        brush = QBrush(QColor(col.red(), col.green(), col.blue(), 50))
         item = self._scene.addPath(path, pen, brush)
         item.setZValue(10)
         self._quad_items[q.name] = item
@@ -572,8 +651,10 @@ class PanoramaViewer(QGraphicsView):
                 item.setPen(QPen(QColor(255, 200, 80), 3))
                 item.setBrush(QBrush(QColor(255, 200, 80, 80)))
             else:
-                item.setPen(QPen(QColor(60, 220, 255), 2))
-                item.setBrush(QBrush(QColor(60, 220, 255, 50)))
+                q = self._quads.get(n)
+                col = self._quad_color(q) if q is not None else QColor(60, 220, 255)
+                item.setPen(QPen(col, 2))
+                item.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(), 50)))
         self._refresh_vertex_handles()
 
     def _clear_vertex_handles(self):

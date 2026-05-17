@@ -60,6 +60,13 @@ class BakeOptions:
     # (Karma, RenderMan) may differ. Configurable via the UI so the user
     # doesn't need a code edit to dial it in.
     dome_rotate_y_deg: float = -180.0
+    # Radial scale (>= 1.0) for the estimated depth mesh. Pushes the geometry
+    # slightly outward so it sits behind the rect lights instead of coplanar
+    # with them (avoids z-fighting / intersection in the viewport). 1.025 ≈ 2.5%.
+    geom_inflation: float = 1.025
+    # Drop the depth mesh's far/sky faces, leaving it open so the real dome
+    # shows through (for outdoor scenes).
+    open_sky: bool = True
 
 
 def bake(
@@ -210,6 +217,8 @@ def bake(
             distance=distance,
             dome_texture=dome_tex_path,
             scene_scale=opts.scene_scale,
+            geom_inflation=opts.geom_inflation,
+            open_sky=opts.open_sky,
         )
 
     # ---------- mask sidecar ----------

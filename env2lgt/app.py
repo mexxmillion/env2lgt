@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDockWidget,
     QFileDialog,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QStatusBar,
     QToolBar,
+    QWidget,
 )
 
 import cv2
@@ -130,12 +132,16 @@ class MainWindow(QMainWindow):
         self._depth_worker: DepthWorker | None = None
         self._worker: BakeWorker | None = None
         self._thread: QThread | None = None
+        self._key_preview_on: bool = False
 
         self.viewer = PanoramaViewer(self)
         self.setCentralWidget(self.viewer)
         self.viewer.quad_committed.connect(self._on_quad_committed)
         self.viewer.quad_selected.connect(self._on_quad_selected)
+        self.viewer.quad_lock_changed.connect(self._on_quad_lock_changed)
         self.viewer.add_mode_changed.connect(self._on_add_mode_changed)
+        self.viewer.pixel_probed.connect(self._on_pixel_probed)
+        self.viewer.probe_left.connect(self._clear_probe)
 
         self.panel = LightPanel(self)
         dock = QDockWidget("Lights", self)
@@ -146,7 +152,10 @@ class MainWindow(QMainWindow):
         self.panel.select_quad.connect(self._on_panel_selected)
         self.panel.rename_quad.connect(self._on_rename_quad)
         self.panel.window_toggled.connect(self._on_window_toggled)
+        self.panel.lock_toggled.connect(self._on_lock_toggled)
         self.panel.add_quad_requested.connect(self._on_add_quad_requested)
+        self.panel.propose_quads_requested.connect(self._on_propose_quads)
+        self.panel.key_preview_changed.connect(self._on_key_preview)
         self.panel.bake_requested.connect(self._on_bake)
         self.panel.preview_requested.connect(self._on_preview)
 
@@ -157,8 +166,94 @@ class MainWindow(QMainWindow):
         self._progress.setRange(0, 100)
         self._progress.setVisible(False)
         self._progress.setFixedWidth(280)
+        self._build_probe_widget()
         self.statusBar().addPermanentWidget(self._progress)
         self.statusBar().showMessage("Open or drag an EXR latlong panorama to begin.")
+
+    def _build_probe_widget(self):
+        """Nuke-style pixel probe in the status bar: a colour swatch plus the
+        scene-linear RGB / HSV values under the cursor."""
+        probe = QWidget()
+        row = QHBoxLayout(probe)
+        row.setContentsMargins(4, 0, 4, 0)
+        row.setSpacing(6)
+        self._probe_swatch = QLabel()
+        self._probe_swatch.setFixedSize(14, 14)
+        self._probe_swatch.setStyleSheet("background:#000; border:1px solid #555;")
+        row.addWidget(self._probe_swatch)
+        self._probe_label = QLabel("")
+        self._probe_label.setMinimumWidth(420)
+        self._probe_label.setTextFormat(Qt.TextFormat.RichText)
+        font = self._probe_label.font()
+        font.setStyleHint(font.StyleHint.Monospace)
+        font.setFamily("Consolas")
+        self._probe_label.setFont(font)
+        row.addWidget(self._probe_label)
+        self.statusBar().addPermanentWidget(probe)
+
+    def _on_key_preview(self, on: bool):
+        self._key_preview_on = bool(on)
+        self._refresh_key_preview()
+
+    def _refresh_key_preview(self):
+        """Recompute and show the luma-key mask overlay, or clear it."""
+        if not self._key_preview_on or self._hdr_display is None:
+            self.viewer.clear_key_overlay()
+            return
+        from env2lgt.lights.detect import DetectParams, bright_mask
+
+        pp = self.panel.detect_params()
+        dp = DetectParams(threshold=pp["threshold"], blur_deg=pp["blur_deg"])
+        mask = bright_mask(self._hdr_display, dp)
+        H, W = mask.shape
+        offset = int(round((self._yaw_offset_deg / 360.0) * W)) % W
+        if offset:
+            mask = np.roll(mask, offset, axis=1)
+        rgba = np.zeros((H, W, 4), dtype=np.uint8)
+        rgba[mask] = (255, 70, 210, 120)  # translucent magenta
+        rgba = np.ascontiguousarray(rgba)
+        qimg = QImage(rgba.data, W, H, W * 4, QImage.Format.Format_RGBA8888).copy()
+        self.viewer.set_key_overlay(qimg)
+
+    def _clear_probe(self):
+        self._probe_label.setText("")
+        self._probe_swatch.setStyleSheet("background:#000; border:1px solid #555;")
+
+    def _on_pixel_probed(self, x: int, y: int):
+        """Show the pixel value under the cursor (scene-linear, Nuke-style)."""
+        # In depth view, probe the distance map; otherwise the HDR panorama.
+        if self._view_mode == "depth" and self._distance_display is not None:
+            buf = self._distance_display
+            if not (0 <= y < buf.shape[0] and 0 <= x < buf.shape[1]):
+                return self._clear_probe()
+            self._probe_label.setText(
+                f"<span style='color:#aaa'>depth</span> {float(buf[y, x]):.4f}"
+                f"  <span style='color:#888'>[{x},{y}]</span>"
+            )
+            self._probe_swatch.setStyleSheet("background:#000; border:1px solid #555;")
+            return
+        hdr = self._hdr_display
+        if hdr is None or not (0 <= y < hdr.shape[0] and 0 <= x < hdr.shape[1]):
+            return self._clear_probe()
+        import colorsys
+
+        r, g, b = (float(c) for c in hdr[y, x, :3])
+        h, s, v = colorsys.rgb_to_hsv(max(r, 0.0), max(g, 0.0), max(b, 0.0))
+        self._probe_label.setText(
+            f"<span style='color:#ff6b6b'>{r:9.4f}</span> "
+            f"<span style='color:#6bd66b'>{g:9.4f}</span> "
+            f"<span style='color:#6b9bff'>{b:9.4f}</span>  "
+            f"<span style='color:#aaa'>H</span>{h * 360:5.0f} "
+            f"<span style='color:#aaa'>S</span>{s:5.3f} "
+            f"<span style='color:#aaa'>V</span>{v:8.4f}  "
+            f"<span style='color:#888'>[{x},{y}]</span>"
+        )
+        # Swatch: clamp + gamma 2.2 for an sRGB-ish preview of the colour.
+        def _enc(c: float) -> int:
+            return int(round(min(1.0, max(0.0, c)) ** (1.0 / 2.2) * 255))
+        self._probe_swatch.setStyleSheet(
+            f"background:rgb({_enc(r)},{_enc(g)},{_enc(b)}); border:1px solid #555;"
+        )
 
     # ---------- menus / toolbars ----------
 
@@ -325,6 +420,7 @@ class MainWindow(QMainWindow):
         default_out = str(path.parent / f"{path.stem}_lightrig")
         self.panel.force_set_output_path(default_out)
         self._refresh_view()
+        self._refresh_key_preview()
         h, w, _ = self._hdr.shape
         self.statusBar().showMessage(f"{path.name}  ·  {w}×{h}  ·  float32")
 
@@ -458,6 +554,8 @@ class MainWindow(QMainWindow):
         self._yaw_offset_deg = val / 10.0
         self._yaw_label.setText(f" {self._yaw_offset_deg:+6.1f}° ")
         self._refresh_view()
+        if self._key_preview_on:
+            self._refresh_key_preview()
 
     def _on_depth_toggle(self, checked: bool):
         if not checked:
@@ -542,10 +640,78 @@ class MainWindow(QMainWindow):
         if q is not None:
             q.is_window = bool(checked)
 
+    def _on_lock_toggled(self, name: str, locked: bool):
+        """User toggled a quad's lock checkbox in the list."""
+        self.viewer.set_quad_locked(name, locked)
+
+    def _on_quad_lock_changed(self, name: str, locked: bool):
+        """Quad got auto-locked (edited an auto quad) — mirror onto the list."""
+        self.panel.set_quad_locked(name, locked)
+
     def _on_quad_committed(self, q: LightQuad):
         self.panel.add_quad(q)
         self.panel.set_selected(q.name)
         self._refresh_window_checkbox(q.name)
+
+    def _on_propose_quads(self, params: dict):
+        """Run auto-detection and add the proposals as quads.
+
+        Locked quads are left untouched and their regions are excluded from
+        detection so nothing duplicates them; previously-proposed quads that
+        are still unlocked are cleared and regenerated.
+        """
+        if self._hdr is None or self._hdr_display is None:
+            QMessageBox.information(self, "Propose quads", "Open an EXR first.")
+            return
+        from env2lgt.lights.detect import DetectParams, propose_quads
+        from env2lgt.proj import rasterize_spherical_quad
+
+        hdr = self._hdr_display
+        H, W = hdr.shape[:2]
+        existing = self.viewer.quads()
+        locked = [q for q in existing if q.locked]
+
+        exclude = None
+        if locked:
+            exclude = np.zeros((H, W), dtype=np.uint8)
+            for q in locked:
+                m, _ = rasterize_spherical_quad(q.corners_dirs, H, W)
+                exclude |= m
+
+        dp = DetectParams(
+            threshold=float(params.get("threshold", 0.03)),
+            blur_deg=float(params.get("blur_deg", 1.0)),
+            max_quads=int(params.get("max_quads", 12)),
+            min_diameter_deg=float(params.get("min_diameter_deg", 1.0)),
+            merge_distance_deg=float(params.get("merge_distance_deg", 1.0)),
+            suppress_floor=bool(params.get("suppress_floor", True)),
+        )
+        self.statusBar().showMessage("Detecting lights…")
+        QApplication.processEvents()
+        detected = propose_quads(hdr, dp, exclude_mask=exclude)
+
+        # Clear stale (unlocked) auto proposals. User + locked quads stay.
+        for q in list(existing):
+            if q.source == "auto" and not q.locked:
+                self.viewer.remove_quad(q.name)
+                self.panel.remove_quad(q.name)
+
+        added = 0
+        for det in detected:
+            name = self.viewer._next_name()
+            lq = LightQuad(
+                name=name, corners_dirs=det.corners_dirs, source="auto"
+            )
+            self.viewer.add_quad(lq)
+            self.panel.add_quad(lq)
+            added += 1
+        self.viewer.select_by_name(None)
+        self.panel.set_selected(None)
+        self._refresh_window_checkbox("")
+        msg = f"Proposed {added} quad(s)"
+        if locked:
+            msg += f"  ·  kept {len(locked)} locked"
+        self.statusBar().showMessage(msg)
 
     def _on_add_quad_requested(self):
         if self._hdr is None:
@@ -713,6 +879,8 @@ class MainWindow(QMainWindow):
             "masks": proj.export.masks,
             "output_dir": proj.export.output_dir,
             "dome_rotate_y_deg": proj.scene.dome_rotate_y_deg,
+            "geom_inflation_pct": proj.export.geom_inflation_pct,
+            "open_sky": proj.export.open_sky,
         }
         self.panel.apply_export_state(ex)
         # Quads
@@ -721,6 +889,8 @@ class MainWindow(QMainWindow):
                 name=q.name,
                 corners_dirs=np.asarray(q.corners_dirs, dtype=np.float64),
                 is_window=bool(getattr(q, "is_window", False)),
+                source=str(getattr(q, "source", "user")),
+                locked=bool(getattr(q, "locked", False)),
             )
             self.viewer.add_quad(lq)
             self.panel.add_quad(lq)
@@ -831,16 +1001,10 @@ class MainWindow(QMainWindow):
         if self._exr_path is None or self._hdr is None:
             QMessageBox.warning(self, "Bake", "Open an EXR first.")
             return
+        # No quads is a valid, intentional case — bake the mesh + a dome-only
+        # rig (handy for outdoor scenes: geometry to catch shadows/reflections,
+        # the sun and everything else left in the dome). No confirm needed.
         quads = self.viewer.quads()
-        if not quads:
-            ret = QMessageBox.question(
-                self,
-                "Bake",
-                "No quads drawn. Bake dome-only (no rect lights)?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if ret != QMessageBox.StandardButton.Yes:
-                return
 
         out_dir_str = opts.get("output_dir", "").strip()
         if not out_dir_str:
@@ -883,6 +1047,8 @@ class MainWindow(QMainWindow):
             scene_scale=self._scene_scale,
             yaw_offset_deg=self._yaw_offset_deg,
             dome_rotate_y_deg=opts.get("dome_rotate_y_deg", -180.0),
+            geom_inflation=1.0 + opts.get("geom_inflation_pct", 2.5) / 100.0,
+            open_sky=bool(opts.get("open_sky", True)),
         )
 
         self._thread = QThread(self)
