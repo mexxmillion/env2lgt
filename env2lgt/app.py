@@ -410,6 +410,15 @@ class MainWindow(QMainWindow):
         act_delete.triggered.connect(self._delete_selected)
         m_tools.addAction(act_delete)
         m_tools.addSeparator()
+        act_exposure = QAction("Exposure mode", self)
+        act_exposure.setToolTip(
+            "Baseline exposure + white balance + colour-checker matching."
+        )
+        act_exposure.triggered.connect(
+            lambda: self._exposure_btn.setChecked(not self._exposure_btn.isChecked())
+        )
+        m_tools.addAction(act_exposure)
+        m_tools.addSeparator()
         act_usdview = QAction("Open last bake in usdview", self)
         act_usdview.triggered.connect(self._launch_usdview)
         m_tools.addAction(act_usdview)
@@ -462,6 +471,20 @@ class MainWindow(QMainWindow):
         reset_view_btn.clicked.connect(self._reset_view)
         tb.addWidget(reset_view_btn)
 
+        # Exposure mode — primary action, kept early so it never lands in the
+        # toolbar overflow chevron.
+        tb.addSeparator()
+        self._exposure_btn = QPushButton("Exposure mode")
+        self._exposure_btn.setCheckable(True)
+        self._exposure_btn.setShortcut("E")
+        self._exposure_btn.setToolTip(
+            "Adjust the HDRI baseline exposure + white balance + colour-checker "
+            "match. Hides the light quads while active. Baked into the export. "
+            "(shortcut: E)"
+        )
+        self._exposure_btn.toggled.connect(self._on_exposure_mode)
+        tb.addWidget(self._exposure_btn)
+
         tb.addSeparator()
         tb.addWidget(QLabel(" Depth "))
         self._backend_combo = QComboBox()
@@ -497,17 +520,6 @@ class MainWindow(QMainWindow):
             # Seed display/view + the cached processor.
             self._ocio_display = color.default_display()
             self._refill_view_combo()
-
-        tb.addSeparator()
-        self._exposure_btn = QPushButton("Exposure mode")
-        self._exposure_btn.setCheckable(True)
-        self._exposure_btn.setShortcut("E")
-        self._exposure_btn.setToolTip(
-            "Adjust the HDRI baseline exposure + white balance. Hides the light "
-            "quads while active. Baked into the exported rig."
-        )
-        self._exposure_btn.toggled.connect(self._on_exposure_mode)
-        tb.addWidget(self._exposure_btn)
 
     # ---------- file loading ----------
 
