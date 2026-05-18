@@ -67,6 +67,12 @@ class BakeOptions:
     # Drop the depth mesh's far/sky faces, leaving it open so the real dome
     # shows through (for outdoor scenes).
     open_sky: bool = True
+    # Baseline HDRI adjustments from exposure mode, applied to the panorama
+    # before any extraction so they bake into the dome / rect textures and
+    # the derived intensities. exposure_offset_ev is in stops; wb_scale is a
+    # 3-tuple RGB multiplier (luminance-neutral).
+    exposure_offset_ev: float = 0.0
+    wb_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
 
 
 def bake(
@@ -88,6 +94,14 @@ def bake(
     _p("loading panorama", 0.05)
     hdr = load_latlong(exr_path)
     H, W, _ = hdr.shape
+
+    # Apply the exposure-mode baseline adjustments up front so white balance +
+    # exposure offset bake into every downstream product (dome, rect textures,
+    # integrated intensities).
+    wb = np.asarray(opts.wb_scale, dtype=np.float32).reshape(1, 1, 3)
+    gain = float(2.0 ** opts.exposure_offset_ev)
+    if gain != 1.0 or not np.allclose(wb, 1.0):
+        hdr = (hdr * wb * gain).astype(np.float32)
 
     backend = get_backend(opts.depth_backend)
     _p(f"estimating depth ({backend.name.upper()})", 0.10)
