@@ -398,45 +398,54 @@ class PanoramaViewer(QGraphicsView):
         self._clear_chart_items()
         if self._chart_dirs is None or self._W <= 0:
             return
-        disp = [self._dir_to_display_pix(d) for d in self._chart_dirs]
-        # Outer quad.
-        outline = QPainterPath()
-        outline.moveTo(*disp[0])
-        for p in disp[1:]:
-            outline.lineTo(*p)
-        outline.closeSubpath()
+        # Outline + grid follow great circles (the equirect warp), exactly
+        # like the light quads — straight lines would misrepresent the chart.
         pen = QPen(QColor(245, 245, 245), 2)
+        outline = self._great_circle_path(list(self._chart_dirs), closed=True)
         self._chart_item = self._scene.addPath(outline, pen)
         self._chart_item.setZValue(15)
-        # Internal 6x4 grid (bilinear guide).
-        grid = self._chart_grid_path(disp)
         gpen = QPen(QColor(245, 245, 245, 130), 1)
         gpen.setCosmetic(True)
-        self._chart_grid_item = self._scene.addPath(grid, gpen)
+        self._chart_grid_item = self._scene.addPath(
+            self._chart_grid_path_spherical(self._chart_dirs), gpen
+        )
         self._chart_grid_item.setZValue(16)
         # Corner handles.
         for i in range(4):
+            d = self._chart_dirs[i]
             h = _ChartHandle(i, self)
             self._scene.addItem(h)
-            h.set_pano_pos_silent(*disp[i])
+            h.set_pano_pos_silent(*self._dir_to_display_pix(d))
             self._chart_handles.append(h)
 
-    @staticmethod
-    def _chart_grid_path(disp: list[tuple[float, float]]) -> QPainterPath:
-        tl, tr, br, bl = (np.array(p, dtype=np.float64) for p in disp)
+    def _chart_grid_path_spherical(self, dirs: np.ndarray) -> QPainterPath:
+        """The interior 6x4 grid, each line sampled along the spherical
+        bilinear patch so it curves with the equirect projection."""
+        from env2lgt.proj import spherical_bilinear
+
+        n = 16
         path = QPainterPath()
-        for i in range(1, 6):  # 5 interior column lines
-            t = i / 6.0
-            top = tl + (tr - tl) * t
-            bot = bl + (br - bl) * t
-            path.moveTo(top[0], top[1])
-            path.lineTo(bot[0], bot[1])
-        for j in range(1, 4):  # 3 interior row lines
-            t = j / 4.0
-            left = tl + (bl - tl) * t
-            right = tr + (br - tr) * t
-            path.moveTo(left[0], left[1])
-            path.lineTo(right[0], right[1])
+
+        def add_curve(uv_at):
+            pts = [
+                self._dir_to_display_pix(spherical_bilinear(dirs, *uv_at(t)))
+                for t in np.linspace(0.0, 1.0, n)
+            ]
+            path.moveTo(*pts[0])
+            last_u = pts[0][0]
+            for (u, v) in pts[1:]:
+                if abs(u - last_u) > self._W / 2:
+                    path.moveTo(u, v)
+                else:
+                    path.lineTo(u, v)
+                last_u = u
+
+        for i in range(1, 6):  # interior column lines
+            uu = i / 6.0
+            add_curve(lambda t, uu=uu: (uu, t))
+        for j in range(1, 4):  # interior row lines
+            vv = j / 4.0
+            add_curve(lambda t, vv=vv: (t, vv))
         return path
 
     def on_chart_vertex_dragged(self, index: int, scene_pos: QPointF) -> None:
@@ -450,15 +459,13 @@ class PanoramaViewer(QGraphicsView):
         self._chart_dirs[index] = d
         # Redraw outline + grid but leave the handles (dragged one stays put).
         if self._chart_item is not None:
-            disp = [self._dir_to_display_pix(dd) for dd in self._chart_dirs]
-            outline = QPainterPath()
-            outline.moveTo(*disp[0])
-            for p in disp[1:]:
-                outline.lineTo(*p)
-            outline.closeSubpath()
-            self._chart_item.setPath(outline)
+            self._chart_item.setPath(
+                self._great_circle_path(list(self._chart_dirs), closed=True)
+            )
             if self._chart_grid_item is not None:
-                self._chart_grid_item.setPath(self._chart_grid_path(disp))
+                self._chart_grid_item.setPath(
+                    self._chart_grid_path_spherical(self._chart_dirs)
+                )
         self.chart_modified.emit()
 
     # ---------- image ----------

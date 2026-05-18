@@ -1098,23 +1098,13 @@ class MainWindow(QMainWindow):
         )
 
     def _sample_chart_swatches(self) -> np.ndarray | None:
-        """Rectify + sample the 24 chart patches from the working-space display
-        HDR. Returns (24,3) or None if no chart is placed."""
-        corners = self.viewer.chart_corners_abs_px()
-        if corners is None or self._hdr_display is None:
+        """Sample the 24 chart patches from the working-space panorama via
+        spherical-bilinear blend of the corner directions — equirect-correct,
+        and seam-safe (directions wrap naturally). Returns (24,3) or None."""
+        dirs = self.viewer.chart_dirs()
+        if dirs is None or self._hdr_display is None:
             return None
-        hdr = self._hdr_display
-        H, W = hdr.shape[:2]
-        xs = corners[:, 0]
-        # If the chart straddles the +/-180 seam, roll the panorama so the
-        # 4 corners are contiguous before the perspective warp.
-        if float(xs.max() - xs.min()) > W / 2.0:
-            shift = W // 2
-            hdr = np.roll(hdr, shift, axis=1)
-            corners = corners.copy()
-            corners[:, 0] = (corners[:, 0] + shift) % W
-        sw, _rect = ccheck.rectify_swatches(hdr, corners)
-        return sw
+        return ccheck.sample_swatches_spherical(self._hdr_display, dirs)
 
     def _on_solve_chart(self):
         sw = self._sample_chart_swatches()

@@ -75,10 +75,60 @@ def _swatch_masks(w: int, h: int, samples: int) -> np.ndarray:
     return np.array(masks, dtype=np.int32)
 
 
+def _bilinear_erp(erp: np.ndarray, x: float, y: float) -> np.ndarray:
+    """Bilinear sample of an equirect image — wraps in X, clamps in Y."""
+    H, W = erp.shape[:2]
+    x0 = int(np.floor(x))
+    y0 = int(np.floor(y))
+    fx, fy = x - x0, y - y0
+    x0m, x1m = x0 % W, (x0 + 1) % W
+    y0c = min(max(y0, 0), H - 1)
+    y1c = min(max(y0 + 1, 0), H - 1)
+    return (
+        erp[y0c, x0m] * (1 - fx) * (1 - fy) + erp[y0c, x1m] * fx * (1 - fy)
+        + erp[y1c, x0m] * (1 - fx) * fy + erp[y1c, x1m] * fx * fy
+    )
+
+
+def sample_swatches_spherical(
+    erp: np.ndarray, corner_dirs: np.ndarray, sub: int = 5
+) -> np.ndarray:
+    """Sample the 24 chart patches from an equirect panorama.
+
+    The chart corners are 4 unit directions (TL, TR, BR, BL). Each patch
+    centre is found by spherical-bilinear blend of the corners, so the swatch
+    grid follows the equirect warp exactly (no flat-perspective error). A
+    `sub` x `sub` neighbourhood is averaged per patch. Returns (24, 3)."""
+    from env2lgt.proj import angles_from_dir, angles_to_pix, spherical_bilinear
+
+    erp = np.asarray(erp, dtype=np.float32)
+    H, W = erp.shape[:2]
+    corners = np.asarray(corner_dirs, dtype=np.float64).reshape(4, 3)
+    # Sample window ~0.22 of a cell, in parametric units.
+    hw_u = 0.22 / _CC_COLS
+    hw_v = 0.22 / _CC_ROWS
+    offs = np.linspace(-1.0, 1.0, max(1, sub))
+    swatches = np.zeros((24, 3), dtype=np.float32)
+    for j in range(_CC_ROWS):
+        for i in range(_CC_COLS):
+            cu = (i + 0.5) / _CC_COLS
+            cv = (j + 0.5) / _CC_ROWS
+            acc = np.zeros(3, dtype=np.float64)
+            for du in offs:
+                for dv in offs:
+                    d = spherical_bilinear(corners, cu + du * hw_u, cv + dv * hw_v)
+                    yaw, pitch = angles_from_dir(d)
+                    x, y = angles_to_pix(np.asarray(yaw), np.asarray(pitch), W, H)
+                    acc += _bilinear_erp(erp, float(x), float(y))
+            swatches[j * _CC_COLS + i] = acc / (offs.size * offs.size)
+    return swatches
+
+
 def rectify_swatches(
     img: np.ndarray, corners_px: np.ndarray, rect_w: int = 600, rect_h: int = 400
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Perspective-rectify a chart and sample its 24 patches.
+    """Perspective-rectify a chart and sample its 24 patches — for a *flat*
+    (regular 2D) image, e.g. a reference photograph.
 
     `corners_px` is (4, 2) — the chart corners in image pixels, ordered
     TL, TR, BR, BL (TL = the dark-skin patch). Returns (swatches (24,3),
