@@ -129,6 +129,36 @@ class _VertexHandle(QGraphicsEllipseItem):
         return super().itemChange(change, value)
 
 
+class _ChartHandle(QGraphicsEllipseItem):
+    """Draggable corner handle for the colour-checker chart quad."""
+
+    def __init__(self, index: int, owner: "PanoramaViewer"):
+        super().__init__(-HANDLE_R, -HANDLE_R, HANDLE_R * 2, HANDLE_R * 2)
+        self._index = index
+        self._owner = owner
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsScenePositionChanges, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        # White handles, distinct from the yellow light-quad handles.
+        self.setBrush(QBrush(QColor(245, 245, 245)))
+        self.setPen(QPen(QColor(20, 20, 20), 1))
+        self.setZValue(210)
+        self._suppress_notify = False
+
+    def set_pano_pos_silent(self, px: float, py: float) -> None:
+        self._suppress_notify = True
+        self.setPos(QPointF(px, py))
+        self._suppress_notify = False
+
+    def itemChange(self, change, value):  # noqa: N802
+        if (
+            change == QGraphicsItem.GraphicsItemChange.ItemScenePositionHasChanged
+            and not self._suppress_notify
+        ):
+            self._owner.on_chart_vertex_dragged(self._index, self.scenePos())
+        return super().itemChange(change, value)
+
+
 # ---------- viewer ----------
 
 class PanoramaViewer(QGraphicsView):
@@ -141,10 +171,14 @@ class PanoramaViewer(QGraphicsView):
     probe_left = Signal()               # cursor left the panorama
     area_sampled = Signal(int, int, int, int)  # absolute pano px x0,y0,x1,y1
     sample_mode_changed = Signal(bool)
+    chart_committed = Signal()          # colour-chart 4 corners finished
+    chart_modified = Signal()           # colour-chart corner dragged
+    chart_mode_changed = Signal(bool)
 
     MODE_SELECT = "select"
     MODE_ADD = "add"
     MODE_SAMPLE = "sample"
+    MODE_CHART = "chart"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -188,6 +222,13 @@ class PanoramaViewer(QGraphicsView):
         self._sample_rect_item: QGraphicsRectItem | None = None
         # Quads hidden in exposure mode.
         self._quads_visible = True
+        # Colour-checker chart: 4 corner dirs (TL, TR, BR, BL) or None.
+        self._chart_dirs: np.ndarray | None = None
+        self._chart_item: QGraphicsPathItem | None = None
+        self._chart_grid_item: QGraphicsPathItem | None = None
+        self._chart_handles: list[_ChartHandle] = []
+        self._placing_chart: list[np.ndarray] = []
+        self._placing_chart_dots: list[QGraphicsEllipseItem] = []
 
     # ---------- mode ----------
 
@@ -261,6 +302,165 @@ class PanoramaViewer(QGraphicsView):
         for h in self._vertex_handles:
             h.setVisible(self._quads_visible)
 
+    # ---------- colour-checker chart ----------
+
+    def is_chart_mode(self) -> bool:
+        return self._mode == self.MODE_CHART
+
+    def start_chart_mode(self):
+        """Enter 4-click placement for the colour-checker chart. The user
+        clicks corners in order: dark-skin (TL), TR, BR, BL."""
+        if self._mode == self.MODE_ADD:
+            self.cancel_add_mode()
+        if self._mode == self.MODE_SAMPLE:
+            self.cancel_sample_mode()
+        self._mode = self.MODE_CHART
+        self._placing_chart = []
+        for d in self._placing_chart_dots:
+            self._scene.removeItem(d)
+        self._placing_chart_dots = []
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.chart_mode_changed.emit(True)
+
+    def cancel_chart_mode(self):
+        if self._mode != self.MODE_CHART:
+            return
+        self._mode = self.MODE_SELECT
+        for d in self._placing_chart_dots:
+            self._scene.removeItem(d)
+        self._placing_chart_dots = []
+        self._placing_chart = []
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.chart_mode_changed.emit(False)
+
+    def _place_chart_vertex(self, scene_pt: QPointF) -> None:
+        u_abs = self._display_to_abs_x(float(scene_pt.x()))
+        v = float(scene_pt.y())
+        yaw, pitch = pix_to_angles(np.array(u_abs), np.array(v), self._W, self._H)
+        d = np.asarray(dir_from_angles(yaw, pitch), dtype=np.float64).reshape(3)
+        self._placing_chart.append(d)
+        dot = self._scene.addEllipse(
+            -HANDLE_R, -HANDLE_R, HANDLE_R * 2, HANDLE_R * 2,
+            QPen(QColor(20, 20, 20), 1), QBrush(QColor(245, 245, 245)),
+        )
+        dot.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        dot.setPos(QPointF(float(scene_pt.x()), v))
+        dot.setZValue(212)
+        self._placing_chart_dots.append(dot)
+        if len(self._placing_chart) >= 4:
+            self._chart_dirs = np.stack(self._placing_chart, axis=0)
+            for dd in self._placing_chart_dots:
+                self._scene.removeItem(dd)
+            self._placing_chart_dots = []
+            self._placing_chart = []
+            self._mode = self.MODE_SELECT
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self._refresh_chart()
+            self.chart_mode_changed.emit(False)
+            self.chart_committed.emit()
+
+    def set_chart(self, dirs: np.ndarray | None) -> None:
+        if dirs is None:
+            self.clear_chart()
+            return
+        self._chart_dirs = np.asarray(dirs, dtype=np.float64).reshape(4, 3)
+        self._refresh_chart()
+
+    def clear_chart(self) -> None:
+        self._chart_dirs = None
+        self._clear_chart_items()
+
+    def has_chart(self) -> bool:
+        return self._chart_dirs is not None
+
+    def chart_dirs(self) -> np.ndarray | None:
+        return None if self._chart_dirs is None else self._chart_dirs.copy()
+
+    def chart_corners_abs_px(self) -> np.ndarray | None:
+        """Chart corners as absolute (unrolled) panorama pixel coords (4, 2)."""
+        if self._chart_dirs is None or self._W <= 0:
+            return None
+        return np.array(
+            [self._dir_to_pix(d) for d in self._chart_dirs], dtype=np.float64
+        )
+
+    def _clear_chart_items(self) -> None:
+        for it in (self._chart_item, self._chart_grid_item):
+            if it is not None:
+                self._scene.removeItem(it)
+        self._chart_item = None
+        self._chart_grid_item = None
+        for h in self._chart_handles:
+            self._scene.removeItem(h)
+        self._chart_handles = []
+
+    def _refresh_chart(self) -> None:
+        self._clear_chart_items()
+        if self._chart_dirs is None or self._W <= 0:
+            return
+        disp = [self._dir_to_display_pix(d) for d in self._chart_dirs]
+        # Outer quad.
+        outline = QPainterPath()
+        outline.moveTo(*disp[0])
+        for p in disp[1:]:
+            outline.lineTo(*p)
+        outline.closeSubpath()
+        pen = QPen(QColor(245, 245, 245), 2)
+        self._chart_item = self._scene.addPath(outline, pen)
+        self._chart_item.setZValue(15)
+        # Internal 6x4 grid (bilinear guide).
+        grid = self._chart_grid_path(disp)
+        gpen = QPen(QColor(245, 245, 245, 130), 1)
+        gpen.setCosmetic(True)
+        self._chart_grid_item = self._scene.addPath(grid, gpen)
+        self._chart_grid_item.setZValue(16)
+        # Corner handles.
+        for i in range(4):
+            h = _ChartHandle(i, self)
+            self._scene.addItem(h)
+            h.set_pano_pos_silent(*disp[i])
+            self._chart_handles.append(h)
+
+    @staticmethod
+    def _chart_grid_path(disp: list[tuple[float, float]]) -> QPainterPath:
+        tl, tr, br, bl = (np.array(p, dtype=np.float64) for p in disp)
+        path = QPainterPath()
+        for i in range(1, 6):  # 5 interior column lines
+            t = i / 6.0
+            top = tl + (tr - tl) * t
+            bot = bl + (br - bl) * t
+            path.moveTo(top[0], top[1])
+            path.lineTo(bot[0], bot[1])
+        for j in range(1, 4):  # 3 interior row lines
+            t = j / 4.0
+            left = tl + (bl - tl) * t
+            right = tr + (br - tr) * t
+            path.moveTo(left[0], left[1])
+            path.lineTo(right[0], right[1])
+        return path
+
+    def on_chart_vertex_dragged(self, index: int, scene_pos: QPointF) -> None:
+        if self._chart_dirs is None:
+            return
+        u_disp = float(np.clip(scene_pos.x(), 0.0, self._W - 1))
+        v = float(np.clip(scene_pos.y(), 0.0, self._H - 1))
+        u_abs = self._display_to_abs_x(u_disp)
+        yaw, pitch = pix_to_angles(np.array(u_abs), np.array(v), self._W, self._H)
+        d = np.asarray(dir_from_angles(yaw, pitch), dtype=np.float64).reshape(3)
+        self._chart_dirs[index] = d
+        # Redraw outline + grid but leave the handles (dragged one stays put).
+        if self._chart_item is not None:
+            disp = [self._dir_to_display_pix(dd) for dd in self._chart_dirs]
+            outline = QPainterPath()
+            outline.moveTo(*disp[0])
+            for p in disp[1:]:
+                outline.lineTo(*p)
+            outline.closeSubpath()
+            self._chart_item.setPath(outline)
+            if self._chart_grid_item is not None:
+                self._chart_grid_item.setPath(self._chart_grid_path(disp))
+        self.chart_modified.emit()
+
     # ---------- image ----------
 
     def set_image(self, qimg: QImage) -> None:
@@ -279,6 +479,9 @@ class PanoramaViewer(QGraphicsView):
         self._vertex_handles.clear()
         self._key_overlay_item = None
         self._sample_rect_item = None
+        self._chart_item = None
+        self._chart_grid_item = None
+        self._chart_handles = []
         self._placing_dots = []
         self._placing_path = None
         pix = QPixmap.fromImage(qimg)
@@ -291,6 +494,8 @@ class PanoramaViewer(QGraphicsView):
             self._add_quad_item(q)
         if sel and sel in self._quads:
             self._set_selected(sel)
+        if self._chart_dirs is not None:
+            self._refresh_chart()
         if keep_view:
             self.setTransform(saved_transform)
             self.horizontalScrollBar().setValue(saved_h)
@@ -356,6 +561,12 @@ class PanoramaViewer(QGraphicsView):
         self._selected = None
         self._key_overlay_img = None
         self._key_overlay_item = None
+        self._chart_dirs = None
+        self._chart_item = None
+        self._chart_grid_item = None
+        self._chart_handles = []
+        self._placing_chart = []
+        self._placing_chart_dots = []
 
     def fit_view(self) -> None:
         """Fit the whole panorama in the viewport (reset zoom/pan)."""
@@ -386,6 +597,13 @@ class PanoramaViewer(QGraphicsView):
             if not self._scene.sceneRect().contains(scene_pt):
                 return
             self._place_vertex(scene_pt)
+            return
+
+        # Chart mode: clicks place the 4 colour-checker corners.
+        if self._mode == self.MODE_CHART:
+            if not self._scene.sceneRect().contains(scene_pt):
+                return
+            self._place_chart_vertex(scene_pt)
             return
 
         # Sample mode: start a rubber-band rectangle.
@@ -486,6 +704,9 @@ class PanoramaViewer(QGraphicsView):
             return
         if event.key() == Qt.Key.Key_Escape and self._mode == self.MODE_SAMPLE:
             self.cancel_sample_mode()
+            return
+        if event.key() == Qt.Key.Key_Escape and self._mode == self.MODE_CHART:
+            self.cancel_chart_mode()
             return
         super().keyPressEvent(event)
 

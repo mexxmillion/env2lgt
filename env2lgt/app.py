@@ -32,6 +32,8 @@ from PySide6.QtWidgets import (
 
 import cv2
 
+from env2lgt import color
+from env2lgt import colorchecker as ccheck
 from env2lgt.bake import BakeOptions, QuadSpec, bake
 from env2lgt.depth import AVAILABLE_BACKENDS, get_backend, shutdown_all
 from env2lgt.exposure import (
@@ -139,6 +141,30 @@ class MainWindow(QMainWindow):
         self._exposure_mode: bool = False
         # Pending rectangle-sample purpose: "exposure" | "wb" | "probe" | None.
         self._pending_sample: str | None = None
+
+        # ---- OCIO colour management ----
+        # Everything internal is the working space (ACEScg). The source EXR is
+        # converted in on load; the bake converts out on write.
+        self._ocio_ok: bool = color.ocio_available()
+        # Default both ends to the resolved working colorspace name (a real
+        # entry in the colorspace combos, not the role alias).
+        _wcs = color.working_colorspace() if self._ocio_ok else ""
+        self._input_cs: str = _wcs
+        self._output_cs: str = _wcs
+        self._ocio_display: str = ""
+        self._ocio_view: str = ""
+        self._display_cpu = None
+        # Source-space copy of the display buffer, so the input colorspace can
+        # be changed without reloading the EXR.
+        self._hdr_display_src: np.ndarray | None = None
+
+        # ---- colour-checker chart correction ----
+        # Solved 3x3 matrix (row-vector convention) or None. Baked into export.
+        self._cc_matrix: np.ndarray | None = None
+        self._cc_target_swatches: np.ndarray | None = None  # current ref (24,3)
+        self._cc_target_name: str = "Built-in CC24"
+        self._cc_fit_mode: str = "matrix"
+        self._cc_pending_ref: bool = False  # placing a chart in a reference EXR
         # DA-2 returns scale-invariant distance ~[0.3, 1.5]. Default at
         # 100 m/u — typical indoor scenes look right at this scale in
         # usdview; the user can adjust via the toolbar slider.
@@ -163,6 +189,8 @@ class MainWindow(QMainWindow):
         self.viewer.probe_left.connect(self._clear_probe)
         self.viewer.area_sampled.connect(self._on_area_sampled)
         self.viewer.sample_mode_changed.connect(self._on_sample_mode_changed)
+        self.viewer.chart_committed.connect(self._on_chart_committed)
+        self.viewer.chart_mode_changed.connect(self._on_chart_mode_changed)
 
         self.panel = LightPanel(self)
         dock = QDockWidget("Lights", self)
@@ -190,6 +218,25 @@ class MainWindow(QMainWindow):
             lambda: self._begin_sample("wb")
         )
         self.exposure_panel.auto_meter_requested.connect(self._on_auto_meter)
+        self.exposure_panel.input_cs_changed.connect(self._on_input_cs_changed)
+        self.exposure_panel.output_cs_changed.connect(self._on_output_cs_changed)
+        self.exposure_panel.pick_chart_requested.connect(self._on_pick_chart)
+        self.exposure_panel.clear_chart_requested.connect(self._on_clear_chart)
+        self.exposure_panel.use_builtin_target.connect(self._on_use_builtin_target)
+        self.exposure_panel.load_json_target_requested.connect(
+            self._on_load_json_target
+        )
+        self.exposure_panel.capture_reference_requested.connect(
+            self._on_capture_reference
+        )
+        self.exposure_panel.fit_mode_changed.connect(self._on_fit_mode_changed)
+        self.exposure_panel.solve_chart_requested.connect(self._on_solve_chart)
+        if self._ocio_ok:
+            self.exposure_panel.populate_colorspaces(
+                color.colorspace_names(), self._input_cs, self._output_cs
+            )
+        else:
+            self.exposure_panel.set_colour_management_enabled(False)
         self.panel.delete_quad.connect(self._on_delete_quad)
         self.panel.select_quad.connect(self._on_panel_selected)
         self.panel.rename_quad.connect(self._on_rename_quad)
@@ -434,6 +481,23 @@ class MainWindow(QMainWindow):
         self._depth_btn.toggled.connect(self._on_depth_toggle)
         tb.addWidget(self._depth_btn)
 
+        # OCIO viewport display + view (Nuke/Maya-style dropdowns).
+        if self._ocio_ok:
+            tb.addSeparator()
+            tb.addWidget(QLabel(" Display "))
+            self._display_combo = QComboBox()
+            for d in color.displays():
+                self._display_combo.addItem(d)
+            self._display_combo.setCurrentText(color.default_display())
+            self._display_combo.currentTextChanged.connect(self._on_display_changed)
+            tb.addWidget(self._display_combo)
+            self._view_combo = QComboBox()
+            self._view_combo.currentTextChanged.connect(self._on_view_changed)
+            tb.addWidget(self._view_combo)
+            # Seed display/view + the cached processor.
+            self._ocio_display = color.default_display()
+            self._refill_view_combo()
+
         tb.addSeparator()
         self._exposure_btn = QPushButton("Exposure mode")
         self._exposure_btn.setCheckable(True)
@@ -471,16 +535,19 @@ class MainWindow(QMainWindow):
             if ret != QMessageBox.StandardButton.Yes:
                 return
         self._hdr = hdr
-        # Downsampled display copy so exposure + yaw scrubs stay snappy.
+        # Downsampled display copy so exposure + yaw scrubs stay snappy. Kept
+        # in the *source* colorspace so the input transform can be re-chosen
+        # without reloading; `_hdr_display` is the working-space version.
         H, W, _ = hdr.shape
         if W > DISPLAY_MAX_WIDTH:
             new_w = DISPLAY_MAX_WIDTH
             new_h = max(2, (new_w * H) // W)
             # Even output size keeps 2:1 latlong aspect well.
             new_h -= new_h % 2
-            self._hdr_display = cv2.resize(hdr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            self._hdr_display_src = cv2.resize(hdr, (new_w, new_h), interpolation=cv2.INTER_AREA)
         else:
-            self._hdr_display = hdr
+            self._hdr_display_src = hdr
+        self._hdr_display = self._to_working_display(self._hdr_display_src)
         # Invalidate caches — last EXR's tonemap is meaningless now.
         self._display_cache = None
         self._cache_key = None
@@ -500,10 +567,13 @@ class MainWindow(QMainWindow):
         self._wb_kelvin = 6500.0
         self._wb_tint = 0.0
         self._wb_scale = np.ones(3, dtype=np.float32)
+        # Drop any colour-checker correction from the previous EXR.
+        self._cc_matrix = None
         if hasattr(self, "exposure_panel"):
             self.exposure_panel.set_exposure_offset(0.0)
             self.exposure_panel.set_wb(6500.0, 0.0)
             self.exposure_panel.set_wb_readout(self._wb_scale)
+            self.exposure_panel.set_chart_status(has_chart=False, rmse=None)
         # Drop cached depth — it's for the previous EXR.
         self._distance = None
         self._view_mode = "hdr"
@@ -583,26 +653,21 @@ class MainWindow(QMainWindow):
             return
 
         is_hdr = self._view_mode == "hdr"
+        cc_id = None if self._cc_matrix is None else hash(self._cc_matrix.tobytes())
         cache_key = (
             self._view_mode,
             round(self._exposure, 3) if is_hdr else None,
             round(self._exposure_offset, 3) if is_hdr else None,
             tuple(round(float(c), 4) for c in self._wb_scale) if is_hdr else None,
+            cc_id if is_hdr else None,
+            (self._ocio_display, self._ocio_view) if is_hdr else None,
         )
         if self._display_cache is None or self._cache_key != cache_key:
             if self._view_mode == "depth" and self._distance_display is not None:
                 self._display_cache = self._tonemap_depth_uint8(self._distance_display)
             else:
-                # Baseline adjustments (WB + exposure offset) are applied to the
-                # HDR before the display-only viewport exposure + tonemap.
-                adjusted = (
-                    self._hdr_display
-                    * self._wb_scale.reshape(1, 1, 3)
-                    * (2.0 ** self._exposure_offset)
-                )
-                self._display_cache = self._tonemap_hdr_uint8(
-                    adjusted, self._exposure
-                )
+                adjusted = self._adjusted_working(self._hdr_display)
+                self._display_cache = self._working_to_u8(adjusted, self._exposure)
             self._cache_key = cache_key
 
         cache = self._display_cache
@@ -617,10 +682,37 @@ class MainWindow(QMainWindow):
         self.viewer.set_yaw_offset_px(offset_px)
         self.viewer.set_image(qimg)
 
+    def _to_working_display(self, src: np.ndarray) -> np.ndarray:
+        """Convert a source-colorspace buffer into the working space."""
+        if not self._ocio_ok or not self._input_cs:
+            return np.asarray(src, dtype=np.float32)
+        try:
+            return color.to_working(src, self._input_cs)
+        except Exception:  # noqa: BLE001
+            return np.asarray(src, dtype=np.float32)
+
+    def _adjusted_working(self, hdr: np.ndarray) -> np.ndarray:
+        """Apply the baked baseline adjustments (colour-checker matrix, white
+        balance, exposure offset) to a working-space buffer. Display-only
+        viewport exposure is NOT included here."""
+        out = hdr
+        if self._cc_matrix is not None:
+            out = ccheck.apply_matrix(out, self._cc_matrix)
+        out = out * self._wb_scale.reshape(1, 1, 3) * (2.0 ** self._exposure_offset)
+        return out
+
+    def _working_to_u8(self, working: np.ndarray, exposure: float) -> np.ndarray:
+        """Working space -> display uint8: viewport exposure, then the OCIO
+        display+view transform (or an ACES-filmic fallback)."""
+        scaled = working * (2.0 ** float(exposure))
+        if self._ocio_ok and self._display_cpu is not None:
+            return color.display_to_u8(scaled, self._display_cpu)
+        return self._tonemap_hdr_uint8(scaled)
+
     @staticmethod
-    def _tonemap_hdr_uint8(hdr: np.ndarray, exposure: float) -> np.ndarray:
-        """ACES filmic tonemap + sRGB clip, returns contiguous (H, W, 3) uint8."""
-        scaled = hdr * (2.0 ** float(exposure))
+    def _tonemap_hdr_uint8(scaled: np.ndarray) -> np.ndarray:
+        """ACES filmic tonemap + sRGB clip — the fallback when OCIO is
+        unavailable. Input is already exposure-scaled."""
         ldr = aces_filmic(scaled)
         u8 = (ldr * 255.0 + 0.5).astype(np.uint8)
         return np.ascontiguousarray(u8)
@@ -681,6 +773,65 @@ class MainWindow(QMainWindow):
         self._yaw_slider.setValue(0)
         self.viewer.fit_view()
 
+    # ---------- OCIO colour management ----------
+
+    def _invalidate_display_cache(self):
+        self._display_cache = None
+        self._cache_key = None
+
+    def _refill_view_combo(self):
+        """Repopulate the view combo for the current display and rebuild the
+        cached display processor."""
+        views = color.views(self._ocio_display)
+        self._view_combo.blockSignals(True)
+        self._view_combo.clear()
+        self._view_combo.addItems(views)
+        default_v = color.default_view(self._ocio_display)
+        self._view_combo.setCurrentText(
+            default_v if default_v in views else (views[0] if views else "")
+        )
+        self._view_combo.blockSignals(False)
+        self._ocio_view = self._view_combo.currentText()
+        self._rebuild_display_cpu()
+
+    def _rebuild_display_cpu(self):
+        if not (self._ocio_ok and self._ocio_display and self._ocio_view):
+            self._display_cpu = None
+            return
+        try:
+            self._display_cpu = color.make_display_cpu(
+                self._ocio_display, self._ocio_view
+            )
+        except Exception:  # noqa: BLE001
+            self._display_cpu = None
+
+    def _on_display_changed(self, name: str):
+        self._ocio_display = name
+        self._refill_view_combo()
+        self._invalidate_display_cache()
+        self._refresh_view()
+
+    def _on_view_changed(self, name: str):
+        if not name:
+            return
+        self._ocio_view = name
+        self._rebuild_display_cpu()
+        self._invalidate_display_cache()
+        self._refresh_view()
+
+    def _on_input_cs_changed(self, name: str):
+        """Source colorspace changed — re-run the input transform."""
+        self._input_cs = name
+        if self._hdr_display_src is not None:
+            self._hdr_display = self._to_working_display(self._hdr_display_src)
+            self._invalidate_display_cache()
+            self._refresh_view()
+
+    def _on_output_cs_changed(self, name: str):
+        """Bake output colorspace — applied when writing the rig (no preview
+        effect)."""
+        self._output_cs = name
+
     # ---------- exposure mode: baseline exposure + white balance ----------
 
     def _recompute_wb(self) -> None:
@@ -706,8 +857,11 @@ class MainWindow(QMainWindow):
         self._lights_dock.setVisible(not checked)
         if checked:
             self._exposure_dock.raise_()
-        elif self.viewer.is_sample_mode():
-            self.viewer.cancel_sample_mode()
+        else:
+            if self.viewer.is_sample_mode():
+                self.viewer.cancel_sample_mode()
+            if self.viewer.is_chart_mode():
+                self.viewer.cancel_chart_mode()
         if self._exr_path is not None:
             self.statusBar().showMessage(
                 "Exposure mode — adjust the HDRI baseline; baked into export."
@@ -834,6 +988,143 @@ class MainWindow(QMainWindow):
             f"Auto meter — {self._exposure_offset:+.2f} EV, "
             f"{int(kelvin)} K, tint {tint:+.2f}"
         )
+
+    # ---------- colour-checker chart ----------
+
+    def _on_pick_chart(self):
+        if self._hdr_display is None:
+            QMessageBox.information(self, "Colour chart", "Open an EXR first.")
+            self.exposure_panel.set_pick_chart_active(False)
+            return
+        self.viewer.start_chart_mode()
+        self.statusBar().showMessage(
+            "Click the 4 chart corners — start at the dark-skin patch, "
+            "then clockwise. Esc to cancel."
+        )
+
+    def _on_chart_mode_changed(self, active: bool):
+        self.exposure_panel.set_pick_chart_active(active)
+
+    def _on_chart_committed(self):
+        self.exposure_panel.set_chart_status(has_chart=True, rmse=None)
+        self.statusBar().showMessage(
+            "Chart placed — drag the corners to refine, then Solve & apply."
+        )
+
+    def _on_clear_chart(self):
+        self.viewer.clear_chart()
+        self._cc_matrix = None
+        self.exposure_panel.set_chart_status(has_chart=False, rmse=None)
+        self._invalidate_display_cache()
+        self._refresh_view()
+
+    def _on_fit_mode_changed(self, mode: str):
+        self._cc_fit_mode = mode
+
+    def _builtin_target_working(self) -> np.ndarray:
+        """The built-in CC24 reference, converted into the working space."""
+        cc = ccheck.CC24_LINEAR_SRGB
+        if self._ocio_ok:
+            try:
+                return color.convert(
+                    cc.reshape(1, 24, 3),
+                    ccheck.CC24_REFERENCE_COLORSPACE,
+                    color.WORKING,
+                ).reshape(24, 3)
+            except Exception:  # noqa: BLE001
+                pass
+        return cc.astype(np.float32)
+
+    def _current_target_working(self) -> np.ndarray:
+        """The active match target (24,3) in the working space."""
+        if self._cc_target_swatches is not None:
+            return self._cc_target_swatches
+        return self._builtin_target_working()
+
+    def _on_use_builtin_target(self):
+        self._cc_target_swatches = None
+        self._cc_target_name = "Built-in CC24"
+        self.exposure_panel.set_target_label("Built-in CC24")
+
+    def _on_load_json_target(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load colour target", "", "Colour target (*.json);;All files (*.*)"
+        )
+        if not path:
+            return
+        try:
+            sw, name, cs = ccheck.load_target(path)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Load target", str(e))
+            return
+        if self._ocio_ok:
+            try:
+                sw = color.convert(sw.reshape(1, 24, 3), cs, color.WORKING).reshape(24, 3)
+            except Exception:  # noqa: BLE001
+                pass
+        self._cc_target_swatches = sw.astype(np.float32)
+        self._cc_target_name = name
+        self.exposure_panel.set_target_label(f"JSON: {name}")
+        self.statusBar().showMessage(f"Colour target loaded: {name}")
+
+    def _on_capture_reference(self):
+        """Sample the 24 swatches under the current chart and use them as the
+        match target — for matching a shot to a reference image."""
+        sw = self._sample_chart_swatches()
+        if sw is None:
+            QMessageBox.information(
+                self, "Capture reference",
+                "Place a colour chart first (Pick colour chart).",
+            )
+            return
+        self._cc_target_swatches = sw.astype(np.float32)
+        self._cc_target_name = "Captured reference"
+        self.exposure_panel.set_target_label("Captured reference (current chart)")
+        self.statusBar().showMessage(
+            "Reference swatches captured — load your shot, place a chart, "
+            "then Solve & apply."
+        )
+
+    def _sample_chart_swatches(self) -> np.ndarray | None:
+        """Rectify + sample the 24 chart patches from the working-space display
+        HDR. Returns (24,3) or None if no chart is placed."""
+        corners = self.viewer.chart_corners_abs_px()
+        if corners is None or self._hdr_display is None:
+            return None
+        hdr = self._hdr_display
+        H, W = hdr.shape[:2]
+        xs = corners[:, 0]
+        # If the chart straddles the +/-180 seam, roll the panorama so the
+        # 4 corners are contiguous before the perspective warp.
+        if float(xs.max() - xs.min()) > W / 2.0:
+            shift = W // 2
+            hdr = np.roll(hdr, shift, axis=1)
+            corners = corners.copy()
+            corners[:, 0] = (corners[:, 0] + shift) % W
+        sw, _rect = ccheck.rectify_swatches(hdr, corners)
+        return sw
+
+    def _on_solve_chart(self):
+        sw = self._sample_chart_swatches()
+        if sw is None:
+            QMessageBox.information(
+                self, "Solve chart",
+                "Place a colour chart first (Pick colour chart).",
+            )
+            return
+        target = self._current_target_working()
+        M, rmse, flipped = ccheck.solve_correction(sw, target, self._cc_fit_mode)
+        self._cc_matrix = M
+        self._invalidate_display_cache()
+        self._refresh_view()
+        self.exposure_panel.set_chart_status(has_chart=True, rmse=rmse)
+        msg = (
+            f"Chart match applied ({self._cc_fit_mode}) — RMSE {rmse:.4f}"
+            f"  ·  target: {self._cc_target_name}"
+        )
+        if flipped:
+            msg += "  ·  chart detected upside-down (auto-corrected)"
+        self.statusBar().showMessage(msg)
 
     def _on_depth_toggle(self, checked: bool):
         if not checked:
@@ -1119,8 +1410,23 @@ class MainWindow(QMainWindow):
             exposure_offset_ev=self._exposure_offset,
             wb_kelvin=self._wb_kelvin,
             wb_tint=self._wb_tint,
+            input_colorspace=self._input_cs,
+            output_colorspace=self._output_cs,
+            ocio_display=self._ocio_display,
+            ocio_view=self._ocio_view,
+            cc_state=self._chart_state_dict(),
         )
         save_project(path, proj)
+
+    def _chart_state_dict(self) -> dict:
+        """Snapshot of the colour-checker chart + solved correction."""
+        dirs = self.viewer.chart_dirs()
+        return {
+            "corners_dirs": [] if dirs is None else dirs.tolist(),
+            "matrix": [] if self._cc_matrix is None else self._cc_matrix.tolist(),
+            "fit_mode": self._cc_fit_mode,
+            "target_name": self._cc_target_name,
+        }
 
     def _apply_project_state(self, proj: Project) -> None:
         """Restore quads + scene + export state from a parsed Project. Assumes
@@ -1147,6 +1453,43 @@ class MainWindow(QMainWindow):
         self.exposure_panel.set_exposure_offset(self._exposure_offset)
         self.exposure_panel.set_wb(self._wb_kelvin, self._wb_tint)
         self._recompute_wb()
+        # OCIO colour management.
+        if self._ocio_ok:
+            if proj.scene.input_colorspace:
+                self._input_cs = proj.scene.input_colorspace
+            if proj.scene.output_colorspace:
+                self._output_cs = proj.scene.output_colorspace
+            self.exposure_panel.populate_colorspaces(
+                color.colorspace_names(), self._input_cs, self._output_cs
+            )
+            self._hdr_display = self._to_working_display(self._hdr_display_src)
+            disp = proj.scene.ocio_display
+            view = proj.scene.ocio_view
+            if disp and disp in color.displays():
+                self._display_combo.blockSignals(True)
+                self._display_combo.setCurrentText(disp)
+                self._display_combo.blockSignals(False)
+                self._ocio_display = disp
+                self._refill_view_combo()
+                if view and view in color.views(disp):
+                    self._view_combo.blockSignals(True)
+                    self._view_combo.setCurrentText(view)
+                    self._view_combo.blockSignals(False)
+                    self._ocio_view = view
+                    self._rebuild_display_cpu()
+        # Colour-checker chart + solved correction.
+        cc = proj.colorchecker
+        if cc.corners_dirs:
+            self.viewer.set_chart(np.asarray(cc.corners_dirs, dtype=np.float64))
+        self._cc_matrix = (
+            np.asarray(cc.matrix, dtype=np.float32) if cc.matrix else None
+        )
+        self._cc_fit_mode = cc.fit_mode or "matrix"
+        self._cc_target_name = cc.target_name or "Built-in CC24"
+        self.exposure_panel.set_chart_status(
+            has_chart=bool(cc.corners_dirs),
+            applied=self._cc_matrix is not None,
+        )
         # Depth backend (tolerate an unknown name from a newer/edited project).
         backend = (proj.scene.depth_backend or "da2").strip().lower()
         if backend not in AVAILABLE_BACKENDS:
@@ -1217,6 +1560,9 @@ class MainWindow(QMainWindow):
             yaw_offset_deg=self._yaw_offset_deg,
             exposure_offset_ev=self._exposure_offset,
             wb_scale=tuple(float(c) for c in self._wb_scale),
+            cc_matrix=self._cc_matrix,
+            input_colorspace=self._input_cs,
+            output_colorspace=self._output_cs,
         )
 
         self._thread = QThread(self)
@@ -1341,6 +1687,9 @@ class MainWindow(QMainWindow):
             open_sky=bool(opts.get("open_sky", True)),
             exposure_offset_ev=self._exposure_offset,
             wb_scale=tuple(float(c) for c in self._wb_scale),
+            cc_matrix=self._cc_matrix,
+            input_colorspace=self._input_cs,
+            output_colorspace=self._output_cs,
         )
 
         self._thread = QThread(self)

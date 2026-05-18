@@ -73,6 +73,13 @@ class BakeOptions:
     # 3-tuple RGB multiplier (luminance-neutral).
     exposure_offset_ev: float = 0.0
     wb_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    # Colour-checker correction: 3x3 matrix (row-vector convention) or None.
+    cc_matrix: object = None
+    # OCIO colorspaces. The source EXR is converted input -> working (ACEScg)
+    # on load; baked dome / rect EXRs are converted working -> output on write.
+    # Empty strings disable the transform (treat the EXR as already-working).
+    input_colorspace: str = ""
+    output_colorspace: str = ""
 
 
 def bake(
@@ -95,13 +102,33 @@ def bake(
     hdr = load_latlong(exr_path)
     H, W, _ = hdr.shape
 
-    # Apply the exposure-mode baseline adjustments up front so white balance +
-    # exposure offset bake into every downstream product (dome, rect textures,
-    # integrated intensities).
+    from env2lgt import color
+    from env2lgt.colorchecker import apply_matrix
+
+    _ocio = color.ocio_available()
+
+    # Input transform: source colorspace -> working space (ACEScg).
+    if opts.input_colorspace and _ocio:
+        hdr = color.to_working(hdr, opts.input_colorspace)
+
+    # Apply the exposure-mode baseline adjustments up front so the colour-
+    # checker correction, white balance and exposure offset bake into every
+    # downstream product (dome, rect textures, integrated intensities).
+    if opts.cc_matrix is not None:
+        hdr = apply_matrix(hdr, np.asarray(opts.cc_matrix, dtype=np.float32))
     wb = np.asarray(opts.wb_scale, dtype=np.float32).reshape(1, 1, 3)
     gain = float(2.0 ** opts.exposure_offset_ev)
     if gain != 1.0 or not np.allclose(wb, 1.0):
         hdr = (hdr * wb * gain).astype(np.float32)
+
+    def _to_output(img: np.ndarray) -> np.ndarray:
+        """Working space -> output colorspace for written colour EXRs."""
+        if opts.output_colorspace and _ocio:
+            try:
+                return color.from_working(img, opts.output_colorspace)
+            except Exception:  # noqa: BLE001
+                return img
+        return img
 
     backend = get_backend(opts.depth_backend)
     _p(f"estimating depth ({backend.name.upper()})", 0.10)
@@ -151,7 +178,7 @@ def bake(
             out_h, out_w = _output_size_for_quad(fit.width, fit.height, max_dim=1024)
             tex = sample_rect_texture(hdr, q.corners_dirs, out_h, out_w)
             tex_path = out_dir / f"{q.name}.exr"
-            save_exr(tex_path, tex)
+            save_exr(tex_path, _to_output(tex))
 
         # UsdLuxRectLight emits intensity * color * textureFile. With a texture,
         # the texture already carries the scene-linear HDR radiance, so leave
@@ -207,7 +234,7 @@ def bake(
         else:
             dome_hdr = hdr.copy()
         dome_tex_path = out_dir / "dome.exr"
-        save_exr(dome_tex_path, dome_hdr)
+        save_exr(dome_tex_path, _to_output(dome_hdr))
 
     # ---------- USD ----------
     usd_path: Path | None = None
