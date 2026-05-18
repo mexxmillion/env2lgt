@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsPathItem,
     QGraphicsPolygonItem,
+    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
 )
@@ -138,9 +139,12 @@ class PanoramaViewer(QGraphicsView):
     add_mode_changed = Signal(bool)
     pixel_probed = Signal(int, int)     # absolute pano pixel (display res) under cursor
     probe_left = Signal()               # cursor left the panorama
+    area_sampled = Signal(int, int, int, int)  # absolute pano px x0,y0,x1,y1
+    sample_mode_changed = Signal(bool)
 
     MODE_SELECT = "select"
     MODE_ADD = "add"
+    MODE_SAMPLE = "sample"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -178,6 +182,12 @@ class PanoramaViewer(QGraphicsView):
         # Auto-detect key-mask preview overlay (an RGBA QImage, display res).
         self._key_overlay_img: QImage | None = None
         self._key_overlay_item = None
+        # Rectangle-sample (exposure / WB / probe) drag state.
+        self._sampling = False
+        self._sample_start: QPointF | None = None
+        self._sample_rect_item: QGraphicsRectItem | None = None
+        # Quads hidden in exposure mode.
+        self._quads_visible = True
 
     # ---------- mode ----------
 
@@ -211,15 +221,64 @@ class PanoramaViewer(QGraphicsView):
             self._scene.removeItem(self._placing_path)
             self._placing_path = None
 
+    # ---------- rectangle-sample mode ----------
+
+    def is_sample_mode(self) -> bool:
+        return self._mode == self.MODE_SAMPLE
+
+    def start_sample_mode(self):
+        """Enter drag-a-rectangle mode. On release the viewer emits
+        `area_sampled` with absolute pano pixel bounds."""
+        if self._mode == self.MODE_ADD:
+            self.cancel_add_mode()
+        self._mode = self.MODE_SAMPLE
+        self._clear_sample_rect()
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.sample_mode_changed.emit(True)
+
+    def cancel_sample_mode(self):
+        if self._mode != self.MODE_SAMPLE:
+            return
+        self._mode = self.MODE_SELECT
+        self._clear_sample_rect()
+        self._sampling = False
+        self._sample_start = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.sample_mode_changed.emit(False)
+
+    def _clear_sample_rect(self):
+        if self._sample_rect_item is not None:
+            self._scene.removeItem(self._sample_rect_item)
+            self._sample_rect_item = None
+
+    # ---------- quad visibility ----------
+
+    def set_quads_visible(self, visible: bool) -> None:
+        """Show/hide quad outlines + vertex handles (exposure mode hides them)."""
+        self._quads_visible = bool(visible)
+        for item in self._quad_items.values():
+            item.setVisible(self._quads_visible)
+        for h in self._vertex_handles:
+            h.setVisible(self._quads_visible)
+
     # ---------- image ----------
 
     def set_image(self, qimg: QImage) -> None:
         had_quads = dict(self._quads)
         sel = self._selected
+        # Preserve zoom/pan across a re-render at the same resolution (the
+        # exposure / yaw sliders re-push an image every tick — the view must
+        # not snap back to fit). Only fit on a genuine resolution change.
+        prev_w, prev_h = self._W, self._H
+        keep_view = prev_w == qimg.width() and prev_h == qimg.height() and prev_w > 0
+        saved_transform = self.transform()
+        saved_h = self.horizontalScrollBar().value()
+        saved_v = self.verticalScrollBar().value()
         self._scene.clear()
         self._quad_items.clear()
         self._vertex_handles.clear()
         self._key_overlay_item = None
+        self._sample_rect_item = None
         self._placing_dots = []
         self._placing_path = None
         pix = QPixmap.fromImage(qimg)
@@ -232,8 +291,14 @@ class PanoramaViewer(QGraphicsView):
             self._add_quad_item(q)
         if sel and sel in self._quads:
             self._set_selected(sel)
-        if self._W > 0:
+        if keep_view:
+            self.setTransform(saved_transform)
+            self.horizontalScrollBar().setValue(saved_h)
+            self.verticalScrollBar().setValue(saved_v)
+        elif self._W > 0:
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        if not self._quads_visible:
+            self.set_quads_visible(False)
 
     # ---------- auto-detect key-mask overlay ----------
 
@@ -292,6 +357,11 @@ class PanoramaViewer(QGraphicsView):
         self._key_overlay_img = None
         self._key_overlay_item = None
 
+    def fit_view(self) -> None:
+        """Fit the whole panorama in the viewport (reset zoom/pan)."""
+        if self._W > 0:
+            self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
     def wheelEvent(self, event):  # noqa: N802
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
@@ -316,6 +386,20 @@ class PanoramaViewer(QGraphicsView):
             if not self._scene.sceneRect().contains(scene_pt):
                 return
             self._place_vertex(scene_pt)
+            return
+
+        # Sample mode: start a rubber-band rectangle.
+        if self._mode == self.MODE_SAMPLE:
+            self._sampling = True
+            self._sample_start = scene_pt
+            self._clear_sample_rect()
+            pen = QPen(QColor(255, 230, 90), 0, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            item = self._scene.addRect(QRectF(scene_pt, scene_pt), pen,
+                                       QBrush(QColor(255, 230, 90, 40)))
+            item.setZValue(220)
+            self._sample_rect_item = item
+            event.accept()
             return
 
         # Let vertex handles handle their own clicks (handled by Qt's item system
@@ -345,6 +429,14 @@ class PanoramaViewer(QGraphicsView):
             vbar.setValue(vbar.value() - int(delta.y()))
             event.accept()
             return
+        # Sample mode: grow the rubber-band rectangle.
+        if self._sampling and self._sample_start is not None:
+            sp = self.mapToScene(event.position().toPoint())
+            rect = QRectF(self._sample_start, sp).normalized()
+            if self._sample_rect_item is not None:
+                self._sample_rect_item.setRect(rect)
+            event.accept()
+            return
         # Pixel probe: report the absolute pano pixel under the cursor.
         if self._bg_item is not None:
             sp = self.mapToScene(event.position().toPoint())
@@ -366,11 +458,34 @@ class PanoramaViewer(QGraphicsView):
             self.setCursor(Qt.CursorShape.ArrowCursor)
             event.accept()
             return
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._sampling
+            and self._sample_start is not None
+        ):
+            self._sampling = False
+            sp = self.mapToScene(event.position().toPoint())
+            rect = QRectF(self._sample_start, sp).normalized()
+            self._sample_start = None
+            # Clamp to image, convert display -> absolute pano px.
+            x0 = float(np.clip(rect.left(), 0.0, self._W - 1))
+            x1 = float(np.clip(rect.right(), 0.0, self._W - 1))
+            y0 = float(np.clip(rect.top(), 0.0, self._H - 1))
+            y1 = float(np.clip(rect.bottom(), 0.0, self._H - 1))
+            if x1 - x0 >= 1.0 and y1 - y0 >= 1.0:
+                ax0 = self._display_to_abs_x(x0)
+                ax1 = self._display_to_abs_x(x1)
+                self.area_sampled.emit(int(ax0), int(y0), int(ax1), int(y1))
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):  # noqa: N802
         if event.key() == Qt.Key.Key_Escape and self._mode == self.MODE_ADD:
             self.cancel_add_mode()
+            return
+        if event.key() == Qt.Key.Key_Escape and self._mode == self.MODE_SAMPLE:
+            self.cancel_sample_mode()
             return
         super().keyPressEvent(event)
 
@@ -579,6 +694,7 @@ class PanoramaViewer(QGraphicsView):
         brush = QBrush(QColor(col.red(), col.green(), col.blue(), 50))
         item = self._scene.addPath(path, pen, brush)
         item.setZValue(10)
+        item.setVisible(self._quads_visible)
         self._quad_items[q.name] = item
 
     def _refresh_quad_path(self, q: LightQuad):
@@ -675,4 +791,5 @@ class PanoramaViewer(QGraphicsView):
             h = _VertexHandle(i, self)
             self._scene.addItem(h)
             h.set_pano_pos_silent(px, py)
+            h.setVisible(self._quads_visible)
             self._vertex_handles.append(h)

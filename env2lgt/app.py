@@ -11,8 +11,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, QThread, Qt, Signal
-from PySide6.QtGui import QAction, QImage
+from PySide6.QtCore import QObject, QPointF, QThread, Qt, Signal
+from PySide6.QtGui import QAction, QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QStatusBar,
     QToolBar,
+    QToolButton,
     QWidget,
 )
 
@@ -33,6 +34,13 @@ import cv2
 
 from env2lgt.bake import BakeOptions, QuadSpec, bake
 from env2lgt.depth import AVAILABLE_BACKENDS, get_backend, shutdown_all
+from env2lgt.exposure import (
+    convolve_dome_meter,
+    grey_world_scale,
+    scale_to_temp_tint,
+    spot_meter_offset_ev,
+    temp_tint_to_scale,
+)
 from env2lgt.io import depth_to_display_qimage, load_latlong, to_display_qimage
 from env2lgt.io.tonemap import aces_filmic
 from env2lgt.project import (
@@ -42,6 +50,7 @@ from env2lgt.project import (
     project_from_app_state,
     save_project,
 )
+from env2lgt.ui.exposure_panel import ExposurePanel
 from env2lgt.ui.light_panel import LightPanel
 from env2lgt.ui.viewer import LightQuad, PanoramaViewer
 
@@ -119,7 +128,17 @@ class MainWindow(QMainWindow):
         self._display_cache: np.ndarray | None = None
         self._cache_key: tuple | None = None
         self._exr_path: Path | None = None
-        self._exposure: float = 0.0
+        self._exposure: float = 0.0          # display-only viewport exposure
+        # Baseline HDRI adjustments — baked into the export. WB follows the
+        # Lightroom model: kelvin + tint are the source of truth, _wb_scale is
+        # derived.
+        self._exposure_offset: float = 0.0
+        self._wb_kelvin: float = 6500.0
+        self._wb_tint: float = 0.0
+        self._wb_scale: np.ndarray = np.ones(3, dtype=np.float32)
+        self._exposure_mode: bool = False
+        # Pending rectangle-sample purpose: "exposure" | "wb" | "probe" | None.
+        self._pending_sample: str | None = None
         # DA-2 returns scale-invariant distance ~[0.3, 1.5]. Default at
         # 100 m/u — typical indoor scenes look right at this scale in
         # usdview; the user can adjust via the toolbar slider.
@@ -142,12 +161,35 @@ class MainWindow(QMainWindow):
         self.viewer.add_mode_changed.connect(self._on_add_mode_changed)
         self.viewer.pixel_probed.connect(self._on_pixel_probed)
         self.viewer.probe_left.connect(self._clear_probe)
+        self.viewer.area_sampled.connect(self._on_area_sampled)
+        self.viewer.sample_mode_changed.connect(self._on_sample_mode_changed)
 
         self.panel = LightPanel(self)
         dock = QDockWidget("Lights", self)
         dock.setWidget(self.panel)
         dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self._lights_dock = dock
+
+        # Exposure-mode panel — same dock area, hidden until exposure mode.
+        self.exposure_panel = ExposurePanel(self)
+        exp_dock = QDockWidget("Exposure", self)
+        exp_dock.setWidget(self.exposure_panel)
+        exp_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, exp_dock)
+        exp_dock.setVisible(False)
+        self._exposure_dock = exp_dock
+        self.exposure_panel.exposure_offset_changed.connect(self._on_exposure_offset)
+        self.exposure_panel.wb_changed.connect(self._on_wb_changed)
+        self.exposure_panel.sample_exposure_requested.connect(
+            lambda: self._begin_sample("exposure")
+        )
+        self.exposure_panel.sample_wb_requested.connect(
+            lambda: self._begin_sample("wb")
+        )
+        self.exposure_panel.auto_meter_requested.connect(self._on_auto_meter)
         self.panel.delete_quad.connect(self._on_delete_quad)
         self.panel.select_quad.connect(self._on_panel_selected)
         self.panel.rename_quad.connect(self._on_rename_quad)
@@ -177,6 +219,17 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout(probe)
         row.setContentsMargins(4, 0, 4, 0)
         row.setSpacing(6)
+        # Eyedropper — area RGB probe, sits right beside the pixel readout.
+        self._eyedrop_btn = QToolButton()
+        self._eyedrop_btn.setIcon(self._make_eyedropper_icon())
+        self._eyedrop_btn.setCheckable(True)
+        self._eyedrop_btn.setAutoRaise(True)
+        self._eyedrop_btn.setToolTip(
+            "Eyedropper — drag a rectangle to read the average scene-linear "
+            "RGB of that area (Nuke-style area probe)."
+        )
+        self._eyedrop_btn.clicked.connect(self._on_eyedropper_clicked)
+        row.addWidget(self._eyedrop_btn)
         self._probe_swatch = QLabel()
         self._probe_swatch.setFixedSize(14, 14)
         self._probe_swatch.setStyleSheet("background:#000; border:1px solid #555;")
@@ -189,7 +242,35 @@ class MainWindow(QMainWindow):
         font.setFamily("Consolas")
         self._probe_label.setFont(font)
         row.addWidget(self._probe_label)
+        # Persistent area-probe (eyedropper) readout — survives cursor moves.
+        self._area_label = QLabel("")
+        self._area_label.setTextFormat(Qt.TextFormat.RichText)
+        self._area_label.setFont(font)
+        row.addWidget(self._area_label)
         self.statusBar().addPermanentWidget(probe)
+
+    @staticmethod
+    def _make_eyedropper_icon() -> QIcon:
+        """Draw a small eyedropper/pipette glyph for the area-probe button."""
+        pm = QPixmap(32, 32)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # Stem.
+        pen = QPen(QColor(225, 225, 225), 4)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(QPointF(8, 24), QPointF(21, 11))
+        # Bulb.
+        p.setPen(QPen(QColor(225, 225, 225), 3))
+        p.setBrush(QColor(150, 195, 255))
+        p.drawEllipse(QPointF(23.5, 8.5), 5.5, 5.5)
+        # Tip.
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(225, 225, 225))
+        p.drawEllipse(QPointF(6.5, 25.5), 2.6, 2.6)
+        p.end()
+        return QIcon(pm)
 
     def _on_key_preview(self, on: bool):
         self._key_preview_on = bool(on)
@@ -291,12 +372,12 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
         tb.addWidget(QLabel(" Exposure "))
-        exp_slider = QSlider(Qt.Orientation.Horizontal)
-        exp_slider.setRange(-60, 60)
-        exp_slider.setValue(0)
-        exp_slider.setFixedWidth(180)
-        exp_slider.valueChanged.connect(self._on_exposure)
-        tb.addWidget(exp_slider)
+        self._view_exp_slider = QSlider(Qt.Orientation.Horizontal)
+        self._view_exp_slider.setRange(-60, 60)
+        self._view_exp_slider.setValue(0)
+        self._view_exp_slider.setFixedWidth(180)
+        self._view_exp_slider.valueChanged.connect(self._on_exposure)
+        tb.addWidget(self._view_exp_slider)
         self._exposure_label = QLabel(" 0.0 EV ")
         tb.addWidget(self._exposure_label)
 
@@ -326,9 +407,13 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._yaw_label)
         from PySide6.QtWidgets import QPushButton
 
-        yaw_reset_btn = QPushButton("Reset")
-        yaw_reset_btn.clicked.connect(lambda: self._yaw_slider.setValue(0))
-        tb.addWidget(yaw_reset_btn)
+        reset_view_btn = QPushButton("⟲ Reset view")
+        reset_view_btn.setToolTip(
+            "Reset the viewport: display exposure, yaw offset, and zoom/pan "
+            "back to defaults."
+        )
+        reset_view_btn.clicked.connect(self._reset_view)
+        tb.addWidget(reset_view_btn)
 
         tb.addSeparator()
         tb.addWidget(QLabel(" Depth "))
@@ -348,6 +433,17 @@ class MainWindow(QMainWindow):
         self._depth_btn.setShortcut("D")
         self._depth_btn.toggled.connect(self._on_depth_toggle)
         tb.addWidget(self._depth_btn)
+
+        tb.addSeparator()
+        self._exposure_btn = QPushButton("Exposure mode")
+        self._exposure_btn.setCheckable(True)
+        self._exposure_btn.setShortcut("E")
+        self._exposure_btn.setToolTip(
+            "Adjust the HDRI baseline exposure + white balance. Hides the light "
+            "quads while active. Baked into the exported rig."
+        )
+        self._exposure_btn.toggled.connect(self._on_exposure_mode)
+        tb.addWidget(self._exposure_btn)
 
     # ---------- file loading ----------
 
@@ -399,6 +495,15 @@ class MainWindow(QMainWindow):
         self._yaw_offset_deg = 0.0
         if hasattr(self, "_yaw_label"):
             self._yaw_label.setText("  0.0° ")
+        # Baseline exposure + WB back to neutral for the new HDRI.
+        self._exposure_offset = 0.0
+        self._wb_kelvin = 6500.0
+        self._wb_tint = 0.0
+        self._wb_scale = np.ones(3, dtype=np.float32)
+        if hasattr(self, "exposure_panel"):
+            self.exposure_panel.set_exposure_offset(0.0)
+            self.exposure_panel.set_wb(6500.0, 0.0)
+            self.exposure_panel.set_wb_readout(self._wb_scale)
         # Drop cached depth — it's for the previous EXR.
         self._distance = None
         self._view_mode = "hdr"
@@ -477,16 +582,26 @@ class MainWindow(QMainWindow):
         if self._hdr_display is None:
             return
 
+        is_hdr = self._view_mode == "hdr"
         cache_key = (
             self._view_mode,
-            round(self._exposure, 3) if self._view_mode == "hdr" else None,
+            round(self._exposure, 3) if is_hdr else None,
+            round(self._exposure_offset, 3) if is_hdr else None,
+            tuple(round(float(c), 4) for c in self._wb_scale) if is_hdr else None,
         )
         if self._display_cache is None or self._cache_key != cache_key:
             if self._view_mode == "depth" and self._distance_display is not None:
                 self._display_cache = self._tonemap_depth_uint8(self._distance_display)
             else:
+                # Baseline adjustments (WB + exposure offset) are applied to the
+                # HDR before the display-only viewport exposure + tonemap.
+                adjusted = (
+                    self._hdr_display
+                    * self._wb_scale.reshape(1, 1, 3)
+                    * (2.0 ** self._exposure_offset)
+                )
                 self._display_cache = self._tonemap_hdr_uint8(
-                    self._hdr_display, self._exposure
+                    adjusted, self._exposure
                 )
             self._cache_key = cache_key
 
@@ -556,6 +671,169 @@ class MainWindow(QMainWindow):
         self._refresh_view()
         if self._key_preview_on:
             self._refresh_key_preview()
+
+    def _reset_view(self):
+        """Reset viewport-only controls: display exposure, yaw, zoom/pan.
+
+        These are display conveniences — none of them affect the bake (unlike
+        the exposure-mode baseline adjustments)."""
+        self._view_exp_slider.setValue(0)
+        self._yaw_slider.setValue(0)
+        self.viewer.fit_view()
+
+    # ---------- exposure mode: baseline exposure + white balance ----------
+
+    def _recompute_wb(self) -> None:
+        """Rebuild the derived RGB scale from the kelvin/tint source of truth."""
+        self._wb_scale = temp_tint_to_scale(self._wb_kelvin, self._wb_tint)
+        self.exposure_panel.set_wb_readout(self._wb_scale)
+
+    def _on_exposure_offset(self, ev: float):
+        self._exposure_offset = float(ev)
+        self._refresh_view()
+
+    def _on_wb_changed(self, kelvin: float, tint: float):
+        self._wb_kelvin = float(kelvin)
+        self._wb_tint = float(tint)
+        self._recompute_wb()
+        self._refresh_view()
+
+    def _on_exposure_mode(self, checked: bool):
+        self._exposure_mode = bool(checked)
+        # The light quads are irrelevant while metering — hide them.
+        self.viewer.set_quads_visible(not checked)
+        self._exposure_dock.setVisible(checked)
+        self._lights_dock.setVisible(not checked)
+        if checked:
+            self._exposure_dock.raise_()
+        elif self.viewer.is_sample_mode():
+            self.viewer.cancel_sample_mode()
+        if self._exr_path is not None:
+            self.statusBar().showMessage(
+                "Exposure mode — adjust the HDRI baseline; baked into export."
+                if checked else f"{self._exr_path.name}"
+            )
+
+    def _begin_sample(self, purpose: str):
+        """Arm the rectangle-sample tool for a given purpose and enter the mode."""
+        if self._hdr_display is None:
+            QMessageBox.information(self, "Sample", "Open an EXR first.")
+            self.exposure_panel.clear_sample_buttons()
+            self._eyedrop_btn.setChecked(False)
+            return
+        self._pending_sample = purpose
+        self.viewer.start_sample_mode()
+        self.statusBar().showMessage(
+            "Drag a rectangle to sample an area. Esc to cancel."
+        )
+
+    def _on_eyedropper_clicked(self):
+        if self._eyedrop_btn.isChecked():
+            self._begin_sample("probe")
+        elif self.viewer.is_sample_mode():
+            self.viewer.cancel_sample_mode()
+
+    def _on_sample_mode_changed(self, active: bool):
+        """Sample mode ended (completed or cancelled) — reset the UI affordances."""
+        if not active:
+            self._pending_sample = None
+            self.exposure_panel.clear_sample_buttons()
+            self._eyedrop_btn.blockSignals(True)
+            self._eyedrop_btn.setChecked(False)
+            self._eyedrop_btn.blockSignals(False)
+
+    def _sample_region(self, x0: int, y0: int, x1: int, y1: int) -> np.ndarray | None:
+        """Slice the display HDR for a sampled rectangle, handling seam wrap."""
+        hdr = self._hdr_display
+        if hdr is None:
+            return None
+        H, W = hdr.shape[:2]
+        y0 = max(0, min(H - 1, y0))
+        y1 = max(0, min(H - 1, y1))
+        h = y1 - y0 + 1
+        w = (x1 - x0 + 1) if x1 >= x0 else (x1 - x0 + 1 + W)
+        if h <= 0 or w <= 0:
+            return None
+        # Cap the pixel count fed to the meter — a sample over a huge crop of
+        # an 8K/16K source would otherwise mean over tens of millions of
+        # pixels. Stride is derived *before* indexing so the strided crop is
+        # the only copy made; a ~1 Mpx subsample is statistically identical
+        # for an average.
+        max_px = 1_000_000
+        stride = max(1, int(np.ceil(np.sqrt(h * w / max_px))))
+        cols = np.arange(x0, x0 + w, stride) % W
+        region = hdr[y0:y1 + 1:stride][:, cols, :3]
+        return region if region.size else None
+
+    def _on_area_sampled(self, x0: int, y0: int, x1: int, y1: int):
+        purpose = self._pending_sample
+        region = self._sample_region(x0, y0, x1, y1)
+        if region is None or region.size == 0:
+            self.viewer.cancel_sample_mode()
+            return
+
+        if purpose == "exposure":
+            offset = spot_meter_offset_ev(region)
+            self._exposure_offset = offset
+            self.exposure_panel.set_exposure_offset(offset)
+            self._refresh_view()
+            self.statusBar().showMessage(
+                f"Spot meter — exposure offset set to {offset:+.2f} EV"
+            )
+        elif purpose == "wb":
+            mean = region.reshape(-1, 3).mean(axis=0)
+            scale = grey_world_scale(mean)
+            kelvin, tint = scale_to_temp_tint(scale)
+            self._wb_kelvin, self._wb_tint = kelvin, tint
+            self.exposure_panel.set_wb(kelvin, tint)
+            self._recompute_wb()
+            self._refresh_view()
+            self.statusBar().showMessage(
+                f"WB sampled — {int(kelvin)} K, tint {tint:+.2f}"
+            )
+        elif purpose == "probe":
+            mean = region.reshape(-1, 3).mean(axis=0)
+            self._show_probe_rgb(mean, region.shape[0] * region.shape[1])
+
+        self.viewer.cancel_sample_mode()
+
+    def _show_probe_rgb(self, rgb: np.ndarray, n_px: int):
+        """Show an averaged RGB readout in the persistent area-probe label.
+
+        Unlike the live cursor probe this survives subsequent mouse moves, so
+        the eyedropper sample stays visible (Nuke-style colour sampler)."""
+        r, g, b = (float(c) for c in rgb[:3])
+        self._area_label.setText(
+            f"<span style='color:#aaa'>▣ avg</span> "
+            f"<span style='color:#ff6b6b'>{r:.4f}</span> "
+            f"<span style='color:#6bd66b'>{g:.4f}</span> "
+            f"<span style='color:#6b9bff'>{b:.4f}</span> "
+            f"<span style='color:#888'>[{n_px}px]</span>"
+        )
+
+    def _on_auto_meter(self):
+        """Convolve-the-dome auto: render a gray ball, set exposure + WB from it."""
+        if self._hdr_display is None:
+            QMessageBox.information(self, "Auto meter", "Open an EXR first.")
+            return
+        self.statusBar().showMessage("Auto meter — convolving the dome…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        try:
+            result = convolve_dome_meter(self._hdr_display)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._exposure_offset = float(result["offset_ev"])
+        kelvin, tint = scale_to_temp_tint(result["wb_scale"])
+        self._wb_kelvin, self._wb_tint = kelvin, tint
+        self.exposure_panel.set_exposure_offset(self._exposure_offset)
+        self.exposure_panel.set_wb(kelvin, tint)
+        self._recompute_wb()
+        self._refresh_view()
+        self.statusBar().showMessage(
+            f"Auto meter — {self._exposure_offset:+.2f} EV, "
+            f"{int(kelvin)} K, tint {tint:+.2f}"
+        )
 
     def _on_depth_toggle(self, checked: bool):
         if not checked:
@@ -838,6 +1116,9 @@ class MainWindow(QMainWindow):
             dome_rotate_y_deg=self.panel.opt_dome_rotate.value(),
             depth_backend=self._depth_backend,
             export_opts=self.panel.export_state(),
+            exposure_offset_ev=self._exposure_offset,
+            wb_kelvin=self._wb_kelvin,
+            wb_tint=self._wb_tint,
         )
         save_project(path, proj)
 
@@ -859,6 +1140,13 @@ class MainWindow(QMainWindow):
             pass
         self._exposure = float(proj.scene.exposure_ev)
         self._exposure_label.setText(f" {self._exposure:+.1f} EV ")
+        # Baseline exposure + white balance.
+        self._exposure_offset = float(proj.scene.exposure_offset_ev)
+        self._wb_kelvin = float(proj.scene.wb_kelvin)
+        self._wb_tint = float(proj.scene.wb_tint)
+        self.exposure_panel.set_exposure_offset(self._exposure_offset)
+        self.exposure_panel.set_wb(self._wb_kelvin, self._wb_tint)
+        self._recompute_wb()
         # Depth backend (tolerate an unknown name from a newer/edited project).
         backend = (proj.scene.depth_backend or "da2").strip().lower()
         if backend not in AVAILABLE_BACKENDS:
@@ -927,6 +1215,8 @@ class MainWindow(QMainWindow):
             depth_backend=self._depth_backend,
             scene_scale=self._scene_scale,
             yaw_offset_deg=self._yaw_offset_deg,
+            exposure_offset_ev=self._exposure_offset,
+            wb_scale=tuple(float(c) for c in self._wb_scale),
         )
 
         self._thread = QThread(self)
@@ -1049,6 +1339,8 @@ class MainWindow(QMainWindow):
             dome_rotate_y_deg=opts.get("dome_rotate_y_deg", -180.0),
             geom_inflation=1.0 + opts.get("geom_inflation_pct", 2.5) / 100.0,
             open_sky=bool(opts.get("open_sky", True)),
+            exposure_offset_ev=self._exposure_offset,
+            wb_scale=tuple(float(c) for c in self._wb_scale),
         )
 
         self._thread = QThread(self)

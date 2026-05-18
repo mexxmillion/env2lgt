@@ -40,9 +40,13 @@ class QuadState:
 class SceneState:
     scene_scale: float = 100.0
     yaw_offset_deg: float = 0.0
-    exposure_ev: float = 0.0
+    exposure_ev: float = 0.0    # display-only viewport exposure
     dome_rotate_y_deg: float = -180.0
     depth_backend: str = "da2"  # "da2" (scale-invariant) | "dap" (metric)
+    # Exposure-mode baseline adjustments (baked into the export).
+    exposure_offset_ev: float = 0.0
+    wb_kelvin: float = 6500.0
+    wb_tint: float = 0.0
 
 
 @dataclass
@@ -144,6 +148,9 @@ def project_from_app_state(
     dome_rotate_y_deg: float,
     depth_backend: str = "da2",
     export_opts: dict | None = None,
+    exposure_offset_ev: float = 0.0,
+    wb_kelvin: float = 6500.0,
+    wb_tint: float = 0.0,
 ) -> Project:
     """Convenience constructor used by the app on save."""
     e = export_opts or {}
@@ -155,6 +162,9 @@ def project_from_app_state(
             exposure_ev=float(exposure_ev),
             dome_rotate_y_deg=float(dome_rotate_y_deg),
             depth_backend=str(depth_backend),
+            exposure_offset_ev=float(exposure_offset_ev),
+            wb_kelvin=float(wb_kelvin),
+            wb_tint=float(wb_tint),
         ),
         quads=[
             QuadState(
