@@ -195,23 +195,31 @@ class MainWindow(QMainWindow):
         self.viewer.chart_committed.connect(self._on_chart_committed)
         self.viewer.chart_mode_changed.connect(self._on_chart_mode_changed)
 
-        self.panel = LightPanel(self)
-        dock = QDockWidget("Lights", self)
-        dock.setWidget(self.panel)
-        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        self._lights_dock = dock
+        # Lights + Exposure panels live in ONE dock, swapped via a stacked
+        # widget. A single fixed-geometry dock means toggling exposure mode
+        # never relayouts the central area — the viewport (and its zoom/pan)
+        # stays put. The tall exposure panel is wrapped in a scroll area so it
+        # can never force the window to grow.
+        from PySide6.QtWidgets import QScrollArea, QStackedWidget
 
-        # Exposure-mode panel — same dock area, hidden until exposure mode.
+        self.panel = LightPanel(self)
         self.exposure_panel = ExposurePanel(self)
-        exp_dock = QDockWidget("Exposure", self)
-        exp_dock.setWidget(self.exposure_panel)
-        exp_dock.setAllowedAreas(
+        exp_scroll = QScrollArea()
+        exp_scroll.setWidgetResizable(True)
+        exp_scroll.setWidget(self.exposure_panel)
+        exp_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+
+        self._panel_stack = QStackedWidget()
+        self._panel_stack.addWidget(self.panel)        # index 0 — Lights
+        self._panel_stack.addWidget(exp_scroll)        # index 1 — Exposure
+
+        dock = QDockWidget("Lights", self)
+        dock.setWidget(self._panel_stack)
+        dock.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, exp_dock)
-        exp_dock.setVisible(False)
-        self._exposure_dock = exp_dock
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self._dock = dock
         self.exposure_panel.exposure_offset_changed.connect(self._on_exposure_offset)
         self.exposure_panel.wb_changed.connect(self._on_wb_changed)
         self.exposure_panel.sample_exposure_requested.connect(
@@ -891,11 +899,11 @@ class MainWindow(QMainWindow):
         self._exposure_mode = bool(checked)
         # The light quads are irrelevant while metering — hide them.
         self.viewer.set_quads_visible(not checked)
-        self._exposure_dock.setVisible(checked)
-        self._lights_dock.setVisible(not checked)
-        if checked:
-            self._exposure_dock.raise_()
-        else:
+        # Swap the panel via the stacked widget — the dock geometry (and so
+        # the viewport) is untouched, so zoom/pan never jumps.
+        self._panel_stack.setCurrentIndex(1 if checked else 0)
+        self._dock.setWindowTitle("Exposure" if checked else "Lights")
+        if not checked:
             if self.viewer.is_sample_mode():
                 self.viewer.cancel_sample_mode()
             if self.viewer.is_chart_mode():
