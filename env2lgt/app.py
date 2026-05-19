@@ -298,7 +298,7 @@ class MainWindow(QMainWindow):
         self._progress.setFixedWidth(280)
         self._build_probe_widget()
         self.statusBar().addPermanentWidget(self._progress)
-        self.statusBar().showMessage("Open or drag an EXR latlong panorama to begin.")
+        self._set_status("Open or drag an EXR latlong panorama to begin.")
 
     def _build_probe_widget(self):
         """Nuke-style pixel probe in the status bar: a colour swatch plus the
@@ -335,8 +335,18 @@ class MainWindow(QMainWindow):
         self._area_label.setTextFormat(Qt.TextFormat.RichText)
         self._area_label.setFont(font)
         row.addWidget(self._area_label)
-        # Flush to the bottom-left of the status bar.
+        # Probe sits flush bottom-left. The status message goes in its own
+        # normal QLabel right of it — NOT via QStatusBar.showMessage(), which
+        # hides every non-permanent widget (the probe included) while a
+        # message is up.
         self.statusBar().addWidget(probe)
+        self._status_msg = QLabel("")
+        self.statusBar().addWidget(self._status_msg, 1)
+
+    def _set_status(self, msg: str) -> None:
+        """Set the status-bar message. Replaces QStatusBar.showMessage so the
+        bottom-left probe widget is never hidden."""
+        self._status_msg.setText(msg)
 
     @staticmethod
     def _make_eyedropper_icon() -> QIcon:
@@ -374,7 +384,9 @@ class MainWindow(QMainWindow):
 
         pp = self.panel.detect_params()
         dp = DetectParams(threshold=pp["threshold"], blur_deg=pp["blur_deg"])
-        mask = bright_mask(self._hdr_display, dp)
+        # Key off the baseline-adjusted HDRI — the same buffer the bake
+        # extracts from — so the mask matches the displayed panorama.
+        mask = bright_mask(self._adjusted_working(self._hdr_display), dp)
         H, W = mask.shape
         offset = int(round((self._yaw_offset_deg / 360.0) * W)) % W
         if offset:
@@ -733,7 +745,7 @@ class MainWindow(QMainWindow):
         self._refresh_view()
         self._refresh_key_preview()
         h, w, _ = self._hdr.shape
-        self.statusBar().showMessage(f"{path.name}  ·  {w}×{h}  ·  float32")
+        self._set_status(f"{path.name}  ·  {w}×{h}  ·  float32")
 
         # Look for a sibling project file and offer to restore.
         sibling = default_project_path(path)
@@ -749,7 +761,7 @@ class MainWindow(QMainWindow):
                 try:
                     proj = load_project(sibling)
                     self._apply_project_state(proj)
-                    self.statusBar().showMessage(
+                    self._set_status(
                         f"Restored {len(proj.quads)} quad(s) from {sibling.name}"
                     )
                 except Exception as e:  # noqa: BLE001
@@ -919,7 +931,7 @@ class MainWindow(QMainWindow):
             self._display_cache = None
             self._cache_key = None
             self._on_depth_toggle(self._depth_btn.isChecked())
-        self.statusBar().showMessage(f"Depth backend: {self._backend_combo.currentText()}")
+        self._set_status(f"Depth backend: {self._backend_combo.currentText()}")
 
     def _on_yaw_offset(self, val: int):
         self._yaw_offset_deg = val / 10.0
@@ -1032,7 +1044,7 @@ class MainWindow(QMainWindow):
                 self.exposure_panel.set_reference_view(False)
                 self._on_reference_view_toggled(False)
         if self._exr_path is not None:
-            self.statusBar().showMessage(
+            self._set_status(
                 "Exposure mode — adjust the HDRI baseline; baked into export."
                 if checked else f"{self._exr_path.name}"
             )
@@ -1046,7 +1058,7 @@ class MainWindow(QMainWindow):
             return
         self._pending_sample = purpose
         self.viewer.start_sample_mode()
-        self.statusBar().showMessage(
+        self._set_status(
             "Drag a rectangle to sample an area. Esc to cancel."
         )
 
@@ -1100,7 +1112,7 @@ class MainWindow(QMainWindow):
             self._exposure_offset = offset
             self.exposure_panel.set_exposure_offset(offset)
             self._refresh_view()
-            self.statusBar().showMessage(
+            self._set_status(
                 f"Spot meter — exposure offset set to {offset:+.2f} EV"
             )
         elif purpose == "wb":
@@ -1111,7 +1123,7 @@ class MainWindow(QMainWindow):
             self.exposure_panel.set_wb(kelvin, tint)
             self._recompute_wb()
             self._refresh_view()
-            self.statusBar().showMessage(
+            self._set_status(
                 f"WB sampled — {int(kelvin)} K, tint {tint:+.2f}"
             )
         elif purpose == "probe":
@@ -1139,7 +1151,7 @@ class MainWindow(QMainWindow):
         if self._hdr_display is None:
             QMessageBox.information(self, "Auto meter", "Open an EXR first.")
             return
-        self.statusBar().showMessage("Auto meter — convolving the dome…")
+        self._set_status("Auto meter — convolving the dome…")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         QApplication.processEvents()
         try:
@@ -1153,7 +1165,7 @@ class MainWindow(QMainWindow):
         self.exposure_panel.set_wb(kelvin, tint)
         self._recompute_wb()
         self._refresh_view()
-        self.statusBar().showMessage(
+        self._set_status(
             f"Auto meter — {self._exposure_offset:+.2f} EV, "
             f"{int(kelvin)} K, tint {tint:+.2f}"
         )
@@ -1166,7 +1178,7 @@ class MainWindow(QMainWindow):
             self.exposure_panel.set_pick_chart_active(False)
             return
         self.viewer.start_chart_mode()
-        self.statusBar().showMessage(
+        self._set_status(
             "Click the 4 chart corners — start at the dark-skin patch, "
             "then clockwise. Esc to cancel."
         )
@@ -1176,7 +1188,7 @@ class MainWindow(QMainWindow):
 
     def _on_chart_committed(self):
         self.exposure_panel.set_chart_status(has_chart=True, rmse=None)
-        self.statusBar().showMessage(
+        self._set_status(
             "Chart placed — drag the corners to refine, then Solve & apply."
         )
 
@@ -1251,7 +1263,7 @@ class MainWindow(QMainWindow):
         self._cc_target_mode = "json"
         self._cc_target_name = name
         self.exposure_panel.set_target_label(f"JSON: {name}")
-        self.statusBar().showMessage(f"Colour target loaded: {name}")
+        self._set_status(f"Colour target loaded: {name}")
 
     # ---------- reference image ----------
 
@@ -1282,7 +1294,7 @@ class MainWindow(QMainWindow):
         self._ref_cs = self.exposure_panel.reference_cs()
         self._ref_display = self._reference_to_working(self._ref_src)
         self.exposure_panel.set_reference_loaded(True)
-        self.statusBar().showMessage(f"Reference image loaded: {Path(path).name}")
+        self._set_status(f"Reference image loaded: {Path(path).name}")
         # Jump straight to the reference view so the user can place a chart.
         self.exposure_panel.set_reference_view(True)
         self._on_reference_view_toggled(True)
@@ -1332,7 +1344,7 @@ class MainWindow(QMainWindow):
         self.exposure_panel.set_reference_view(show_reference)
         self._invalidate_display_cache()
         self._refresh_view()
-        self.statusBar().showMessage(
+        self._set_status(
             "Reference image — place a chart, then set the target to "
             "'Reference image'." if show_reference else ""
         )
@@ -1386,7 +1398,7 @@ class MainWindow(QMainWindow):
         )
         if flipped:
             msg += "  ·  chart detected upside-down (auto-corrected)"
-        self.statusBar().showMessage(msg)
+        self._set_status(msg)
 
     def _on_save_correction(self):
         """Export the solved colour-checker correction to a JSON file."""
@@ -1416,7 +1428,7 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Save correction", str(e))
             return
-        self.statusBar().showMessage(f"Correction saved: {Path(path).name}")
+        self._set_status(f"Correction saved: {Path(path).name}")
 
     def _on_load_correction(self):
         """Load a saved correction JSON and apply it directly — no chart
@@ -1443,7 +1455,7 @@ class MainWindow(QMainWindow):
         )
         self._invalidate_display_cache()
         self._refresh_view()
-        self.statusBar().showMessage(
+        self._set_status(
             f"Correction loaded: {Path(path).name} ({self._cc_fit_mode})"
         )
 
@@ -1482,7 +1494,7 @@ class MainWindow(QMainWindow):
         self._depth_worker.failed.connect(self._depth_thread.quit)
         self._depth_thread.finished.connect(self._depth_worker.deleteLater)
         self._depth_thread.finished.connect(self._depth_thread.deleteLater)
-        self.statusBar().showMessage(
+        self._set_status(
             f"Running {self._backend_combo.currentText()} for depth view…"
         )
         self._depth_thread.start()
@@ -1504,7 +1516,7 @@ class MainWindow(QMainWindow):
         self._view_mode = "depth"
         self._depth_btn.setEnabled(True)
         self._depth_btn.setText("Show HDR")
-        self.statusBar().showMessage(
+        self._set_status(
             f"Depth ready  ·  range [{distance.min():.3f}, {distance.max():.3f}] (DA-2 scale-invariant)"
         )
         self._refresh_view()
@@ -1556,7 +1568,11 @@ class MainWindow(QMainWindow):
         from env2lgt.lights.detect import DetectParams, propose_quads
         from env2lgt.proj import rasterize_spherical_quad
 
-        hdr = self._hdr_display
+        # Detect on the baseline-adjusted HDRI (colour-checker matrix, white
+        # balance, exposure offset) — the bake applies these before extracting
+        # the rect / dome textures, so detection must see the same buffer or
+        # the proposed quads won't match the baked result.
+        hdr = self._adjusted_working(self._hdr_display)
         H, W = hdr.shape[:2]
         existing = self.viewer.quads()
         locked = [q for q in existing if q.locked]
@@ -1576,7 +1592,7 @@ class MainWindow(QMainWindow):
             merge_distance_deg=float(params.get("merge_distance_deg", 1.0)),
             suppress_floor=bool(params.get("suppress_floor", True)),
         )
-        self.statusBar().showMessage("Detecting lights…")
+        self._set_status("Detecting lights…")
         QApplication.processEvents()
         detected = propose_quads(hdr, dp, exclude_mask=exclude)
 
@@ -1601,7 +1617,7 @@ class MainWindow(QMainWindow):
         msg = f"Proposed {added} quad(s)"
         if locked:
             msg += f"  ·  kept {len(locked)} locked"
-        self.statusBar().showMessage(msg)
+        self._set_status(msg)
 
     def _on_add_quad_requested(self):
         if self._hdr is None:
@@ -1615,12 +1631,12 @@ class MainWindow(QMainWindow):
     def _on_add_mode_changed(self, active: bool):
         self.panel.set_add_mode_active(active)
         if active:
-            self.statusBar().showMessage(
+            self._set_status(
                 "Add mode — click 4 corners of the light. Esc to cancel."
             )
         else:
             if self._exr_path is not None:
-                self.statusBar().showMessage(
+                self._set_status(
                     f"{self._exr_path.name}  ·  {self._hdr.shape[1]}×{self._hdr.shape[0]}"
                 )
 
@@ -1644,7 +1660,7 @@ class MainWindow(QMainWindow):
         # Reflect the final name back in the panel (might be munged on collision).
         self.panel.rename(old_name, actual)
         if actual != new_name:
-            self.statusBar().showMessage(
+            self._set_status(
                 f"Name '{new_name}' was taken; using '{actual}'."
             )
 
@@ -1673,7 +1689,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self._save_project_to(Path(path))
-            self.statusBar().showMessage(f"Saved: {path}")
+            self._set_status(f"Saved: {path}")
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Save project", str(e))
 
@@ -1712,7 +1728,7 @@ class MainWindow(QMainWindow):
         # restore from it (could be the same file we just opened, or a different
         # one). Either way, force-apply the project the user explicitly opened.
         self._apply_project_state(proj)
-        self.statusBar().showMessage(
+        self._set_status(
             f"Project loaded: {Path(path).name}  ·  {len(proj.quads)} quad(s)"
         )
 
@@ -1901,12 +1917,12 @@ class MainWindow(QMainWindow):
         self._thread.finished.connect(self._thread.deleteLater)
         self._progress.setValue(0)
         self._progress.setVisible(True)
-        self.statusBar().showMessage("Preview running…")
+        self._set_status("Preview running…")
         self._thread.start()
 
     def _on_preview_finished(self, summary: dict):
         self._progress.setVisible(False)
-        self.statusBar().showMessage("Preview ready.")
+        self._set_status("Preview ready.")
         self._show_preview_dialog(summary)
 
     def _show_preview_dialog(self, summary: dict):
@@ -2028,12 +2044,12 @@ class MainWindow(QMainWindow):
         self._thread.finished.connect(self._thread.deleteLater)
         self._progress.setValue(0)
         self._progress.setVisible(True)
-        self.statusBar().showMessage("Baking…")
+        self._set_status("Baking…")
         self._thread.start()
 
     def _on_bake_progress(self, stage: str, frac: float):
         self._progress.setValue(int(frac * 100))
-        self.statusBar().showMessage(f"Baking: {stage}")
+        self._set_status(f"Baking: {stage}")
 
     def _on_bake_finished(self, summary: dict):
         self._progress.setVisible(False)
@@ -2052,7 +2068,7 @@ class MainWindow(QMainWindow):
             except Exception as e:  # noqa: BLE001
                 import sys
                 print(f"[env2lgt] autosave failed: {e}", file=sys.stderr)
-        self.statusBar().showMessage(f"Bake done: {usd}  ({n} rect lights)")
+        self._set_status(f"Bake done: {usd}  ({n} rect lights)")
         QMessageBox.information(
             self,
             "Bake complete",
@@ -2061,7 +2077,7 @@ class MainWindow(QMainWindow):
 
     def _on_bake_failed(self, msg: str):
         self._progress.setVisible(False)
-        self.statusBar().showMessage("Bake failed.")
+        self._set_status("Bake failed.")
         QMessageBox.critical(self, "Bake failed", msg)
 
     def closeEvent(self, event):  # noqa: N802
