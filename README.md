@@ -58,10 +58,17 @@ Refer to the screenshot above.
 
 ### Toolbar (top)
 
-- **Exposure** — log2 stops, display-only. Doesn't affect what's written.
+- **Exposure** — log2 stops, display-only viewport exposure. Doesn't affect what's written (for a *baked* exposure shift, see [Exposure mode](#exposure-mode)).
 - **Scene scale** — meters per depth unit. For DA² (scale-invariant) this is the primary "how big is this room actually" knob; for DAP (metric) it's a fine-tune multiplier. Switching the **Depth** dropdown snaps it to that backend's default (DA² → 100 m/u, DAP → 1.0). Slider range `0.001 .. 1000`.
-- **Yaw offset** — rolls the displayed panorama horizontally (in degrees). Use this to place lights that straddle the seam at u=0/u=W. Quad data stays in **absolute** spherical coords, so changing the offset doesn't move the lights — it only changes what's under the mouse. **Reset** zeroes it.
+- **Yaw offset** — rolls the displayed panorama horizontally (in degrees). Use this to place lights that straddle the seam at u=0/u=W. Quad data stays in **absolute** spherical coords, so changing the offset doesn't move the lights — it only changes what's under the mouse.
+- **⟲ Reset view** — zeroes the viewport exposure + yaw offset and refits zoom/pan.
+- **Display** / **View** — OCIO display + view transform for the viewport (Nuke/Maya-style), driven by the `$OCIO` config. Display-only; see [Colour management](#colour-management).
+- **Exposure mode** (hotkey **E**) — baseline exposure / white balance / colour-checker matching. See [Exposure mode](#exposure-mode).
 - **Show depth** (hotkey **D**) — toggle the equirect view between HDR and a turbo-colormap of the DA-2 distance map. Quad outlines + handles render on top either way, so you can verify each quad sits on a region of consistent depth before baking. First press runs DA-2 in a background thread; subsequent toggles are instant.
+
+### Status bar
+
+A Nuke-style pixel probe — colour swatch + scene-linear RGB/HSV under the cursor — plus an **eyedropper** button: drag a rectangle to read the average RGB of an area.
 
 ### Light quads panel (right)
 
@@ -89,6 +96,35 @@ Per-file output checkboxes. All are independent, so you can bake just the dome, 
 
 - **Preview (no files)** — runs the full pipeline with every `write_*` set to False. Produces an in-memory table of per-quad fit results (center, size, normal, intensity, RANSAC inlier ratio). Useful for sanity-checking before committing files to disk. Distance cache lands at `<exr_dir>/.env2lgt_cache/` so the first real bake hits it for free.
 - **Bake light rig** — full pipeline, writes everything checked.
+
+---
+
+## Exposure mode
+
+Press **E** (or the toolbar button / *Tools → Exposure mode*) to enter exposure mode. The right dock swaps to the exposure panel and the light quads hide. Everything here shifts the **HDRI baseline** — unlike the toolbar Exposure slider, these adjustments are **baked into the exported dome / rect textures and light intensities**.
+
+- **Exposure offset** — a baseline shift in stops.
+- **Spot meter** — drag a rectangle; its average is metered to 18% middle grey, setting the exposure offset (camera spot-meter behaviour).
+- **White balance** — Lightroom-style **Temperature** + **Tint** sliders. The **WB eyedropper** samples a rectangle over something neutral and back-solves the sliders.
+- **Auto exposure + WB** — "convolve the dome": renders a cosine-weighted Lambertian gray ball lit by the whole panorama and sets exposure + WB from it.
+
+### Colour-checker chart
+
+Match an HDRI to a known chart or a reference plate (MMColorTarget-style):
+
+1. **Pick colour chart** — click the 4 corners of a 24-patch ColorChecker on the panorama (dark-skin patch first, then clockwise). The overlay curves along the equirect projection and fills each cell with the reference colour so you can line it up by eye; drag the handles to refine.
+2. **Target** — the built-in **CC24** reference, a custom 24-swatch **JSON** target, or a **reference image**: *Load reference image…* opens a regular 2D photo into the viewer (HDRI ⇄ Reference toggle), where you place a flat chart and match against it.
+3. **Fit** — exposure-only, white-balance, or a full **3×3 matrix**, solved by least squares. The RMSE is reported; the correction bakes into the rig.
+
+### Colour management
+
+env2lgt works internally in a scene-linear **working space** (the `$OCIO` config's `scene_linear` role — ACEScg in an ACES config):
+
+- **Input transform** — the source EXR's colorspace, converted to working on load (Exposure panel → *Colour management*). Defaults to ACEScg; pick `Utility - Linear - sRGB` for an sRGB-linear source, etc.
+- **Output transform** — the colorspace the baked dome / rect EXRs are written in.
+- **Display / View** — the viewport transform (toolbar dropdowns).
+
+If `$OCIO` is unset or PyOpenColorIO is unavailable, the app falls back to a fixed ACES-filmic display and the colour-management controls are disabled.
 
 ---
 
@@ -151,6 +187,7 @@ When a metric backend is selected, `bake.py` records `is_metric` + `depth_backen
 - NVIDIA GPU (RTX 3090-class, ≥ 24 GB VRAM recommended; smaller works but DA-2 has to downscale)
 - conda (miniconda or miniforge)
 - Disk: ~15 GB on `E:` for the two envs + DA-2 model weights cache
+- An **OCIO config** for colour management — set the `OCIO` environment variable to a `config.ocio` (e.g. an [ACES config](https://github.com/AcademySoftwareFoundation/OpenColorIO-Config-ACES)). Optional: without it the app falls back to a fixed ACES-filmic display. `PyOpenColorIO` itself ships with the conda `opencolorio` package (already in `environment.yml`).
 
 ### Setup
 
@@ -211,6 +248,7 @@ The `requirements.txt` only covers the pure-Python additions.
 Set these once with `setx` (paths are examples — point them anywhere with room):
 
 ```cmd
+setx OCIO                "C:\OCIO\aces_1.2\config.ocio"
 setx HF_HOME             "D:\models\huggingface"
 setx TORCH_HOME          "D:\models\torch"
 setx HF_TOKEN            "hf_xxxxxxxxxxxxxxxxxxxxxx"
@@ -280,6 +318,9 @@ env2lgt/
 ├── bake.py                  End-to-end pipeline orchestration
 ├── cli.py                   `env2lgt-bake` headless command (stub)
 ├── proj.py                  Sphere ↔ equirect ↔ rectilinear math (single source of truth)
+├── color.py                 OCIO colour management (working space, transforms, display)
+├── colorchecker.py          Colour-checker rectify / sample / least-squares solve
+├── exposure.py              Exposure + white-balance metering (spot, dome convolution)
 ├── depth/
 │   ├── base.py              DepthBackend protocol
 │   ├── __init__.py          Backend registry — get_backend() / ENV2LGT_DEPTH_BACKEND
@@ -292,8 +333,9 @@ env2lgt/
 │   ├── extract.py           sample_rect_texture, rect_from_quad, photometry
 │   └── inpaint.py           Iterative gaussian edge-extend (HDR-safe)
 ├── ui/
-│   ├── viewer.py            Equirect viewer + 4-click placement + drag handles
-│   └── light_panel.py       Quad list, name sanitizer, export options, paths
+│   ├── viewer.py            Equirect viewer + 4-click placement + drag handles + chart
+│   ├── light_panel.py       Quad list, name sanitizer, export options, paths
+│   └── exposure_panel.py    Exposure / white-balance / colour-checker / OCIO panel
 └── usd/
     ├── lightrig.py          UsdLuxDomeLight + UsdLuxRectLight authoring
     └── mesh.py              Depth-displaced UV sphere with emissive dome
@@ -318,6 +360,7 @@ scripts/
 ## Roadmap
 
 - [x] **Swappable depth backend** — `DepthBackend` protocol + registry, DA²/DAP backends, UI dropdown, project-file key, DAP inference wired + validated against DA². See [Depth backends](#depth-backends) and [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md). *Remaining:* absolute metric calibration against a known-size scene.
+- [x] **Exposure mode** — baked baseline exposure offset, Lightroom-style white balance, spot + convolve-the-dome metering, OCIO colour management (ACEScg working space, input/output transforms, viewport display/view), and colour-checker chart matching (CC24 / JSON / reference-image targets, 3×3 least-squares fit). See [Exposure mode](#exposure-mode).
 - [ ] Auto-detect mode — propose quads from brightness-thresholded connected components, with K-means grouping by brightness so the user can include/exclude "windows" vs "lamps" with one click.
 - [ ] **Load masks.json** — reproduce a previous bake's quad layout for a new render.
 - [ ] Disk + portal lights (in addition to rect).

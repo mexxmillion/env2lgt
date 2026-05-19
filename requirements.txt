@@ -1,9 +1,12 @@
 # env2lgt — UI / USD / EXR environment (pip-installable subset)
 #
 # IMPORTANT: most of the UI env is conda-only (openusd, pyside6, opencv,
-# openexr, py-openimageio). Install those via conda first; see README.md or
-# environment.yml. This file covers the pure-Python parts so `pip install -r
-# requirements.txt -e .` works inside the conda env.
+# openexr, py-openimageio, opencolorio). Install those via conda first; see
+# README.md or environment.yml. This file covers the pure-Python parts so
+# `pip install -r requirements.txt -e .` works inside the conda env.
+#
+# Colour management uses PyOpenColorIO (from the conda `opencolorio` package)
+# and needs the OCIO env var pointing at a config.ocio — see README.md.
 #
 # Tested with Python 3.11.
 
