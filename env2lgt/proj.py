@@ -39,6 +39,33 @@ def angles_from_dir(d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return yaw, pitch
 
 
+# ---------- spherical interpolation ----------
+
+def slerp(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
+    """Spherical-linear interpolation between two unit directions."""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    cos = float(np.clip(a @ b, -1.0, 1.0))
+    om = float(np.arccos(cos))
+    if om < 1e-6:
+        d = a
+    else:
+        s = np.sin(om)
+        d = (np.sin((1.0 - t) * om) / s) * a + (np.sin(t * om) / s) * b
+    return d / (np.linalg.norm(d) + 1e-12)
+
+
+def spherical_bilinear(corners: np.ndarray, u: float, v: float) -> np.ndarray:
+    """Spherical bilinear blend of a 4-corner patch (ordered TL, TR, BR, BL)
+    at parametric (u, v) in [0, 1]^2 — slerp the top + bottom edges, then
+    slerp between them. The patch follows great circles, so it tracks the
+    equirect warp like a light quad does."""
+    c = np.asarray(corners, dtype=np.float64).reshape(4, 3)
+    top = slerp(c[0], c[1], u)
+    bot = slerp(c[3], c[2], u)
+    return slerp(top, bot, v)
+
+
 # ---------- equirect pixel <-> spherical angle ----------
 
 def pix_to_angles(u: np.ndarray, v: np.ndarray, W: int, H: int) -> tuple[np.ndarray, np.ndarray]:

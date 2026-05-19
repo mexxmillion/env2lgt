@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QComboBox,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -33,6 +35,17 @@ class ExposurePanel(QWidget):
     sample_exposure_requested = Signal()           # spot-meter an area
     sample_wb_requested = Signal()                 # WB-eyedropper an area
     auto_meter_requested = Signal()                # convolve-the-dome auto
+    input_cs_changed = Signal(str)                 # source colorspace
+    output_cs_changed = Signal(str)                # bake output colorspace
+    pick_chart_requested = Signal()                # place a colour-checker
+    clear_chart_requested = Signal()
+    use_builtin_target = Signal()                  # target = built-in CC24
+    load_json_target_requested = Signal()          # target = a JSON file
+    use_reference_target = Signal()                # target = reference image
+    load_reference_image_requested = Signal()      # load a flat reference image
+    reference_view_toggled = Signal(bool)          # HDRI <-> reference view
+    fit_mode_changed = Signal(str)                 # exposure | wb | matrix
+    solve_chart_requested = Signal()               # solve + apply correction
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -134,7 +147,119 @@ class ExposurePanel(QWidget):
         ab.addWidget(self._auto_btn)
         layout.addWidget(auto_box)
 
+        layout.addWidget(self._build_colour_management_group())
+        layout.addWidget(self._build_chart_group())
         layout.addStretch(1)
+
+    # ---------- colour management ----------
+
+    def _build_colour_management_group(self) -> QGroupBox:
+        box = QGroupBox("Colour management (OCIO)", self)
+        form = QFormLayout(box)
+        self._input_cs_combo = QComboBox()
+        self._input_cs_combo.setToolTip(
+            "Colorspace of the source EXR. Converted into the ACEScg working "
+            "space on load."
+        )
+        self._input_cs_combo.currentTextChanged.connect(self.input_cs_changed)
+        form.addRow("Input", self._input_cs_combo)
+        self._output_cs_combo = QComboBox()
+        self._output_cs_combo.setToolTip(
+            "Colorspace the baked dome / rect EXRs are written in."
+        )
+        self._output_cs_combo.currentTextChanged.connect(self.output_cs_changed)
+        form.addRow("Output", self._output_cs_combo)
+        return box
+
+    # ---------- colour-checker chart ----------
+
+    def _build_chart_group(self) -> QGroupBox:
+        box = QGroupBox("Colour-checker chart", self)
+        v = QVBoxLayout(box)
+        desc = QLabel(
+            "Place a 4-corner quad over a 24-patch chart (corner 1 = dark "
+            "skin, then clockwise). The cells show the reference colours so "
+            "you can line it up. Pick a target and solve a colour match."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color:#888;")
+        v.addWidget(desc)
+
+        # HDRI <-> reference-image view toggle (like the depth toggle).
+        self._ref_view_btn = QPushButton("Show reference image")
+        self._ref_view_btn.setCheckable(True)
+        self._ref_view_btn.setEnabled(False)
+        self._ref_view_btn.setToolTip(
+            "Switch the viewport between the HDRI panorama and the loaded "
+            "flat reference image. Each keeps its own chart."
+        )
+        self._ref_view_btn.toggled.connect(self.reference_view_toggled)
+        v.addWidget(self._ref_view_btn)
+        self._load_ref_btn = QPushButton("Load reference image…")
+        self._load_ref_btn.setToolTip(
+            "Load a regular 2D photo of a colour chart to match against."
+        )
+        self._load_ref_btn.clicked.connect(self.load_reference_image_requested)
+        v.addWidget(self._load_ref_btn)
+
+        pick_row = QHBoxLayout()
+        self._pick_chart_btn = QPushButton("Pick colour chart")
+        self._pick_chart_btn.setCheckable(True)
+        self._pick_chart_btn.setToolTip(
+            "Place the chart on the current view (HDRI or reference)."
+        )
+        self._pick_chart_btn.clicked.connect(self._on_pick_chart)
+        pick_row.addWidget(self._pick_chart_btn, stretch=1)
+        self._clear_chart_btn = QPushButton("Clear")
+        self._clear_chart_btn.setFixedWidth(56)
+        self._clear_chart_btn.clicked.connect(self.clear_chart_requested)
+        pick_row.addWidget(self._clear_chart_btn)
+        v.addLayout(pick_row)
+
+        v.addWidget(QLabel("Target:"))
+        self._target_label = QLabel("Built-in CC24")
+        self._target_label.setStyleSheet("color:#6bd66b;")
+        v.addWidget(self._target_label)
+        tgt_row = QHBoxLayout()
+        builtin_btn = QPushButton("Built-in CC24")
+        builtin_btn.clicked.connect(self.use_builtin_target)
+        tgt_row.addWidget(builtin_btn)
+        json_btn = QPushButton("Load JSON…")
+        json_btn.clicked.connect(self.load_json_target_requested)
+        tgt_row.addWidget(json_btn)
+        ref_tgt_btn = QPushButton("Reference image")
+        ref_tgt_btn.setToolTip(
+            "Match to the chart placed on the loaded reference image."
+        )
+        ref_tgt_btn.clicked.connect(self.use_reference_target)
+        tgt_row.addWidget(ref_tgt_btn)
+        v.addLayout(tgt_row)
+
+        fit_row = QHBoxLayout()
+        fit_row.addWidget(QLabel("Fit:"))
+        self._fit_combo = QComboBox()
+        self._fit_combo.addItem("Exposure only", "exposure")
+        self._fit_combo.addItem("White balance", "wb")
+        self._fit_combo.addItem("Full 3×3 matrix", "matrix")
+        self._fit_combo.setCurrentIndex(2)
+        self._fit_combo.currentIndexChanged.connect(
+            lambda _=0: self.fit_mode_changed.emit(self._fit_combo.currentData())
+        )
+        fit_row.addWidget(self._fit_combo, stretch=1)
+        v.addLayout(fit_row)
+
+        self._solve_btn = QPushButton("Solve & apply")
+        self._solve_btn.clicked.connect(self.solve_chart_requested)
+        v.addWidget(self._solve_btn)
+        self._chart_status = QLabel("No chart placed.")
+        self._chart_status.setStyleSheet("color:#888;")
+        self._chart_status.setWordWrap(True)
+        v.addWidget(self._chart_status)
+        return box
+
+    def _on_pick_chart(self):
+        if self._pick_chart_btn.isChecked():
+            self.pick_chart_requested.emit()
 
     # ---------- slider handlers ----------
 
@@ -193,3 +318,61 @@ class ExposurePanel(QWidget):
             b.blockSignals(True)
             b.setChecked(False)
             b.blockSignals(False)
+
+    # ---------- colour-management / chart setters ----------
+
+    def populate_colorspaces(
+        self, names: list[str], input_cs: str, output_cs: str
+    ) -> None:
+        for combo, cur in (
+            (self._input_cs_combo, input_cs),
+            (self._output_cs_combo, output_cs),
+        ):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(names)
+            if cur in names:
+                combo.setCurrentText(cur)
+            combo.blockSignals(False)
+
+    def set_colour_management_enabled(self, enabled: bool) -> None:
+        self._input_cs_combo.setEnabled(enabled)
+        self._output_cs_combo.setEnabled(enabled)
+
+    def fit_mode(self) -> str:
+        return self._fit_combo.currentData()
+
+    def set_pick_chart_active(self, active: bool) -> None:
+        self._pick_chart_btn.blockSignals(True)
+        self._pick_chart_btn.setChecked(active)
+        self._pick_chart_btn.setText(
+            "Cancel chart (Esc)" if active else "Pick colour chart"
+        )
+        self._pick_chart_btn.blockSignals(False)
+
+    def set_target_label(self, name: str) -> None:
+        self._target_label.setText(name)
+
+    def set_reference_loaded(self, loaded: bool) -> None:
+        self._ref_view_btn.setEnabled(loaded)
+
+    def set_reference_view(self, on: bool) -> None:
+        """Reflect the active view on the toggle without re-emitting."""
+        self._ref_view_btn.blockSignals(True)
+        self._ref_view_btn.setChecked(on)
+        self._ref_view_btn.setText(
+            "Show HDRI panorama" if on else "Show reference image"
+        )
+        self._ref_view_btn.blockSignals(False)
+
+    def set_chart_status(
+        self, has_chart: bool, rmse: float | None = None, applied: bool = False
+    ) -> None:
+        if not has_chart:
+            self._chart_status.setText("No chart placed.")
+        elif rmse is not None:
+            self._chart_status.setText(f"Correction applied — RMSE {rmse:.4f}")
+        elif applied:
+            self._chart_status.setText("Correction applied (restored from project).")
+        else:
+            self._chart_status.setText("Chart placed — pick a target and solve.")

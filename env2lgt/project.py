@@ -47,6 +47,20 @@ class SceneState:
     exposure_offset_ev: float = 0.0
     wb_kelvin: float = 6500.0
     wb_tint: float = 0.0
+    # OCIO colour management.
+    input_colorspace: str = ""
+    output_colorspace: str = ""
+    ocio_display: str = ""
+    ocio_view: str = ""
+
+
+@dataclass
+class ColorCheckerState:
+    """Persisted colour-checker chart placement + solved correction."""
+    corners_dirs: list = field(default_factory=list)  # 4x3 dirs, [] if none
+    matrix: list = field(default_factory=list)         # 3x3, [] if unsolved
+    fit_mode: str = "matrix"
+    target_name: str = "Built-in CC24"
 
 
 @dataclass
@@ -73,6 +87,7 @@ class Project:
     scene: SceneState = field(default_factory=SceneState)
     quads: list[QuadState] = field(default_factory=list)
     export: ExportState = field(default_factory=ExportState)
+    colorchecker: ColorCheckerState = field(default_factory=ColorCheckerState)
     saved_at: str = ""
     format: str = "env2lgt-project"
     version: int = FILE_VERSION
@@ -119,6 +134,8 @@ def load_project(path: str | Path) -> Project:
 
     scene = SceneState(**_filt(scene_raw, {f.name for f in SceneState.__dataclass_fields__.values()}))  # type: ignore[attr-defined]
     export = ExportState(**_filt(export_raw, {f.name for f in ExportState.__dataclass_fields__.values()}))  # type: ignore[attr-defined]
+    cc_raw = raw.get("colorchecker", {})
+    colorchecker = ColorCheckerState(**_filt(cc_raw, {f.name for f in ColorCheckerState.__dataclass_fields__.values()}))  # type: ignore[attr-defined]
     quads = [
         QuadState(
             name=q["name"],
@@ -134,6 +151,7 @@ def load_project(path: str | Path) -> Project:
         scene=scene,
         quads=quads,
         export=export,
+        colorchecker=colorchecker,
         saved_at=raw.get("saved_at", ""),
         version=ver,
     )
@@ -151,9 +169,15 @@ def project_from_app_state(
     exposure_offset_ev: float = 0.0,
     wb_kelvin: float = 6500.0,
     wb_tint: float = 0.0,
+    input_colorspace: str = "",
+    output_colorspace: str = "",
+    ocio_display: str = "",
+    ocio_view: str = "",
+    cc_state: dict | None = None,
 ) -> Project:
     """Convenience constructor used by the app on save."""
     e = export_opts or {}
+    cc = cc_state or {}
     return Project(
         source_exr=str(source_exr),
         scene=SceneState(
@@ -165,6 +189,16 @@ def project_from_app_state(
             exposure_offset_ev=float(exposure_offset_ev),
             wb_kelvin=float(wb_kelvin),
             wb_tint=float(wb_tint),
+            input_colorspace=str(input_colorspace),
+            output_colorspace=str(output_colorspace),
+            ocio_display=str(ocio_display),
+            ocio_view=str(ocio_view),
+        ),
+        colorchecker=ColorCheckerState(
+            corners_dirs=[[float(c) for c in row] for row in cc.get("corners_dirs", [])],
+            matrix=[[float(c) for c in row] for row in cc.get("matrix", [])],
+            fit_mode=str(cc.get("fit_mode", "matrix")),
+            target_name=str(cc.get("target_name", "Built-in CC24")),
         ),
         quads=[
             QuadState(
