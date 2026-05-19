@@ -1,8 +1,8 @@
 """Depth-backend registry.
 
 Pick a backend by name (``da2`` | ``dap``) or fall back to the
-``ENV2LGT_DEPTH_BACKEND`` env var (default ``da2`` — don't break existing
-installs). Backends are instantiated lazily and cached one-per-name, so the
+``ENV2LGT_DEPTH_BACKEND`` env var (default ``dap`` — metric depth).
+Backends are instantiated lazily and cached one-per-name, so the
 DA² / DAP inference daemon is spawned at most once per process.
 """
 
@@ -13,7 +13,7 @@ import os
 
 from env2lgt.depth.base import DepthBackend
 
-DEFAULT_BACKEND = "da2"
+DEFAULT_BACKEND = "dap"
 AVAILABLE_BACKENDS = ("da2", "dap")
 
 _instances: dict[str, DepthBackend] = {}
@@ -34,7 +34,7 @@ def _resolve_name(name: str | None) -> str:
 def get_backend(name: str | None = None) -> DepthBackend:
     """Return the (cached) depth backend for `name`.
 
-    `name=None` consults `ENV2LGT_DEPTH_BACKEND`, then falls back to `da2`.
+    `name=None` consults `ENV2LGT_DEPTH_BACKEND`, then falls back to `dap`.
     """
     name = _resolve_name(name)
     inst = _instances.get(name)

@@ -6,7 +6,7 @@ Built for VFX lighting pipelines: take an HDRI latlong EXR, mark the practical l
 
 ![env2lgt GUI](docs/gui_preview.png)
 
-> *Above: the env2lgt main window. A 4K HDRI is loaded; three light quads have been placed on ceiling fixtures (the large yellow one is selected, with its 4 corner handles visible). The right panel shows the quad list, output path, and per-rig export toggles.*
+> *Above: the env2lgt main window. A 4K HDRI is loaded and auto-detect has proposed light quads on the ceiling fixtures. The toolbar carries the OCIO display, viewport exposure / gamma / yaw and depth controls; the right dock holds the quad list, auto-detect, output path and per-rig export options.*
 
 <!--
 GitHub's README renderer only inlines <video> tags whose src is an absolute
@@ -19,6 +19,21 @@ https://github.com/mexxmillion/env2lgt/raw/main/docs/demo.mp4
 *Workflow demo (16 MB) — load EXR, click corners, bake, open in usdview. If your viewer doesn't inline the player, [download / open in a tab](docs/demo.mp4).*
 
 > **Status:** working tool, not feature-complete. End-to-end pipeline is solid; UX still being iterated on.
+
+---
+
+## Features
+
+- **3D geometry estimation from depth** — A monocular panorama depth model lifts the equirectangular HDRI into 3D: every pixel gets a distance, so the room's surfaces — and the lights on them — sit at real world-space positions. The estimate can be exported as a depth-displaced mesh for validation in `usdview`.
+- **Area-light extraction & placement from geometry** — Each marked light becomes a `UsdLuxRectLight`, sized, oriented and positioned from the estimated geometry (fit to the fixture's plane and depth), with a rectilinear texture sampled straight off the panorama so it maps 1:1 onto the light surface.
+- **Auto-detect lights** — One pass thresholds the panorama's bright sources into proposed quads — seam-aware, with angular merging of clustered fixtures and a tunable settings window. Detected quads are fit in a tangent-plane projection so their corners hug a fixture's true edges. Hand-placement (4 clicks + draggable corner handles) is always available too.
+- **Dome light with Gaussian fill** — The environment is preserved as a `UsdLuxDomeLight`. The regions taken by the extracted area lights are cut out and seamlessly closed by an iterative, HDR-safe Gaussian edge-extend (Nuke `EdgeExtend`-style) — no dark holes, no rainbow inpaint artefacts.
+- **OCIO display & ACEScg colour pipeline** — Everything is processed in a scene-linear ACEScg working space, with OCIO input/output transforms on the source and baked EXRs and a Nuke/Maya-style display + view transform for the viewport.
+- **Colour-checker calibration with reference target** — Place a 24-patch ColorChecker and solve an exposure / white-balance / full 3×3 correction against the built-in CC24, a JSON target, or a reference photo. The correction bakes into the rig — and saves to JSON so it can be reloaded to batch-match a whole shoot.
+- **Auto exposure via dome integration** — A light-integration meter "convolves the dome": it renders a cosine-weighted Lambertian grey ball lit by the entire panorama and back-solves a baseline exposure + white balance from it. Spot-metering a dragged rectangle is also available.
+- **Multiple depth backends** — Two panorama depth models behind one interface: **DAP** — Depth Any Panorama (metric, the default) — and **DA²** — Depth Anything in Any Direction (scale-invariant). Switch per-bake from the toolbar.
+- **Display helpers** — Viewport display exposure, gamma, a Nuke-style pixel + area-average colour probe, and a turbo-mapped depth preview. All display-only — none of it touches the bake.
+- **Project save / restore** — The whole session — quads, exposure/WB, colour-checker correction, scene scale, depth backend, output paths — round-trips through a JSON project file, and every bake autosaves one beside the source EXR.
 
 ---
 
@@ -58,23 +73,34 @@ Refer to the screenshot above.
 
 ### Toolbar (top)
 
-- **Exposure** — log2 stops, display-only viewport exposure. Doesn't affect what's written (for a *baked* exposure shift, see [Exposure mode](#exposure-mode)).
-- **Scene scale** — meters per depth unit. For DA² (scale-invariant) this is the primary "how big is this room actually" knob; for DAP (metric) it's a fine-tune multiplier. Switching the **Depth** dropdown snaps it to that backend's default (DA² → 100 m/u, DAP → 1.0). Slider range `0.001 .. 1000`.
-- **Yaw offset** — rolls the displayed panorama horizontally (in degrees). Use this to place lights that straddle the seam at u=0/u=W. Quad data stays in **absolute** spherical coords, so changing the offset doesn't move the lights — it only changes what's under the mouse.
-- **⟲ Reset view** — zeroes the viewport exposure + yaw offset and refits zoom/pan.
+Left to right:
+
 - **Display** / **View** — OCIO display + view transform for the viewport (Nuke/Maya-style), driven by the `$OCIO` config. Display-only; see [Colour management](#colour-management).
+- **Exposure** — log2 stops, display-only viewport exposure. Doesn't affect what's written (for a *baked* exposure shift, see [Exposure mode](#exposure-mode)).
+- **Gamma** — display-only viewport gamma (`0.25 .. 4.0`). A look knob for the viewport only; never baked.
+- **Yaw offset** — rolls the displayed panorama horizontally (in degrees). Use this to place lights that straddle the seam at u=0/u=W. Quad data stays in **absolute** spherical coords, so changing the offset doesn't move the lights — it only changes what's under the mouse.
+- **⟲ Reset view** — zeroes the viewport exposure, gamma and yaw offset and refits zoom/pan.
+- **Depth** — backend dropdown (DAP / DA²). Switching it snaps the Export panel's Scene scale to that backend's default (DAP → 1.0 m/u, DA² → 100).
+- **Show depth** (hotkey **D**) — toggle the equirect view between HDR and a turbo-colormap of the distance map. Quad outlines + handles render on top either way, so you can verify each quad sits on a region of consistent depth before baking. First press runs depth in a background thread; subsequent toggles are instant.
 - **Exposure mode** (hotkey **E**) — baseline exposure / white balance / colour-checker matching. See [Exposure mode](#exposure-mode).
-- **Show depth** (hotkey **D**) — toggle the equirect view between HDR and a turbo-colormap of the DA-2 distance map. Quad outlines + handles render on top either way, so you can verify each quad sits on a region of consistent depth before baking. First press runs DA-2 in a background thread; subsequent toggles are instant.
+
+(Scene scale moved off the toolbar — it now lives in the [Export panel](#export-panel) next to Geometry inflation.)
+
+### Menus
+
+- **File** — Open EXR, **Open Recent** (the last 10 EXRs, remembered across sessions), Save / Open Project.
+- **Tools** — quad add/delete, Exposure mode, and **Open last bake in usdview** → *Light rig* / *Depth mesh* / *Light rig + depth mesh (layered)*.
 
 ### Status bar
 
-A Nuke-style pixel probe — colour swatch + scene-linear RGB/HSV under the cursor — plus an **eyedropper** button: drag a rectangle to read the average RGB of an area.
+Flush bottom-left: a Nuke-style pixel probe — colour swatch + scene-linear RGB/HSV under the cursor — plus an **eyedropper** button: drag a rectangle to read the average RGB of an area.
 
 ### Light quads panel (right)
 
 - **List** of all defined quads. Double-click to rename — input is sanitized to USD/Maya/Houdini-friendly identifiers (`spaces → _`, non-`[A-Za-z0-9_]` stripped, no leading digits).
 - **Add quad (click 4 corners)** — hotkey **A**. Enters add mode: cursor becomes a crosshair, four left-clicks place the four corners of a new quad. The 4 corners are auto-sorted CCW so click order doesn't matter. The newly-committed quad is selected and gets draggable vertex handles.
 - **Delete selected** — hotkey **Delete**.
+- **Auto-detect lights** — **Detect lights** thresholds the panorama's bright sources into proposed quads in one pass (locked quads are preserved; unlocked auto-proposals are regenerated). **Settings…** opens a separate window with the detection knobs — brightness threshold, blur, max count, min size, merge distance, floor-reflection suppression, and a live key-mask overlay. Detection runs on the baseline-adjusted HDRI, so it matches what you see and what the bake extracts.
 - **Window / portal** — per-quad checkbox. Normally the rect light is slid in from the quad corners' (wall) depth to the bright region's depth, so it sits on the actual light rather than the wall behind it. Tick this for windows / skylights, where the bright pixels are distant sky through the opening — the rect then stays on the wall plane (flush, portal-friendly).
 
 ### Output panel
@@ -88,9 +114,11 @@ Per-file output checkboxes. All are independent, so you can bake just the dome, 
 - `dome.exr` — the inpainted dome panorama
 - `light_<i>.exr` — per-rect rectilinear textures
 - `lightrig.usda` — the composed light scene
-- `depth.exr` (debug) — write the raw DA-2 distance map as a 3-channel EXR
+- `depth.exr` (debug) — write the raw distance map as a 3-channel EXR
 - `panorama_geo.usda` — the depth-displaced UV sphere mesh
 - `masks.json` — the mask sidecar
+
+Plus two bake parameters: **Dome rotateY** (azimuth compensation for the target renderer), **Geometry inflation** (push the depth mesh outward so it doesn't z-fight the rect lights), and **Scene scale** — metres per scene unit, moved here from the toolbar. DAP depth is metric so it defaults to 1.0; DA² is scale-invariant and wants ≈100.
 
 ### Preview vs Bake
 
@@ -115,6 +143,7 @@ Match an HDRI to a known chart or a reference plate (MMColorTarget-style):
 1. **Pick colour chart** — click the 4 corners of a 24-patch ColorChecker on the panorama (dark-skin patch first, then clockwise). The overlay curves along the equirect projection and fills each cell with the reference colour so you can line it up by eye; drag the handles to refine.
 2. **Target** — the built-in **CC24** reference, a custom 24-swatch **JSON** target, or a **reference image**: *Load reference image…* opens a regular 2D photo into the viewer (HDRI ⇄ Reference toggle), where you place a flat chart and match against it.
 3. **Fit** — exposure-only, white-balance, or a full **3×3 matrix**, solved by least squares. The RMSE is reported; the correction bakes into the rig.
+4. **Save / load correction** — export the solved correction (matrix + fit mode + target) to a JSON file, and reload it on other HDRIs. Solve once, then batch-match every panorama from the same shoot without re-placing a chart.
 
 ### Colour management
 
@@ -122,6 +151,7 @@ env2lgt works internally in a scene-linear **working space** (the `$OCIO` config
 
 - **Input transform** — the source EXR's colorspace, converted to working on load (Exposure panel → *Colour management*). Defaults to ACEScg; pick `Utility - Linear - sRGB` for an sRGB-linear source, etc.
 - **Output transform** — the colorspace the baked dome / rect EXRs are written in.
+- **Reference image colorspace** — a separate input transform for a loaded colour-chart reference photo (auto-detected as sRGB for 8-bit images; override in the colour-checker panel).
 - **Display / View** — the viewport transform (toolbar dropdowns).
 
 If `$OCIO` is unset or PyOpenColorIO is unavailable, the app falls back to a fixed ACES-filmic display and the colour-management controls are disabled.
@@ -171,7 +201,7 @@ The depth model sits behind a `DepthBackend` protocol ([env2lgt/depth/base.py](e
 
 1. The **Depth** dropdown in the toolbar (per-bake, no restart).
 2. The `depth_backend` key saved in the project file (`*.env2lgt.json`).
-3. The `ENV2LGT_DEPTH_BACKEND` environment variable (`da2` | `dap`), default `da2`.
+3. The `ENV2LGT_DEPTH_BACKEND` environment variable (`da2` | `dap`), default `dap`.
 
 When a metric backend is selected, `bake.py` records `is_metric` + `depth_backend` in `masks.json` and the `scene_scale` slider becomes a fine-tune multiplier rather than the primary scale control.
 
@@ -266,7 +296,7 @@ setup, **set these**. Run `conda info --base` to find your conda envs
 directory. **`ENV2LGT_DAP_WEIGHTS`** must point at the folder holding DAP's
 `model.pth` (no sensible default — the path baked into DAP's
 `config/infer.yaml` is the authors' own machine). `ENV2LGT_DEPTH_BACKEND`
-(`da2` | `dap`) picks the default backend; it defaults to `da2`.
+(`da2` | `dap`) picks the default backend; it defaults to `dap`.
 
 ### Run
 
@@ -305,8 +335,8 @@ launch.cmd
 2. **Press D** — flip to depth view. Confirm each quad sits on a region of plausible, consistent depth. Lights at very different depths than their immediate surroundings (e.g. a window with the sky visible through it) may need manual scale-tweaking later.
 3. **Preview (no files)** — get the fit table. Sanity-check sizes (a wall sconce should be ~0.3 m, a ceiling panel ~1–2 m). If a quad reports a 50 m × 30 m fit, the depth under that mask is unreliable.
 4. **Check Depth mesh USD**, **Bake**.
-5. **Tools → Open last bake in usdview**. The rect lights should sit directly on the bright fixtures in the dome texture; the panorama mesh shows them in 3D space.
-6. **Adjust scene scale** in the toolbar and re-bake if everything is too small / too big. Cache hit → ~1 s per re-bake.
+5. **Tools → Open last bake in usdview** → *Light rig + depth mesh (layered)*. The rect lights should sit directly on the bright fixtures in the dome texture; the panorama mesh shows them in 3D space.
+6. **Adjust Scene scale** in the Export panel and re-bake if everything is too small / too big. Cache hit → ~1 s per re-bake.
 
 ---
 
@@ -361,7 +391,7 @@ scripts/
 
 - [x] **Swappable depth backend** — `DepthBackend` protocol + registry, DA²/DAP backends, UI dropdown, project-file key, DAP inference wired + validated against DA². See [Depth backends](#depth-backends) and [docs/DAP_BACKEND_PLAN.md](docs/DAP_BACKEND_PLAN.md). *Remaining:* absolute metric calibration against a known-size scene.
 - [x] **Exposure mode** — baked baseline exposure offset, Lightroom-style white balance, spot + convolve-the-dome metering, OCIO colour management (ACEScg working space, input/output transforms, viewport display/view), and colour-checker chart matching (CC24 / JSON / reference-image targets, 3×3 least-squares fit). See [Exposure mode](#exposure-mode).
-- [ ] Auto-detect mode — propose quads from brightness-thresholded connected components, with K-means grouping by brightness so the user can include/exclude "windows" vs "lamps" with one click.
+- [x] **Auto-detect lights** — proposes quads from brightness-thresholded, seam-aware connected components, with angular merging of clustered sources. Tunable from a dedicated settings window; quads are fit in a tangent-plane projection for correctly-oriented corners. See the [Light quads panel](#light-quads-panel-right).
 - [ ] **Load masks.json** — reproduce a previous bake's quad layout for a new render.
 - [ ] Disk + portal lights (in addition to rect).
 - [ ] Per-quad intensity multiplier in the panel.
