@@ -24,7 +24,13 @@ import cv2
 import numpy as np
 
 from env2lgt.lights.extract import equirect_solid_angle, luminance
-from env2lgt.proj import dir_from_angles, pix_to_angles, rasterize_spherical_quad
+from env2lgt.proj import (
+    angles_from_dir,
+    dir_from_angles,
+    pix_to_angles,
+    rasterize_spherical_quad,
+    view_basis,
+)
 
 
 @dataclass
@@ -118,56 +124,48 @@ def _order_box(box: np.ndarray) -> np.ndarray:
 
 
 def _blob_quad(
-    ys: np.ndarray, xs: np.ndarray, W: int, H: int, pad_frac: float = 0.10
+    ys: np.ndarray, xs: np.ndarray, W: int, H: int, pad_frac: float = 0.04
 ) -> np.ndarray:
-    """Fit a quad to a blob by looking at its outline back in equirect space.
+    """Fit an oriented quad to a blob in a gnomonic tangent plane.
 
-    The blob is rasterised into a local mask, its contour traced, and an
-    *oriented* minimum-area rectangle fit to that contour — so a tilted light
-    gets corners that hug its edges instead of a loose axis-aligned box. The
-    rect is padded outward and its 4 corners lifted to direction vectors
-    (ordered TL, TR, BR, BL). Falls back to an axis-aligned box if the contour
-    can't be traced.
+    A flat rectangular fixture has straight 3D edges, so on the sphere each
+    edge is a great-circle arc — *curved* in equirect pixel space. Fitting a
+    rectangle directly to the equirect blob therefore comes out skewed and
+    loose. Instead we project the blob's pixel directions into a gnomonic
+    (rectilinear) tangent plane centred on the blob: there great circles
+    become straight lines, so the fixture reads as a true straight-edged
+    quad. A minimum-area rotated rectangle is fit in that plane, padded
+    slightly, and its 4 corners lifted back to direction vectors (ordered
+    TL, TR, BR, BL).
 
-    Horizontal seam wrap is handled: if the blob is tighter when shifted half
-    a panorama, it is measured in the shifted frame (corner u's may go
-    negative — the angle conversion is periodic)."""
-    # Seam-aware frame: shift the blob if that makes it contiguous.
-    span_raw = float(xs.max() - xs.min())
-    xs_shift = (xs + W // 2) % W
-    if float(xs_shift.max() - xs_shift.min()) < span_raw:
-        xs_use, x_off = xs_shift, -(W // 2)
-    else:
-        xs_use, x_off = xs, 0
+    Working in directions rather than pixel columns makes the seam wrap a
+    non-issue — the tangent projection handles it implicitly."""
+    dirs = _pixel_dirs(ys, xs, W, H)                       # (N, 3) unit dirs
+    centroid = dirs.mean(axis=0)
+    centroid /= np.linalg.norm(centroid) + 1e-12
+    yaw, pitch = angles_from_dir(centroid.reshape(1, 3))
+    basis = view_basis(float(yaw[0]), float(pitch[0]))     # rows: right/up/fwd
 
-    x0, x1 = int(xs_use.min()), int(xs_use.max())
-    y0, y1 = int(ys.min()), int(ys.max())
+    # Gnomonic projection onto the tangent plane at the centroid. y is negated
+    # so the plane uses image convention (+y down), matching `_order_box`.
+    cam = dirs @ basis.T                                   # (N, 3) camera frame
+    front = cam[:, 2] > 1e-3
+    if int(front.sum()) >= 3:
+        cam = cam[front]
+    tx = cam[:, 0] / cam[:, 2]
+    ty = -cam[:, 1] / cam[:, 2]
+    pts = np.stack([tx, ty], axis=1).astype(np.float32)
 
-    # Rasterise the blob into a local mask (1px border so the contour closes).
-    mask = np.zeros((y1 - y0 + 3, x1 - x0 + 3), np.uint8)
-    mask[ys - y0 + 1, xs_use - x0 + 1] = 255
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    (cx, cy), (rw, rh), ang = cv2.minAreaRect(pts)
+    grow = 1.0 + 2.0 * pad_frac
+    box = cv2.boxPoints(((cx, cy), (rw * grow, rh * grow), ang))
+    box = _order_box(np.asarray(box, dtype=np.float64))    # TL, TR, BR, BL
 
-    if cnts:
-        cnt = max(cnts, key=cv2.contourArea)
-        (cx, cy), (rw, rh), ang = cv2.minAreaRect(cnt)
-        s = 1.0 + 2.0 * pad_frac
-        box = cv2.boxPoints(((cx, cy), (rw * s + 3.0, rh * s + 3.0), ang))
-    else:  # degenerate — axis-aligned fallback
-        pad = pad_frac * max(x1 - x0, y1 - y0) + 1.5
-        box = np.array([
-            [-pad, -pad], [x1 - x0 + 2 + pad, -pad],
-            [x1 - x0 + 2 + pad, y1 - y0 + 2 + pad], [-pad, y1 - y0 + 2 + pad],
-        ], dtype=np.float32)
-
-    box = _order_box(np.asarray(box, dtype=np.float64))
-    # Local mask coords -> global equirect pixel coords.
-    box[:, 0] += x0 - 1 + x_off
-    box[:, 1] = np.clip(box[:, 1] + y0 - 1, 0.0, H - 1.0)
-
-    yaw, pitch = pix_to_angles(box[:, 0], box[:, 1], W, H)
-    corners = np.asarray(dir_from_angles(yaw, pitch), dtype=np.float64).reshape(4, 3)
-    corners /= np.linalg.norm(corners, axis=1, keepdims=True) + 1e-12
+    # Tangent-plane corner -> camera ray -> world direction.
+    corners = np.empty((4, 3), dtype=np.float64)
+    for i, (u, v) in enumerate(box):
+        ray = u * basis[0] - v * basis[1] + basis[2]
+        corners[i] = ray / (np.linalg.norm(ray) + 1e-12)
     return corners
 
 

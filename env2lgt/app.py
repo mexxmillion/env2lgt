@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, QPointF, QThread, Qt, Signal
+from PySide6.QtCore import QObject, QPointF, QSettings, QThread, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -54,6 +54,7 @@ from env2lgt.project import (
 )
 from env2lgt.ui.exposure_panel import ExposurePanel
 from env2lgt.ui.light_panel import LightPanel
+from env2lgt.ui.theme import apply_theme
 from env2lgt.ui.viewer import LightQuad, PanoramaViewer
 
 
@@ -161,20 +162,27 @@ class MainWindow(QMainWindow):
         # ---- colour-checker chart correction ----
         # Solved 3x3 matrix (row-vector convention) or None. Baked into export.
         self._cc_matrix: np.ndarray | None = None
+        self._last_rmse: float | None = None
         self._cc_target_swatches: np.ndarray | None = None  # JSON target (24,3)
         self._cc_target_name: str = "Built-in CC24"
         self._cc_target_mode: str = "builtin"   # builtin | json | reference
         self._cc_fit_mode: str = "matrix"
-        # Flat reference image (working space, display-res) for chart matching.
+        # Flat reference image for chart matching. `_ref_src` is the
+        # source-encoded display-res copy (so the colorspace can be re-picked
+        # without reloading); `_ref_display` is the working-space version.
         self._ref_display: np.ndarray | None = None
+        self._ref_src: np.ndarray | None = None
+        self._ref_cs: str = ""
         self._ref_path: Path | None = None
-        # DA-2 returns scale-invariant distance ~[0.3, 1.5]. Default at
-        # 100 m/u — typical indoor scenes look right at this scale in
-        # usdview; the user can adjust via the toolbar slider.
-        self._scene_scale: float = 100.0
-        self._depth_backend: str = "da2"
+        # Scene scale = metres per scene unit. DAP depth is metric, so the
+        # default backend ships a 1.0 default; DA² is scale-invariant and
+        # needs ~100. Adjusted via the Export panel's Scene scale spinbox.
+        self._scene_scale: float = 1.0
+        self._depth_backend: str = "dap"
         self._yaw_offset_deg: float = 0.0
+        self._view_gamma: float = 1.0   # display-only viewport gamma
         self._last_usd: Path | None = None
+        self._last_mesh: Path | None = None
         self._view_mode: str = "hdr"    # "hdr" or "depth"
         self._depth_thread: QThread | None = None
         self._depth_worker: DepthWorker | None = None
@@ -204,13 +212,17 @@ class MainWindow(QMainWindow):
 
         self.panel = LightPanel(self)
         self.exposure_panel = ExposurePanel(self)
+        panel_scroll = QScrollArea()
+        panel_scroll.setWidgetResizable(True)
+        panel_scroll.setWidget(self.panel)
+        panel_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         exp_scroll = QScrollArea()
         exp_scroll.setWidgetResizable(True)
         exp_scroll.setWidget(self.exposure_panel)
         exp_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
 
         self._panel_stack = QStackedWidget()
-        self._panel_stack.addWidget(self.panel)        # index 0 — Lights
+        self._panel_stack.addWidget(panel_scroll)      # index 0 — Lights
         self._panel_stack.addWidget(exp_scroll)        # index 1 — Exposure
 
         dock = QDockWidget("Lights", self)
@@ -220,6 +232,10 @@ class MainWindow(QMainWindow):
         )
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self._dock = dock
+        # Give the tool column a comfortable default width — the side panels
+        # are cramped at Qt's size-hint default.
+        self._panel_stack.setMinimumWidth(340)
+        self.resizeDocks([dock], [400], Qt.Orientation.Horizontal)
         self.exposure_panel.exposure_offset_changed.connect(self._on_exposure_offset)
         self.exposure_panel.wb_changed.connect(self._on_wb_changed)
         self.exposure_panel.sample_exposure_requested.connect(
@@ -241,11 +257,20 @@ class MainWindow(QMainWindow):
         self.exposure_panel.load_reference_image_requested.connect(
             self._on_load_reference_image
         )
+        self.exposure_panel.reference_cs_changed.connect(
+            self._on_reference_cs_changed
+        )
         self.exposure_panel.reference_view_toggled.connect(
             self._on_reference_view_toggled
         )
         self.exposure_panel.fit_mode_changed.connect(self._on_fit_mode_changed)
         self.exposure_panel.solve_chart_requested.connect(self._on_solve_chart)
+        self.exposure_panel.save_correction_requested.connect(
+            self._on_save_correction
+        )
+        self.exposure_panel.load_correction_requested.connect(
+            self._on_load_correction
+        )
         if self._ocio_ok:
             self.exposure_panel.populate_colorspaces(
                 color.colorspace_names(), self._input_cs, self._output_cs
@@ -262,6 +287,7 @@ class MainWindow(QMainWindow):
         self.panel.key_preview_changed.connect(self._on_key_preview)
         self.panel.bake_requested.connect(self._on_bake)
         self.panel.preview_requested.connect(self._on_preview)
+        self.panel.opt_scene_scale.valueChanged.connect(self._on_scene_scale)
 
         self._build_menu()
         self._build_toolbar()
@@ -309,7 +335,8 @@ class MainWindow(QMainWindow):
         self._area_label.setTextFormat(Qt.TextFormat.RichText)
         self._area_label.setFont(font)
         row.addWidget(self._area_label)
-        self.statusBar().addPermanentWidget(probe)
+        # Flush to the bottom-left of the status bar.
+        self.statusBar().addWidget(probe)
 
     @staticmethod
     def _make_eyedropper_icon() -> QIcon:
@@ -405,6 +432,9 @@ class MainWindow(QMainWindow):
         act_open = QAction("&Open EXR…", self, shortcut="Ctrl+O")
         act_open.triggered.connect(self._open_exr_dialog)
         m_file.addAction(act_open)
+        self._recent_menu = m_file.addMenu("Open &Recent")
+        self._recent_menu.setToolTipsVisible(True)
+        self._rebuild_recent_menu()
         m_file.addSeparator()
         act_save_proj = QAction("&Save Project…", self, shortcut="Ctrl+S")
         act_save_proj.triggered.connect(self._save_project_dialog)
@@ -434,94 +464,26 @@ class MainWindow(QMainWindow):
         )
         m_tools.addAction(act_exposure)
         m_tools.addSeparator()
-        act_usdview = QAction("Open last bake in usdview", self)
-        act_usdview.triggered.connect(self._launch_usdview)
-        m_tools.addAction(act_usdview)
+        m_usdview = m_tools.addMenu("Open last bake in usdview")
+        act_uv_light = QAction("Light rig", self)
+        act_uv_light.triggered.connect(lambda: self._launch_usdview("light"))
+        m_usdview.addAction(act_uv_light)
+        act_uv_mesh = QAction("Depth mesh", self)
+        act_uv_mesh.triggered.connect(lambda: self._launch_usdview("mesh"))
+        m_usdview.addAction(act_uv_mesh)
+        act_uv_both = QAction("Light rig + depth mesh (layered)", self)
+        act_uv_both.triggered.connect(lambda: self._launch_usdview("both"))
+        m_usdview.addAction(act_uv_both)
 
     def _build_toolbar(self):
+        from PySide6.QtWidgets import QPushButton
+
         tb = QToolBar("View", self)
         tb.setMovable(False)
         self.addToolBar(tb)
-        tb.addWidget(QLabel(" Exposure "))
-        self._view_exp_slider = QSlider(Qt.Orientation.Horizontal)
-        self._view_exp_slider.setRange(-60, 60)
-        self._view_exp_slider.setValue(0)
-        self._view_exp_slider.setFixedWidth(180)
-        self._view_exp_slider.valueChanged.connect(self._on_exposure)
-        tb.addWidget(self._view_exp_slider)
-        self._exposure_label = QLabel(" 0.0 EV ")
-        tb.addWidget(self._exposure_label)
 
-        tb.addSeparator()
-        tb.addWidget(QLabel(" Scene scale "))
-        self._scale_slider = QSlider(Qt.Orientation.Horizontal)
-        scale_slider = self._scale_slider
-        # Hundredths of log10(m/u). Range = 0.001 .. 1000 m/u so there's
-        # headroom both above and below the default.
-        scale_slider.setRange(-300, 300)
-        scale_slider.setValue(200)              # 10**2 = 100 m/u default
-        scale_slider.setFixedWidth(200)
-        scale_slider.valueChanged.connect(self._on_scale)
-        tb.addWidget(scale_slider)
-        self._scale_label = QLabel(" 100.00 m/u ")
-        tb.addWidget(self._scale_label)
-
-        tb.addSeparator()
-        tb.addWidget(QLabel(" Yaw offset "))
-        self._yaw_slider = QSlider(Qt.Orientation.Horizontal)
-        self._yaw_slider.setRange(-1800, 1800)  # tenths of a degree, -180.0..+180.0
-        self._yaw_slider.setValue(0)
-        self._yaw_slider.setFixedWidth(220)
-        self._yaw_slider.valueChanged.connect(self._on_yaw_offset)
-        tb.addWidget(self._yaw_slider)
-        self._yaw_label = QLabel("  0.0° ")
-        tb.addWidget(self._yaw_label)
-        from PySide6.QtWidgets import QPushButton
-
-        reset_view_btn = QPushButton("⟲ Reset view")
-        reset_view_btn.setToolTip(
-            "Reset the viewport: display exposure, yaw offset, and zoom/pan "
-            "back to defaults."
-        )
-        reset_view_btn.clicked.connect(self._reset_view)
-        tb.addWidget(reset_view_btn)
-
-        # Exposure mode — primary action, kept early so it never lands in the
-        # toolbar overflow chevron.
-        tb.addSeparator()
-        self._exposure_btn = QPushButton("Exposure mode")
-        self._exposure_btn.setCheckable(True)
-        self._exposure_btn.setShortcut("E")
-        self._exposure_btn.setToolTip(
-            "Adjust the HDRI baseline exposure + white balance + colour-checker "
-            "match. Hides the light quads while active. Baked into the export. "
-            "(shortcut: E)"
-        )
-        self._exposure_btn.toggled.connect(self._on_exposure_mode)
-        tb.addWidget(self._exposure_btn)
-
-        tb.addSeparator()
-        tb.addWidget(QLabel(" Depth "))
-        self._backend_combo = QComboBox()
-        _backend_labels = {"da2": "DA²", "dap": "DAP"}
-        for b in AVAILABLE_BACKENDS:
-            self._backend_combo.addItem(_backend_labels.get(b, b.upper()), b)
-        self._backend_combo.setCurrentIndex(
-            max(0, self._backend_combo.findData(self._depth_backend))
-        )
-        self._backend_combo.currentIndexChanged.connect(self._on_backend_changed)
-        tb.addWidget(self._backend_combo)
-
-        tb.addSeparator()
-        self._depth_btn = QPushButton("Show depth")
-        self._depth_btn.setCheckable(True)
-        self._depth_btn.setShortcut("D")
-        self._depth_btn.toggled.connect(self._on_depth_toggle)
-        tb.addWidget(self._depth_btn)
-
-        # OCIO viewport display + view (Nuke/Maya-style dropdowns).
+        # OCIO viewport display + view — leftmost (Nuke/Maya-style dropdowns).
         if self._ocio_ok:
-            tb.addSeparator()
             tb.addWidget(QLabel(" Display "))
             self._display_combo = QComboBox()
             for d in color.displays():
@@ -535,6 +497,142 @@ class MainWindow(QMainWindow):
             # Seed display/view + the cached processor.
             self._ocio_display = color.default_display()
             self._refill_view_combo()
+            tb.addSeparator()
+
+        tb.addWidget(QLabel(" Exposure "))
+        self._view_exp_slider = QSlider(Qt.Orientation.Horizontal)
+        self._view_exp_slider.setRange(-60, 60)
+        self._view_exp_slider.setValue(0)
+        self._view_exp_slider.setFixedWidth(160)
+        self._view_exp_slider.valueChanged.connect(self._on_exposure)
+        tb.addWidget(self._view_exp_slider)
+        self._exposure_label = QLabel(" 0.0 EV ")
+        tb.addWidget(self._exposure_label)
+
+        tb.addSeparator()
+        tb.addWidget(QLabel(" Gamma "))
+        self._gamma_slider = QSlider(Qt.Orientation.Horizontal)
+        # Hundredths of gamma — range 0.25 .. 4.0, default 1.0.
+        self._gamma_slider.setRange(25, 400)
+        self._gamma_slider.setValue(100)
+        self._gamma_slider.setFixedWidth(140)
+        self._gamma_slider.setToolTip(
+            "Display-only viewport gamma. Does not affect the bake."
+        )
+        self._gamma_slider.valueChanged.connect(self._on_gamma)
+        tb.addWidget(self._gamma_slider)
+        self._gamma_label = QLabel(" 1.00 ")
+        tb.addWidget(self._gamma_label)
+
+        tb.addSeparator()
+        tb.addWidget(QLabel(" Yaw offset "))
+        self._yaw_slider = QSlider(Qt.Orientation.Horizontal)
+        self._yaw_slider.setRange(-1800, 1800)  # tenths of a degree, -180.0..+180.0
+        self._yaw_slider.setValue(0)
+        self._yaw_slider.setFixedWidth(200)
+        self._yaw_slider.valueChanged.connect(self._on_yaw_offset)
+        tb.addWidget(self._yaw_slider)
+        self._yaw_label = QLabel("  0.0° ")
+        tb.addWidget(self._yaw_label)
+
+        reset_view_btn = QPushButton("⟲ Reset view")
+        reset_view_btn.setToolTip(
+            "Reset the viewport: display exposure, gamma, yaw offset, and "
+            "zoom/pan back to defaults."
+        )
+        reset_view_btn.clicked.connect(self._reset_view)
+        tb.addWidget(reset_view_btn)
+
+        tb.addSeparator()
+        tb.addWidget(QLabel(" Depth "))
+        self._backend_combo = QComboBox()
+        _backend_labels = {"da2": "DA²", "dap": "DAP"}
+        for b in AVAILABLE_BACKENDS:
+            self._backend_combo.addItem(_backend_labels.get(b, b.upper()), b)
+        self._backend_combo.setCurrentIndex(
+            max(0, self._backend_combo.findData(self._depth_backend))
+        )
+        # Self-correct the backend if the requested default isn't available.
+        self._depth_backend = (
+            self._backend_combo.currentData() or self._depth_backend
+        )
+        self._backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+        tb.addWidget(self._backend_combo)
+        self._depth_btn = QPushButton("Show depth")
+        self._depth_btn.setCheckable(True)
+        self._depth_btn.setShortcut("D")
+        self._depth_btn.toggled.connect(self._on_depth_toggle)
+        tb.addWidget(self._depth_btn)
+
+        # Exposure mode — rightmost, closest to the right edge.
+        tb.addSeparator()
+        self._exposure_btn = QPushButton("Exposure mode")
+        self._exposure_btn.setCheckable(True)
+        self._exposure_btn.setShortcut("E")
+        self._exposure_btn.setToolTip(
+            "Adjust the HDRI baseline exposure + white balance + colour-checker "
+            "match. Hides the light quads while active. Baked into the export. "
+            "(shortcut: E)"
+        )
+        self._exposure_btn.toggled.connect(self._on_exposure_mode)
+        tb.addWidget(self._exposure_btn)
+
+    # ---------- recent files ----------
+
+    _MAX_RECENT = 10
+
+    @staticmethod
+    def _settings() -> QSettings:
+        return QSettings("env2lgt", "env2lgt")
+
+    def _recent_paths(self) -> list[str]:
+        val = self._settings().value("recentFiles", [])
+        if isinstance(val, str):
+            val = [val]
+        return [str(p) for p in (val or [])]
+
+    def _push_recent(self, path: Path) -> None:
+        p = str(Path(path).resolve())
+        recent = [r for r in self._recent_paths() if r != p]
+        recent.insert(0, p)
+        del recent[self._MAX_RECENT:]
+        self._settings().setValue("recentFiles", recent)
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self) -> None:
+        menu = self._recent_menu
+        menu.clear()
+        recent = self._recent_paths()
+        if not recent:
+            act = menu.addAction("(no recent files)")
+            act.setEnabled(False)
+            return
+        for p in recent:
+            act = menu.addAction(Path(p).name)
+            act.setToolTip(p)
+            act.triggered.connect(
+                lambda _=False, path=p: self._open_recent(path)
+            )
+        menu.addSeparator()
+        menu.addAction("Clear recent files").triggered.connect(
+            self._clear_recent
+        )
+
+    def _open_recent(self, path: str) -> None:
+        p = Path(path)
+        if not p.exists():
+            QMessageBox.warning(
+                self, "Open recent", f"File no longer exists:\n{path}"
+            )
+            recent = [r for r in self._recent_paths() if r != str(p.resolve())]
+            self._settings().setValue("recentFiles", recent)
+            self._rebuild_recent_menu()
+            return
+        self._load_exr(p)
+
+    def _clear_recent(self) -> None:
+        self._settings().remove("recentFiles")
+        self._rebuild_recent_menu()
 
     # ---------- file loading ----------
 
@@ -580,6 +678,7 @@ class MainWindow(QMainWindow):
         self._cache_key = None
         self._distance_display = None
         self._exr_path = path
+        self._push_recent(path)
         # --- reset everything tied to the previous EXR ---
         # Yaw offset back to 0 (a stale offset would confuse quad placement).
         if hasattr(self, "_yaw_slider"):
@@ -608,6 +707,7 @@ class MainWindow(QMainWindow):
             self.exposure_panel.set_wb_readout(self._wb_scale)
             self.exposure_panel.set_chart_status(has_chart=False, rmse=None)
             self.exposure_panel.set_target_label("Built-in CC24")
+            self.exposure_panel.set_correction_available(False)
             self.exposure_panel.set_reference_view(False)
         # Drop cached depth — it's for the previous EXR.
         self._distance = None
@@ -620,6 +720,7 @@ class MainWindow(QMainWindow):
             self._depth_btn.blockSignals(False)
         # Last bake's USD is no longer applicable.
         self._last_usd = None
+        self._last_mesh = None
         # Clear quads everywhere — viewer state, panel list, viewer's stored dict.
         # IMPORTANT: viewer.reset_image() empties self.viewer._quads, so we
         # can't iterate it afterwards to remove panel entries. Just clear the
@@ -707,6 +808,7 @@ class MainWindow(QMainWindow):
             tuple(round(float(c), 4) for c in self._wb_scale) if is_hdr else None,
             cc_id if is_hdr else None,
             (self._ocio_display, self._ocio_view) if is_hdr else None,
+            round(self._view_gamma, 3),
         )
         if self._display_cache is None or self._cache_key != cache_key:
             if self._view_mode == "depth" and self._distance_display is not None:
@@ -748,12 +850,24 @@ class MainWindow(QMainWindow):
         return out
 
     def _working_to_u8(self, working: np.ndarray, exposure: float) -> np.ndarray:
-        """Working space -> display uint8: viewport exposure, then the OCIO
-        display+view transform (or an ACES-filmic fallback)."""
+        """Working space -> display uint8: viewport exposure, the OCIO
+        display+view transform (or an ACES-filmic fallback), then the
+        display-only viewport gamma."""
         scaled = working * (2.0 ** float(exposure))
         if self._ocio_ok and self._display_cpu is not None:
-            return color.display_to_u8(scaled, self._display_cpu)
-        return self._tonemap_hdr_uint8(scaled)
+            u8 = color.display_to_u8(scaled, self._display_cpu)
+        else:
+            u8 = self._tonemap_hdr_uint8(scaled)
+        return self._apply_view_gamma(u8)
+
+    def _apply_view_gamma(self, u8: np.ndarray) -> np.ndarray:
+        """Apply the display-only viewport gamma via a 256-entry LUT."""
+        g = self._view_gamma
+        if abs(g - 1.0) < 1e-3:
+            return u8
+        ramp = (np.arange(256, dtype=np.float32) / 255.0) ** (1.0 / g)
+        lut = np.clip(ramp * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(lut[u8])
 
     @staticmethod
     def _tonemap_hdr_uint8(scaled: np.ndarray) -> np.ndarray:
@@ -779,9 +893,13 @@ class MainWindow(QMainWindow):
         self._exposure_label.setText(f" {self._exposure:+.1f} EV ")
         self._refresh_view()
 
-    def _on_scale(self, val: int):
-        self._scene_scale = float(10 ** (val / 100.0))
-        self._scale_label.setText(f" {self._scene_scale:.3f} m/u ")
+    def _on_scene_scale(self, value: float):
+        self._scene_scale = float(value)
+
+    def _on_gamma(self, val: int):
+        self._view_gamma = val / 100.0
+        self._gamma_label.setText(f" {self._view_gamma:.2f} ")
+        self._refresh_view()
 
     def _on_backend_changed(self, _idx: int):
         name = self._backend_combo.currentData()
@@ -790,9 +908,9 @@ class MainWindow(QMainWindow):
         self._depth_backend = name
         # Snap scene scale to the backend's natural default: DAP is metric
         # (depth already in metres → 1.0 m/u), DA² is scale-invariant and
-        # needs the ~100 m/u working default. Setting the slider drives
-        # _on_scale, which updates self._scene_scale + the label.
-        self._scale_slider.setValue(0 if name == "dap" else 200)
+        # needs the ~100 m/u working default. The spinbox's valueChanged
+        # drives _on_scene_scale, which updates self._scene_scale.
+        self.panel.opt_scene_scale.setValue(1.0 if name == "dap" else 100.0)
         # The cached depth belongs to the previous backend — drop it.
         self._distance = None
         self._distance_display = None
@@ -816,6 +934,7 @@ class MainWindow(QMainWindow):
         These are display conveniences — none of them affect the bake (unlike
         the exposure-mode baseline adjustments)."""
         self._view_exp_slider.setValue(0)
+        self._gamma_slider.setValue(100)
         self._yaw_slider.setValue(0)
         self.viewer.fit_view()
 
@@ -1064,7 +1183,9 @@ class MainWindow(QMainWindow):
     def _on_clear_chart(self):
         self.viewer.clear_chart()
         self._cc_matrix = None
+        self._last_rmse = None
         self.exposure_panel.set_chart_status(has_chart=False, rmse=None)
+        self.exposure_panel.set_correction_available(False)
         self._invalidate_display_cache()
         self._refresh_view()
 
@@ -1143,27 +1264,33 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            ref = self._load_reference_array(Path(path))
+            raw, default_cs = self._read_reference_raw(Path(path))
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Load reference", str(e))
             return
         # Downsample for display, same width cap as the panorama.
-        H, W = ref.shape[:2]
+        H, W = raw.shape[:2]
         if W > DISPLAY_MAX_WIDTH:
             new_w = DISPLAY_MAX_WIDTH
             new_h = max(2, (new_w * H) // W)
-            ref = cv2.resize(ref, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        self._ref_display = ref
+            raw = cv2.resize(raw, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        self._ref_src = np.ascontiguousarray(raw)
         self._ref_path = Path(path)
+        # Reflect the auto-detected colorspace on the panel, then convert the
+        # reference into the working space through it.
+        self.exposure_panel.set_reference_cs(default_cs)
+        self._ref_cs = self.exposure_panel.reference_cs()
+        self._ref_display = self._reference_to_working(self._ref_src)
         self.exposure_panel.set_reference_loaded(True)
         self.statusBar().showMessage(f"Reference image loaded: {Path(path).name}")
         # Jump straight to the reference view so the user can place a chart.
         self.exposure_panel.set_reference_view(True)
         self._on_reference_view_toggled(True)
 
-    def _load_reference_array(self, path: Path) -> np.ndarray:
-        """Load a reference image into the working space. 8-bit images are
-        treated as sRGB-encoded; float/EXR as the current input colorspace."""
+    def _read_reference_raw(self, path: Path) -> tuple[np.ndarray, str]:
+        """Read a reference image as a source-encoded float RGB array, plus a
+        best-guess source colorspace: 8-bit images are treated as sRGB-encoded;
+        float / EXR as the current input colorspace."""
         arr = cv2.imread(
             str(path), cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR | cv2.IMREAD_COLOR
         )
@@ -1171,17 +1298,28 @@ class MainWindow(QMainWindow):
             raise RuntimeError(f"Could not read {path.name}")
         arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
         if arr.dtype == np.uint8:
-            arr = arr.astype(np.float32) / 255.0
-            src_cs = "Utility - sRGB - Texture"
-        else:
-            arr = np.ascontiguousarray(arr.astype(np.float32))
-            src_cs = self._input_cs
-        if self._ocio_ok and src_cs:
-            try:
-                return color.to_working(arr, src_cs)
-            except Exception:  # noqa: BLE001
-                pass
-        return arr
+            return arr.astype(np.float32) / 255.0, "Utility - sRGB - Texture"
+        return np.ascontiguousarray(arr.astype(np.float32)), self._input_cs
+
+    def _reference_to_working(self, src: np.ndarray) -> np.ndarray:
+        """Convert the source-encoded reference into the working space using
+        the colorspace currently chosen on the panel."""
+        if not self._ocio_ok or not self._ref_cs:
+            return np.asarray(src, dtype=np.float32)
+        try:
+            return color.to_working(src, self._ref_cs)
+        except Exception:  # noqa: BLE001
+            return np.asarray(src, dtype=np.float32)
+
+    def _on_reference_cs_changed(self, name: str):
+        """Reference-image colorspace changed — re-run its input transform."""
+        self._ref_cs = name
+        if self._ref_src is None:
+            return
+        self._ref_display = self._reference_to_working(self._ref_src)
+        if self._view_mode == "reference":
+            self._invalidate_display_cache()
+            self._refresh_view()
 
     def _on_reference_view_toggled(self, show_reference: bool):
         if show_reference and self._ref_display is None:
@@ -1237,9 +1375,11 @@ class MainWindow(QMainWindow):
             return
         M, rmse, flipped = ccheck.solve_correction(sw, target, self._cc_fit_mode)
         self._cc_matrix = M
+        self._last_rmse = rmse
         self._invalidate_display_cache()
         self._refresh_view()
         self.exposure_panel.set_chart_status(has_chart=True, rmse=rmse)
+        self.exposure_panel.set_correction_available(True)
         msg = (
             f"Chart match applied ({self._cc_fit_mode}) — RMSE {rmse:.4f}"
             f"  ·  target: {self._cc_target_name}"
@@ -1247,6 +1387,65 @@ class MainWindow(QMainWindow):
         if flipped:
             msg += "  ·  chart detected upside-down (auto-corrected)"
         self.statusBar().showMessage(msg)
+
+    def _on_save_correction(self):
+        """Export the solved colour-checker correction to a JSON file."""
+        if self._cc_matrix is None:
+            QMessageBox.information(
+                self, "Save correction",
+                "Solve a colour-checker correction before saving it.",
+            )
+            return
+        default_name = "cc_correction.json"
+        if self._exr_path is not None:
+            default_name = f"{self._exr_path.stem}_cc_correction.json"
+            start = str(self._exr_path.parent / default_name)
+        else:
+            start = default_name
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save colour correction", start,
+            "Colour correction (*.json);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            ccheck.save_correction(
+                path, self._cc_matrix, self._cc_fit_mode, self._cc_target_name,
+                rmse=self._last_rmse,
+            )
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Save correction", str(e))
+            return
+        self.statusBar().showMessage(f"Correction saved: {Path(path).name}")
+
+    def _on_load_correction(self):
+        """Load a saved correction JSON and apply it directly — no chart
+        needed. Used to batch-match a set of similar HDRIs."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load colour correction", "",
+            "Colour correction (*.json);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            corr = ccheck.load_correction(path)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Load correction", str(e))
+            return
+        self._cc_matrix = corr["matrix"]
+        self._cc_fit_mode = corr["fit_mode"]
+        self._cc_target_name = corr["target_name"] or corr["name"]
+        self._last_rmse = corr["rmse"]
+        self.exposure_panel.set_fit_mode(self._cc_fit_mode)
+        self.exposure_panel.set_correction_available(True)
+        self.exposure_panel.set_chart_status(
+            has_chart=True, rmse=self._last_rmse, applied=self._last_rmse is None
+        )
+        self._invalidate_display_cache()
+        self._refresh_view()
+        self.statusBar().showMessage(
+            f"Correction loaded: {Path(path).name} ({self._cc_fit_mode})"
+        )
 
     def _on_depth_toggle(self, checked: bool):
         if not checked:
@@ -1555,7 +1754,7 @@ class MainWindow(QMainWindow):
         the matching EXR is already loaded (state cleared by _load_exr)."""
         # Scene state
         self._scene_scale = float(proj.scene.scene_scale)
-        self._scale_label.setText(f" {self._scene_scale:.3f} m/u ")
+        self.panel.opt_scene_scale.setValue(self._scene_scale)
         self._yaw_offset_deg = float(proj.scene.yaw_offset_deg)
         self._yaw_label.setText(f" {self._yaw_offset_deg:+6.1f}° ")
         # Reposition the yaw slider to match (signal-blocked to avoid a redundant refresh).
@@ -1608,10 +1807,12 @@ class MainWindow(QMainWindow):
         )
         self._cc_fit_mode = cc.fit_mode or "matrix"
         self._cc_target_name = cc.target_name or "Built-in CC24"
+        self.exposure_panel.set_fit_mode(self._cc_fit_mode)
         self.exposure_panel.set_chart_status(
             has_chart=bool(cc.corners_dirs),
             applied=self._cc_matrix is not None,
         )
+        self.exposure_panel.set_correction_available(self._cc_matrix is not None)
         # Depth backend (tolerate an unknown name from a newer/edited project).
         backend = (proj.scene.depth_backend or "da2").strip().lower()
         if backend not in AVAILABLE_BACKENDS:
@@ -1839,6 +2040,8 @@ class MainWindow(QMainWindow):
         usd = summary.get("usd")
         if usd:
             self._last_usd = Path(usd)
+        mesh = summary.get("mesh")
+        self._last_mesh = Path(mesh) if mesh else None
         n = len(summary.get("rect_lights", []))
         # Auto-save the project next to the source EXR so the user's work
         # survives a crash / future session. Silent — failures are logged
@@ -1869,9 +2072,38 @@ class MainWindow(QMainWindow):
             pass
         super().closeEvent(event)
 
-    def _launch_usdview(self):
-        if self._last_usd is None or not self._last_usd.exists():
-            QMessageBox.information(self, "usdview", "Bake a rig first, or open one manually.")
+    def _write_combined_layer(self) -> Path | None:
+        """Write a tiny stage that sublayers the light rig over the depth mesh,
+        so usdview can show both at once. Returns the combined layer's path."""
+        if self._last_usd is None or self._last_mesh is None:
+            return None
+        out = self._last_usd.parent / "usdview_layered.usda"
+        out.write_text(
+            "#usda 1.0\n"
+            "(\n"
+            "    subLayers = [\n"
+            f"        @./{self._last_usd.name}@,\n"
+            f"        @./{self._last_mesh.name}@\n"
+            "    ]\n"
+            ")\n"
+        )
+        return out
+
+    def _launch_usdview(self, kind: str = "light"):
+        """Open a baked stage in usdview. `kind` is 'light', 'mesh', or 'both'
+        (the light rig layered over the depth mesh)."""
+        if kind == "mesh":
+            target, label = self._last_mesh, "depth mesh"
+        elif kind == "both":
+            target, label = self._write_combined_layer(), "light rig + depth mesh"
+        else:
+            target, label = self._last_usd, "light rig"
+        if target is None or not Path(target).exists():
+            QMessageBox.information(
+                self, "usdview",
+                f"No baked {label} to open — bake a rig first "
+                "(the depth mesh needs its export option enabled).",
+            )
             return
         py = Path(sys.executable)
         usdview = py.parent / "Library" / "bin" / "usdview"
@@ -1879,13 +2111,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "usdview", f"usdview not found at {usdview}")
             return
         try:
-            subprocess.Popen([str(py), str(usdview), str(self._last_usd)], shell=False)
+            subprocess.Popen([str(py), str(usdview), str(target)], shell=False)
         except OSError as e:
             QMessageBox.critical(self, "usdview", f"Failed to launch:\n{e}")
 
 
 def main():
     app = QApplication(sys.argv)
+    apply_theme(app)
     win = MainWindow()
     win.show()
     return app.exec()

@@ -43,13 +43,18 @@ class ExposurePanel(QWidget):
     load_json_target_requested = Signal()          # target = a JSON file
     use_reference_target = Signal()                # target = reference image
     load_reference_image_requested = Signal()      # load a flat reference image
+    reference_cs_changed = Signal(str)             # reference-image colorspace
     reference_view_toggled = Signal(bool)          # HDRI <-> reference view
     fit_mode_changed = Signal(str)                 # exposure | wb | matrix
     solve_chart_requested = Signal()               # solve + apply correction
+    save_correction_requested = Signal()           # export the correction JSON
+    load_correction_requested = Signal()           # load a correction JSON
 
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
 
         intro = QLabel(
             "Shift the HDRI baseline exposure + white balance. These are baked "
@@ -202,6 +207,18 @@ class ExposurePanel(QWidget):
         self._load_ref_btn.clicked.connect(self.load_reference_image_requested)
         v.addWidget(self._load_ref_btn)
 
+        ref_cs_row = QHBoxLayout()
+        ref_cs_row.addWidget(QLabel("Image colorspace"))
+        self._ref_cs_combo = QComboBox()
+        self._ref_cs_combo.setToolTip(
+            "Colorspace of the loaded reference image. Converted into the "
+            "ACEScg working space, the same way the source EXR is. Auto-set "
+            "on load (sRGB for 8-bit images); override here if it's wrong."
+        )
+        self._ref_cs_combo.currentTextChanged.connect(self.reference_cs_changed)
+        ref_cs_row.addWidget(self._ref_cs_combo, stretch=1)
+        v.addLayout(ref_cs_row)
+
         pick_row = QHBoxLayout()
         self._pick_chart_btn = QPushButton("Pick colour chart")
         self._pick_chart_btn.setCheckable(True)
@@ -249,12 +266,33 @@ class ExposurePanel(QWidget):
         v.addLayout(fit_row)
 
         self._solve_btn = QPushButton("Solve & apply")
+        self._solve_btn.setObjectName("primary")
         self._solve_btn.clicked.connect(self.solve_chart_requested)
         v.addWidget(self._solve_btn)
         self._chart_status = QLabel("No chart placed.")
         self._chart_status.setStyleSheet("color:#888;")
         self._chart_status.setWordWrap(True)
         v.addWidget(self._chart_status)
+
+        # Save / reload the solved correction — for batch-matching a set of
+        # HDRIs: solve once, save the JSON, load it on the rest.
+        corr_row = QHBoxLayout()
+        self._save_corr_btn = QPushButton("Save correction…")
+        self._save_corr_btn.setEnabled(False)
+        self._save_corr_btn.setToolTip(
+            "Export the solved colour-checker correction to a JSON file so it "
+            "can be reapplied to other HDRIs of the same set."
+        )
+        self._save_corr_btn.clicked.connect(self.save_correction_requested)
+        corr_row.addWidget(self._save_corr_btn)
+        self._load_corr_btn = QPushButton("Load correction…")
+        self._load_corr_btn.setToolTip(
+            "Load a saved correction JSON and apply it directly — no chart "
+            "needed. Use this when batch-matching similar HDRIs."
+        )
+        self._load_corr_btn.clicked.connect(self.load_correction_requested)
+        corr_row.addWidget(self._load_corr_btn)
+        v.addLayout(corr_row)
         return box
 
     def _on_pick_chart(self):
@@ -327,6 +365,7 @@ class ExposurePanel(QWidget):
         for combo, cur in (
             (self._input_cs_combo, input_cs),
             (self._output_cs_combo, output_cs),
+            (self._ref_cs_combo, input_cs),
         ):
             combo.blockSignals(True)
             combo.clear()
@@ -335,12 +374,38 @@ class ExposurePanel(QWidget):
                 combo.setCurrentText(cur)
             combo.blockSignals(False)
 
+    def set_reference_cs(self, name: str) -> None:
+        """Reflect a colorspace pick on the combo without re-emitting — used
+        when a reference image loads and its colorspace is auto-detected."""
+        self._ref_cs_combo.blockSignals(True)
+        if name and self._ref_cs_combo.findText(name) < 0:
+            self._ref_cs_combo.addItem(name)
+        self._ref_cs_combo.setCurrentText(name)
+        self._ref_cs_combo.blockSignals(False)
+
+    def reference_cs(self) -> str:
+        return self._ref_cs_combo.currentText()
+
     def set_colour_management_enabled(self, enabled: bool) -> None:
         self._input_cs_combo.setEnabled(enabled)
         self._output_cs_combo.setEnabled(enabled)
+        self._ref_cs_combo.setEnabled(enabled)
 
     def fit_mode(self) -> str:
         return self._fit_combo.currentData()
+
+    def set_fit_mode(self, mode: str) -> None:
+        """Reflect a fit mode on the combo without re-emitting (e.g. restored
+        from a loaded correction)."""
+        idx = self._fit_combo.findData(mode)
+        if idx >= 0:
+            self._fit_combo.blockSignals(True)
+            self._fit_combo.setCurrentIndex(idx)
+            self._fit_combo.blockSignals(False)
+
+    def set_correction_available(self, available: bool) -> None:
+        """Enable the 'Save correction' button once a correction is solved."""
+        self._save_corr_btn.setEnabled(available)
 
     def set_pick_chart_active(self, active: bool) -> None:
         self._pick_chart_btn.blockSignals(True)

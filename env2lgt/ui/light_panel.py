@@ -7,6 +7,7 @@ import re
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -80,10 +81,13 @@ class LightPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
 
         list_box = QGroupBox("Light quads", self)
         lb = QVBoxLayout(list_box)
         self._list = QListWidget()
+        self._list.setMinimumHeight(200)
         self._list.setEditTriggers(
             QListWidget.EditTrigger.DoubleClicked | QListWidget.EditTrigger.EditKeyPressed
         )
@@ -196,10 +200,28 @@ class LightPanel(QWidget):
         geom_row.addWidget(self.opt_geom_inflation, stretch=1)
         eb.addLayout(geom_row)
 
+        # World scale of the baked rig — metres per scene unit.
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel("Scene scale:"))
+        self.opt_scene_scale = QDoubleSpinBox()
+        self.opt_scene_scale.setRange(0.001, 1000.0)
+        self.opt_scene_scale.setDecimals(3)
+        self.opt_scene_scale.setSingleStep(1.0)
+        self.opt_scene_scale.setSuffix(" m/u")
+        self.opt_scene_scale.setValue(1.0)
+        self.opt_scene_scale.setToolTip(
+            "World scale of the baked rig — metres per scene unit. DAP depth "
+            "is metric (≈1.0); DA² is scale-invariant and typically needs a "
+            "larger value (≈100)."
+        )
+        scale_row.addWidget(self.opt_scene_scale, stretch=1)
+        eb.addLayout(scale_row)
+
         self._preview_btn = QPushButton("Preview (no files)")
         self._preview_btn.clicked.connect(self._on_preview)
         eb.addWidget(self._preview_btn)
         self._bake_btn = QPushButton("Bake light rig")
+        self._bake_btn.setObjectName("primary")
         self._bake_btn.clicked.connect(self._on_bake)
         eb.addWidget(self._bake_btn)
         layout.addWidget(export_box)
@@ -209,13 +231,41 @@ class LightPanel(QWidget):
     # ---------- auto-detect ----------
 
     def _build_autodetect_group(self) -> QGroupBox:
-        """'Auto-detect lights' group — detection params sit right above the
-        'Propose quads' button, always visible (no collapse)."""
+        """'Auto-detect lights' group — just the action buttons. The detection
+        parameters live in a separate settings window."""
         box = QGroupBox("Auto-detect lights", self)
-        outer = QVBoxLayout(box)
+        row = QHBoxLayout(box)
+        self._propose_btn = QPushButton("Detect lights")
+        self._propose_btn.setToolTip(
+            "Detect lights and add them as quads. Locked quads are kept as-is; "
+            "other auto-proposed quads are replaced. Your hand-placed quads are "
+            "never touched."
+        )
+        self._propose_btn.clicked.connect(self._on_propose)
+        row.addWidget(self._propose_btn, stretch=1)
+        self._detect_settings_btn = QPushButton("Settings…")
+        self._detect_settings_btn.setFixedWidth(88)
+        self._detect_settings_btn.setToolTip(
+            "Open the light-detection settings window."
+        )
+        self._detect_settings_btn.clicked.connect(self._open_detect_settings)
+        row.addWidget(self._detect_settings_btn)
+        self._build_detection_dialog()
+        return box
+
+    def _open_detect_settings(self) -> None:
+        self._detect_dialog.show()
+        self._detect_dialog.raise_()
+        self._detect_dialog.activateWindow()
+
+    def _build_detection_dialog(self) -> None:
+        """The light-detection parameters, housed in their own window so they
+        don't crowd the side panel."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Light detection settings")
+        outer = QVBoxLayout(dlg)
 
         form = QFormLayout()
-        form.setContentsMargins(0, 0, 0, 0)
 
         self.det_threshold = QDoubleSpinBox()
         self.det_threshold.setRange(0.0, 100.0)
@@ -303,21 +353,18 @@ class LightPanel(QWidget):
             )
 
         btn_row = QHBoxLayout()
-        self._propose_btn = QPushButton("Propose quads")
-        self._propose_btn.setToolTip(
-            "Detect lights and add them as quads. Locked quads are kept as-is; "
-            "other auto-proposed quads are replaced. Your hand-placed quads are "
-            "never touched."
-        )
-        self._propose_btn.clicked.connect(self._on_propose)
-        btn_row.addWidget(self._propose_btn, stretch=1)
+        btn_row.addStretch(1)
         self._det_reset_btn = QPushButton("Reset")
-        self._det_reset_btn.setToolTip("Restore the detection parameters to their defaults.")
-        self._det_reset_btn.setFixedWidth(64)
+        self._det_reset_btn.setToolTip(
+            "Restore the detection parameters to their defaults."
+        )
         self._det_reset_btn.clicked.connect(self._reset_detect_params)
         btn_row.addWidget(self._det_reset_btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.hide)
+        btn_row.addWidget(close_btn)
         outer.addLayout(btn_row)
-        return box
+        self._detect_dialog = dlg
 
     def _reset_detect_params(self):
         """Restore every auto-detect control to its default."""

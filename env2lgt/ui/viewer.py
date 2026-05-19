@@ -113,6 +113,10 @@ def _cc24_display_colors() -> list:
 
 _CC24_DISPLAY = _cc24_display_colors()
 
+# Reference swatches are drawn inset within each chart cell (as a fraction of
+# the cell), leaving a window so the real chart underneath stays visible.
+_CC_SWATCH_INSET = 0.26
+
 
 # ---------- vertex handle (draggable) ----------
 
@@ -471,23 +475,42 @@ class PanoramaViewer(QGraphicsView):
         self._chart_cell_items = []
 
     def _build_chart_shapes(self) -> None:
-        """24 cells filled with the CC24 reference colours + an outer border.
-        The cell borders double as the 6x4 grid."""
+        """A 6x4 grid with an inset reference swatch in every cell, plus an
+        outer border. Each swatch is drawn smaller than its cell so the real
+        chart underneath shows through around it — line the chart up by
+        matching each swatch to the patch framing it."""
         cell_pen = QPen(QColor(245, 245, 245, 120), 1)
         cell_pen.setCosmetic(True)
+        no_pen = QPen(Qt.PenStyle.NoPen)
+        m = _CC_SWATCH_INSET
         for j in range(4):
             for i in range(6):
-                poly = QPolygonF()
+                # Full cell — grid lines only, no fill.
+                cell = QPolygonF()
                 for (uu, vv) in (
                     (i / 6.0, j / 4.0), ((i + 1) / 6.0, j / 4.0),
                     ((i + 1) / 6.0, (j + 1) / 4.0), (i / 6.0, (j + 1) / 4.0),
                 ):
-                    poly.append(QPointF(*self._chart_param_display(uu, vv)))
+                    cell.append(QPointF(*self._chart_param_display(uu, vv)))
+                cell_item = self._scene.addPolygon(
+                    cell, cell_pen, QBrush(Qt.BrushStyle.NoBrush)
+                )
+                cell_item.setZValue(15)
+                self._chart_cell_items.append(cell_item)
+                # Inset reference swatch.
+                swatch = QPolygonF()
+                for (su, sv) in (
+                    (i + m, j + m), (i + 1 - m, j + m),
+                    (i + 1 - m, j + 1 - m), (i + m, j + 1 - m),
+                ):
+                    swatch.append(
+                        QPointF(*self._chart_param_display(su / 6.0, sv / 4.0))
+                    )
                 col = _CC24_DISPLAY[j * 6 + i]
-                fill = QColor(col.red(), col.green(), col.blue(), 115)
-                item = self._scene.addPolygon(poly, cell_pen, QBrush(fill))
-                item.setZValue(15)
-                self._chart_cell_items.append(item)
+                fill = QColor(col.red(), col.green(), col.blue(), 235)
+                sw_item = self._scene.addPolygon(swatch, no_pen, QBrush(fill))
+                sw_item.setZValue(15)
+                self._chart_cell_items.append(sw_item)
         self._chart_item = self._scene.addPath(
             self._chart_border_path(), QPen(QColor(255, 235, 90), 2)
         )

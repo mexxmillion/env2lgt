@@ -59,6 +59,7 @@ _CC_ROWS = 4
 _LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float64)
 
 TARGET_FORMAT = "env2lgt-cc-target"
+CORRECTION_FORMAT = "env2lgt-cc-correction"
 
 
 # ---------- swatch sampling ----------
@@ -243,3 +244,51 @@ def save_target(
         "swatches": [[float(c) for c in row] for row in np.asarray(swatches)],
     }
     Path(path).write_text(json.dumps(data, indent=2))
+
+
+# ---------- correction files ----------
+
+def save_correction(
+    path: str | Path,
+    matrix: np.ndarray,
+    fit_mode: str,
+    target_name: str,
+    *,
+    name: str | None = None,
+    rmse: float | None = None,
+) -> None:
+    """Write a solved 3x3 colour-checker correction to JSON so it can be
+    reloaded and reapplied to other HDRIs of the same set (batch matching)."""
+    M = np.asarray(matrix, dtype=np.float32)
+    if M.shape != (3, 3):
+        raise ValueError(f"Correction matrix must be 3x3, got {M.shape}.")
+    data = {
+        "format": CORRECTION_FORMAT,
+        "name": name or Path(path).stem,
+        "fit_mode": fit_mode,
+        "target_name": target_name,
+        "matrix": [[float(c) for c in row] for row in M],
+    }
+    if rmse is not None:
+        data["rmse"] = float(rmse)
+    Path(path).write_text(json.dumps(data, indent=2))
+
+
+def load_correction(path: str | Path) -> dict:
+    """Load a correction JSON written by `save_correction`. Returns a dict:
+    matrix (3,3 ndarray), fit_mode, target_name, name, rmse (float or None)."""
+    raw = json.loads(Path(path).read_text())
+    if raw.get("format") != CORRECTION_FORMAT:
+        raise ValueError(
+            f"{Path(path).name} is not an env2lgt colour correction."
+        )
+    M = np.asarray(raw["matrix"], dtype=np.float32)
+    if M.shape != (3, 3):
+        raise ValueError(f"Correction matrix must be 3x3, got {M.shape}.")
+    return {
+        "matrix": M,
+        "fit_mode": str(raw.get("fit_mode", "matrix")),
+        "target_name": str(raw.get("target_name", "")),
+        "name": str(raw.get("name", Path(path).stem)),
+        "rmse": float(raw["rmse"]) if "rmse" in raw else None,
+    }
