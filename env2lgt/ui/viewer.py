@@ -98,6 +98,22 @@ class LightQuad:
 HANDLE_R = 7  # pixel radius; drawn ignoring view transform so it stays constant
 
 
+def _cc24_display_colors() -> list:
+    """The 24 CC24 reference patches, sRGB-encoded for on-screen drawing.
+    Painted (semi-transparent) inside the chart cells so the user can line
+    the chart up by eye — patch 1 (dark skin) onto the dark-skin patch."""
+    from env2lgt.colorchecker import CC24_LINEAR_SRGB
+
+    cols = []
+    for rgb in CC24_LINEAR_SRGB:
+        enc = [int(round(min(1.0, max(0.0, float(c))) ** (1.0 / 2.2) * 255)) for c in rgb]
+        cols.append(QColor(enc[0], enc[1], enc[2]))
+    return cols
+
+
+_CC24_DISPLAY = _cc24_display_colors()
+
+
 # ---------- vertex handle (draggable) ----------
 
 class _VertexHandle(QGraphicsEllipseItem):
@@ -222,10 +238,17 @@ class PanoramaViewer(QGraphicsView):
         self._sample_rect_item: QGraphicsRectItem | None = None
         # Quads hidden in exposure mode.
         self._quads_visible = True
-        # Colour-checker chart: 4 corner dirs (TL, TR, BR, BL) or None.
+        # Colour-checker chart. Two independent slots so the HDRI chart and a
+        # flat reference-image chart both survive a view switch:
+        #   _chart_dirs : (4,3) corner dirs   — used on the equirect panorama
+        #   _chart_uv   : (4,2) normalised px — used on a flat reference image
+        # `_flat_mode` selects which one is active (matches the shown image).
+        self._flat_mode: bool = False
         self._chart_dirs: np.ndarray | None = None
+        self._chart_uv: np.ndarray | None = None
         self._chart_item: QGraphicsPathItem | None = None
         self._chart_grid_item: QGraphicsPathItem | None = None
+        self._chart_cell_items: list = []
         self._chart_handles: list[_ChartHandle] = []
         self._placing_chart: list[np.ndarray] = []
         self._placing_chart_dots: list[QGraphicsEllipseItem] = []
@@ -334,21 +357,30 @@ class PanoramaViewer(QGraphicsView):
         self.chart_mode_changed.emit(False)
 
     def _place_chart_vertex(self, scene_pt: QPointF) -> None:
-        u_abs = self._display_to_abs_x(float(scene_pt.x()))
-        v = float(scene_pt.y())
-        yaw, pitch = pix_to_angles(np.array(u_abs), np.array(v), self._W, self._H)
-        d = np.asarray(dir_from_angles(yaw, pitch), dtype=np.float64).reshape(3)
-        self._placing_chart.append(d)
+        x = float(np.clip(scene_pt.x(), 0.0, max(1.0, self._W - 1)))
+        y = float(np.clip(scene_pt.y(), 0.0, max(1.0, self._H - 1)))
+        if self._flat_mode:
+            self._placing_chart.append(np.array([x / self._W, y / self._H]))
+        else:
+            u_abs = self._display_to_abs_x(x)
+            yaw, pitch = pix_to_angles(np.array(u_abs), np.array(y), self._W, self._H)
+            self._placing_chart.append(
+                np.asarray(dir_from_angles(yaw, pitch), dtype=np.float64).reshape(3)
+            )
         dot = self._scene.addEllipse(
             -HANDLE_R, -HANDLE_R, HANDLE_R * 2, HANDLE_R * 2,
             QPen(QColor(20, 20, 20), 1), QBrush(QColor(245, 245, 245)),
         )
         dot.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-        dot.setPos(QPointF(float(scene_pt.x()), v))
+        dot.setPos(QPointF(x, y))
         dot.setZValue(212)
         self._placing_chart_dots.append(dot)
         if len(self._placing_chart) >= 4:
-            self._chart_dirs = np.stack(self._placing_chart, axis=0)
+            corners = np.stack(self._placing_chart, axis=0)
+            if self._flat_mode:
+                self._chart_uv = corners
+            else:
+                self._chart_dirs = corners
             for dd in self._placing_chart_dots:
                 self._scene.removeItem(dd)
             self._placing_chart_dots = []
@@ -359,113 +391,158 @@ class PanoramaViewer(QGraphicsView):
             self.chart_mode_changed.emit(False)
             self.chart_committed.emit()
 
+    # ---------- chart accessors ----------
+
+    def set_flat_mode(self, flat: bool) -> None:
+        """Select which chart slot is active: a flat reference image (planar
+        chart) vs the equirect panorama (spherical chart). Call before
+        set_image() for the new view."""
+        self._flat_mode = bool(flat)
+
+    def _active_chart(self):
+        return self._chart_uv if self._flat_mode else self._chart_dirs
+
     def set_chart(self, dirs: np.ndarray | None) -> None:
-        if dirs is None:
-            self.clear_chart()
-            return
-        self._chart_dirs = np.asarray(dirs, dtype=np.float64).reshape(4, 3)
+        """Set the equirect (panorama) chart from 4 corner dirs."""
+        self._chart_dirs = (
+            None if dirs is None else np.asarray(dirs, dtype=np.float64).reshape(4, 3)
+        )
+        self._refresh_chart()
+
+    def set_chart_uv(self, uv: np.ndarray | None) -> None:
+        """Set the flat (reference-image) chart from 4 normalised corners."""
+        self._chart_uv = (
+            None if uv is None else np.asarray(uv, dtype=np.float64).reshape(4, 2)
+        )
         self._refresh_chart()
 
     def clear_chart(self) -> None:
-        self._chart_dirs = None
+        """Clear the chart for the active view (HDRI or reference)."""
+        if self._flat_mode:
+            self._chart_uv = None
+        else:
+            self._chart_dirs = None
         self._clear_chart_items()
 
     def has_chart(self) -> bool:
-        return self._chart_dirs is not None
+        return self._active_chart() is not None
 
     def chart_dirs(self) -> np.ndarray | None:
         return None if self._chart_dirs is None else self._chart_dirs.copy()
 
-    def chart_corners_abs_px(self) -> np.ndarray | None:
-        """Chart corners as absolute (unrolled) panorama pixel coords (4, 2)."""
-        if self._chart_dirs is None or self._W <= 0:
-            return None
-        return np.array(
-            [self._dir_to_pix(d) for d in self._chart_dirs], dtype=np.float64
-        )
+    def chart_uv(self) -> np.ndarray | None:
+        return None if self._chart_uv is None else self._chart_uv.copy()
+
+    # ---------- chart geometry ----------
+
+    def _chart_param_display(self, u: float, v: float) -> tuple[float, float]:
+        """Parametric chart coord (u, v) in [0,1]^2 -> display scene pixel.
+        Spherical-bilinear on the panorama, plain bilinear on a flat image."""
+        if self._flat_mode:
+            c = self._chart_uv
+            top = c[0] * (1.0 - u) + c[1] * u
+            bot = c[3] * (1.0 - u) + c[2] * u
+            p = top * (1.0 - v) + bot * v
+            return float(p[0] * self._W), float(p[1] * self._H)
+        from env2lgt.proj import spherical_bilinear
+
+        return self._dir_to_display_pix(spherical_bilinear(self._chart_dirs, u, v))
+
+    def _chart_corner_display(self, i: int) -> tuple[float, float]:
+        if self._flat_mode:
+            c = self._chart_uv[i]
+            return float(c[0] * self._W), float(c[1] * self._H)
+        return self._dir_to_display_pix(self._chart_dirs[i])
 
     def _clear_chart_items(self) -> None:
+        self._clear_chart_shapes()
+        for h in self._chart_handles:
+            self._scene.removeItem(h)
+        self._chart_handles = []
+
+    def _clear_chart_shapes(self) -> None:
         for it in (self._chart_item, self._chart_grid_item):
             if it is not None:
                 self._scene.removeItem(it)
         self._chart_item = None
         self._chart_grid_item = None
-        for h in self._chart_handles:
-            self._scene.removeItem(h)
-        self._chart_handles = []
+        for it in self._chart_cell_items:
+            self._scene.removeItem(it)
+        self._chart_cell_items = []
+
+    def _build_chart_shapes(self) -> None:
+        """24 cells filled with the CC24 reference colours + an outer border.
+        The cell borders double as the 6x4 grid."""
+        cell_pen = QPen(QColor(245, 245, 245, 120), 1)
+        cell_pen.setCosmetic(True)
+        for j in range(4):
+            for i in range(6):
+                poly = QPolygonF()
+                for (uu, vv) in (
+                    (i / 6.0, j / 4.0), ((i + 1) / 6.0, j / 4.0),
+                    ((i + 1) / 6.0, (j + 1) / 4.0), (i / 6.0, (j + 1) / 4.0),
+                ):
+                    poly.append(QPointF(*self._chart_param_display(uu, vv)))
+                col = _CC24_DISPLAY[j * 6 + i]
+                fill = QColor(col.red(), col.green(), col.blue(), 115)
+                item = self._scene.addPolygon(poly, cell_pen, QBrush(fill))
+                item.setZValue(15)
+                self._chart_cell_items.append(item)
+        self._chart_item = self._scene.addPath(
+            self._chart_border_path(), QPen(QColor(255, 235, 90), 2)
+        )
+        self._chart_item.setZValue(16)
+
+    def _chart_border_path(self) -> QPainterPath:
+        """The outer chart border, sampled along its 4 edges (curves on the
+        panorama, straight on a flat image), with seam-wrap breaks."""
+        n = 14
+        edges = (
+            [(t, 0.0) for t in np.linspace(0, 1, n)]
+            + [(1.0, t) for t in np.linspace(0, 1, n)]
+            + [(t, 1.0) for t in np.linspace(1, 0, n)]
+            + [(0.0, t) for t in np.linspace(1, 0, n)]
+        )
+        pts = [self._chart_param_display(u, v) for (u, v) in edges]
+        path = QPainterPath()
+        path.moveTo(*pts[0])
+        last_u = pts[0][0]
+        for (u, v) in pts[1:]:
+            if abs(u - last_u) > self._W / 2:
+                path.moveTo(u, v)
+            else:
+                path.lineTo(u, v)
+            last_u = u
+        return path
 
     def _refresh_chart(self) -> None:
         self._clear_chart_items()
-        if self._chart_dirs is None or self._W <= 0:
+        if self._active_chart() is None or self._W <= 0:
             return
-        # Outline + grid follow great circles (the equirect warp), exactly
-        # like the light quads — straight lines would misrepresent the chart.
-        pen = QPen(QColor(245, 245, 245), 2)
-        outline = self._great_circle_path(list(self._chart_dirs), closed=True)
-        self._chart_item = self._scene.addPath(outline, pen)
-        self._chart_item.setZValue(15)
-        gpen = QPen(QColor(245, 245, 245, 130), 1)
-        gpen.setCosmetic(True)
-        self._chart_grid_item = self._scene.addPath(
-            self._chart_grid_path_spherical(self._chart_dirs), gpen
-        )
-        self._chart_grid_item.setZValue(16)
-        # Corner handles.
+        self._build_chart_shapes()
         for i in range(4):
-            d = self._chart_dirs[i]
             h = _ChartHandle(i, self)
             self._scene.addItem(h)
-            h.set_pano_pos_silent(*self._dir_to_display_pix(d))
+            h.set_pano_pos_silent(*self._chart_corner_display(i))
             self._chart_handles.append(h)
 
-    def _chart_grid_path_spherical(self, dirs: np.ndarray) -> QPainterPath:
-        """The interior 6x4 grid, each line sampled along the spherical
-        bilinear patch so it curves with the equirect projection."""
-        from env2lgt.proj import spherical_bilinear
-
-        n = 16
-        path = QPainterPath()
-
-        def add_curve(uv_at):
-            pts = [
-                self._dir_to_display_pix(spherical_bilinear(dirs, *uv_at(t)))
-                for t in np.linspace(0.0, 1.0, n)
-            ]
-            path.moveTo(*pts[0])
-            last_u = pts[0][0]
-            for (u, v) in pts[1:]:
-                if abs(u - last_u) > self._W / 2:
-                    path.moveTo(u, v)
-                else:
-                    path.lineTo(u, v)
-                last_u = u
-
-        for i in range(1, 6):  # interior column lines
-            uu = i / 6.0
-            add_curve(lambda t, uu=uu: (uu, t))
-        for j in range(1, 4):  # interior row lines
-            vv = j / 4.0
-            add_curve(lambda t, vv=vv: (t, vv))
-        return path
-
     def on_chart_vertex_dragged(self, index: int, scene_pos: QPointF) -> None:
-        if self._chart_dirs is None:
+        if self._active_chart() is None:
             return
-        u_disp = float(np.clip(scene_pos.x(), 0.0, self._W - 1))
-        v = float(np.clip(scene_pos.y(), 0.0, self._H - 1))
-        u_abs = self._display_to_abs_x(u_disp)
-        yaw, pitch = pix_to_angles(np.array(u_abs), np.array(v), self._W, self._H)
-        d = np.asarray(dir_from_angles(yaw, pitch), dtype=np.float64).reshape(3)
-        self._chart_dirs[index] = d
-        # Redraw outline + grid but leave the handles (dragged one stays put).
-        if self._chart_item is not None:
-            self._chart_item.setPath(
-                self._great_circle_path(list(self._chart_dirs), closed=True)
-            )
-            if self._chart_grid_item is not None:
-                self._chart_grid_item.setPath(
-                    self._chart_grid_path_spherical(self._chart_dirs)
-                )
+        x = float(np.clip(scene_pos.x(), 0.0, self._W - 1))
+        y = float(np.clip(scene_pos.y(), 0.0, self._H - 1))
+        if self._flat_mode:
+            self._chart_uv[index] = [x / self._W, y / self._H]
+        else:
+            u_abs = self._display_to_abs_x(x)
+            yaw, pitch = pix_to_angles(np.array(u_abs), np.array(y), self._W, self._H)
+            self._chart_dirs[index] = np.asarray(
+                dir_from_angles(yaw, pitch), dtype=np.float64
+            ).reshape(3)
+        # Rebuild cells + border; leave the handles (the dragged one tracks
+        # the cursor on its own).
+        self._clear_chart_shapes()
+        self._build_chart_shapes()
         self.chart_modified.emit()
 
     # ---------- image ----------
@@ -488,6 +565,7 @@ class PanoramaViewer(QGraphicsView):
         self._sample_rect_item = None
         self._chart_item = None
         self._chart_grid_item = None
+        self._chart_cell_items = []
         self._chart_handles = []
         self._placing_dots = []
         self._placing_path = None
@@ -501,7 +579,7 @@ class PanoramaViewer(QGraphicsView):
             self._add_quad_item(q)
         if sel and sel in self._quads:
             self._set_selected(sel)
-        if self._chart_dirs is not None:
+        if self._active_chart() is not None:
             self._refresh_chart()
         if keep_view:
             self.setTransform(saved_transform)
@@ -569,8 +647,10 @@ class PanoramaViewer(QGraphicsView):
         self._key_overlay_img = None
         self._key_overlay_item = None
         self._chart_dirs = None
+        self._chart_uv = None
         self._chart_item = None
         self._chart_grid_item = None
+        self._chart_cell_items = []
         self._chart_handles = []
         self._placing_chart = []
         self._placing_chart_dots = []

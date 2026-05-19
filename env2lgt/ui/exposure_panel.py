@@ -41,7 +41,9 @@ class ExposurePanel(QWidget):
     clear_chart_requested = Signal()
     use_builtin_target = Signal()                  # target = built-in CC24
     load_json_target_requested = Signal()          # target = a JSON file
-    capture_reference_requested = Signal()         # target = current chart
+    use_reference_target = Signal()                # target = reference image
+    load_reference_image_requested = Signal()      # load a flat reference image
+    reference_view_toggled = Signal(bool)          # HDRI <-> reference view
     fit_mode_changed = Signal(str)                 # exposure | wb | matrix
     solve_chart_requested = Signal()               # solve + apply correction
 
@@ -176,15 +178,36 @@ class ExposurePanel(QWidget):
         v = QVBoxLayout(box)
         desc = QLabel(
             "Place a 4-corner quad over a 24-patch chart (corner 1 = dark "
-            "skin, then clockwise), pick a target, and solve a colour match."
+            "skin, then clockwise). The cells show the reference colours so "
+            "you can line it up. Pick a target and solve a colour match."
         )
         desc.setWordWrap(True)
         desc.setStyleSheet("color:#888;")
         v.addWidget(desc)
 
+        # HDRI <-> reference-image view toggle (like the depth toggle).
+        self._ref_view_btn = QPushButton("Show reference image")
+        self._ref_view_btn.setCheckable(True)
+        self._ref_view_btn.setEnabled(False)
+        self._ref_view_btn.setToolTip(
+            "Switch the viewport between the HDRI panorama and the loaded "
+            "flat reference image. Each keeps its own chart."
+        )
+        self._ref_view_btn.toggled.connect(self.reference_view_toggled)
+        v.addWidget(self._ref_view_btn)
+        self._load_ref_btn = QPushButton("Load reference image…")
+        self._load_ref_btn.setToolTip(
+            "Load a regular 2D photo of a colour chart to match against."
+        )
+        self._load_ref_btn.clicked.connect(self.load_reference_image_requested)
+        v.addWidget(self._load_ref_btn)
+
         pick_row = QHBoxLayout()
         self._pick_chart_btn = QPushButton("Pick colour chart")
         self._pick_chart_btn.setCheckable(True)
+        self._pick_chart_btn.setToolTip(
+            "Place the chart on the current view (HDRI or reference)."
+        )
         self._pick_chart_btn.clicked.connect(self._on_pick_chart)
         pick_row.addWidget(self._pick_chart_btn, stretch=1)
         self._clear_chart_btn = QPushButton("Clear")
@@ -204,15 +227,13 @@ class ExposurePanel(QWidget):
         json_btn = QPushButton("Load JSON…")
         json_btn.clicked.connect(self.load_json_target_requested)
         tgt_row.addWidget(json_btn)
-        v.addLayout(tgt_row)
-        self._capture_ref_btn = QPushButton("Capture reference from current chart")
-        self._capture_ref_btn.setToolTip(
-            "Sample the 24 swatches under the current chart and use them as "
-            "the match target — e.g. load a reference EXR, place a chart, "
-            "capture, then load your shot and match to it."
+        ref_tgt_btn = QPushButton("Reference image")
+        ref_tgt_btn.setToolTip(
+            "Match to the chart placed on the loaded reference image."
         )
-        self._capture_ref_btn.clicked.connect(self.capture_reference_requested)
-        v.addWidget(self._capture_ref_btn)
+        ref_tgt_btn.clicked.connect(self.use_reference_target)
+        tgt_row.addWidget(ref_tgt_btn)
+        v.addLayout(tgt_row)
 
         fit_row = QHBoxLayout()
         fit_row.addWidget(QLabel("Fit:"))
@@ -331,6 +352,18 @@ class ExposurePanel(QWidget):
 
     def set_target_label(self, name: str) -> None:
         self._target_label.setText(name)
+
+    def set_reference_loaded(self, loaded: bool) -> None:
+        self._ref_view_btn.setEnabled(loaded)
+
+    def set_reference_view(self, on: bool) -> None:
+        """Reflect the active view on the toggle without re-emitting."""
+        self._ref_view_btn.blockSignals(True)
+        self._ref_view_btn.setChecked(on)
+        self._ref_view_btn.setText(
+            "Show HDRI panorama" if on else "Show reference image"
+        )
+        self._ref_view_btn.blockSignals(False)
 
     def set_chart_status(
         self, has_chart: bool, rmse: float | None = None, applied: bool = False

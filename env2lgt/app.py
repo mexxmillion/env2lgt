@@ -161,10 +161,13 @@ class MainWindow(QMainWindow):
         # ---- colour-checker chart correction ----
         # Solved 3x3 matrix (row-vector convention) or None. Baked into export.
         self._cc_matrix: np.ndarray | None = None
-        self._cc_target_swatches: np.ndarray | None = None  # current ref (24,3)
+        self._cc_target_swatches: np.ndarray | None = None  # JSON target (24,3)
         self._cc_target_name: str = "Built-in CC24"
+        self._cc_target_mode: str = "builtin"   # builtin | json | reference
         self._cc_fit_mode: str = "matrix"
-        self._cc_pending_ref: bool = False  # placing a chart in a reference EXR
+        # Flat reference image (working space, display-res) for chart matching.
+        self._ref_display: np.ndarray | None = None
+        self._ref_path: Path | None = None
         # DA-2 returns scale-invariant distance ~[0.3, 1.5]. Default at
         # 100 m/u — typical indoor scenes look right at this scale in
         # usdview; the user can adjust via the toolbar slider.
@@ -226,8 +229,12 @@ class MainWindow(QMainWindow):
         self.exposure_panel.load_json_target_requested.connect(
             self._on_load_json_target
         )
-        self.exposure_panel.capture_reference_requested.connect(
-            self._on_capture_reference
+        self.exposure_panel.use_reference_target.connect(self._on_use_reference_target)
+        self.exposure_panel.load_reference_image_requested.connect(
+            self._on_load_reference_image
+        )
+        self.exposure_panel.reference_view_toggled.connect(
+            self._on_reference_view_toggled
         )
         self.exposure_panel.fit_mode_changed.connect(self._on_fit_mode_changed)
         self.exposure_panel.solve_chart_requested.connect(self._on_solve_chart)
@@ -579,13 +586,21 @@ class MainWindow(QMainWindow):
         self._wb_kelvin = 6500.0
         self._wb_tint = 0.0
         self._wb_scale = np.ones(3, dtype=np.float32)
-        # Drop any colour-checker correction from the previous EXR.
+        # Drop any colour-checker correction from the previous EXR. The loaded
+        # reference image persists (it's an independent match target), but its
+        # chart is cleared by viewer.reset_image() below.
         self._cc_matrix = None
+        self._cc_target_mode = "builtin"
+        self._cc_target_name = "Built-in CC24"
+        if hasattr(self, "viewer"):
+            self.viewer.set_flat_mode(False)
         if hasattr(self, "exposure_panel"):
             self.exposure_panel.set_exposure_offset(0.0)
             self.exposure_panel.set_wb(6500.0, 0.0)
             self.exposure_panel.set_wb_readout(self._wb_scale)
             self.exposure_panel.set_chart_status(has_chart=False, rmse=None)
+            self.exposure_panel.set_target_label("Built-in CC24")
+            self.exposure_panel.set_reference_view(False)
         # Drop cached depth — it's for the previous EXR.
         self._distance = None
         self._view_mode = "hdr"
@@ -661,6 +676,17 @@ class MainWindow(QMainWindow):
         - Yaw offset rolls the cached uint8 (column-wise) and wraps in a
           QImage. Cheap (~5 ms at 2K) — runs on every yaw-slider tick.
         """
+        # Reference-image view (flat 2D) — bypasses the pano cache + yaw roll.
+        if self._view_mode == "reference":
+            if self._ref_display is None:
+                return
+            u8 = self._working_to_u8(self._ref_display, 0.0)
+            H, W, _ = u8.shape
+            qimg = QImage(u8.data, W, H, W * 3, QImage.Format.Format_RGB888).copy()
+            self.viewer.set_yaw_offset_px(0)
+            self.viewer.set_image(qimg)
+            return
+
         if self._hdr_display is None:
             return
 
@@ -874,6 +900,10 @@ class MainWindow(QMainWindow):
                 self.viewer.cancel_sample_mode()
             if self.viewer.is_chart_mode():
                 self.viewer.cancel_chart_mode()
+            # Leaving exposure mode drops the reference view.
+            if self._view_mode == "reference":
+                self.exposure_panel.set_reference_view(False)
+                self._on_reference_view_toggled(False)
         if self._exr_path is not None:
             self.statusBar().showMessage(
                 "Exposure mode — adjust the HDRI baseline; baked into export."
@@ -1047,16 +1077,30 @@ class MainWindow(QMainWindow):
                 pass
         return cc.astype(np.float32)
 
-    def _current_target_working(self) -> np.ndarray:
-        """The active match target (24,3) in the working space."""
-        if self._cc_target_swatches is not None:
+    def _current_target_working(self) -> np.ndarray | None:
+        """The active match target (24,3) in the working space, or None if it
+        cannot be resolved (e.g. reference target with no reference chart)."""
+        if self._cc_target_mode == "reference":
+            return self._sample_reference_swatches()
+        if self._cc_target_mode == "json" and self._cc_target_swatches is not None:
             return self._cc_target_swatches
         return self._builtin_target_working()
 
     def _on_use_builtin_target(self):
-        self._cc_target_swatches = None
+        self._cc_target_mode = "builtin"
         self._cc_target_name = "Built-in CC24"
         self.exposure_panel.set_target_label("Built-in CC24")
+
+    def _on_use_reference_target(self):
+        if self.viewer.chart_uv() is None and self._ref_display is None:
+            QMessageBox.information(
+                self, "Reference target",
+                "Load a reference image and place a chart on it first.",
+            )
+            return
+        self._cc_target_mode = "reference"
+        self._cc_target_name = "Reference image"
+        self.exposure_panel.set_target_label("Reference image chart")
 
     def _on_load_json_target(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1075,30 +1119,80 @@ class MainWindow(QMainWindow):
             except Exception:  # noqa: BLE001
                 pass
         self._cc_target_swatches = sw.astype(np.float32)
+        self._cc_target_mode = "json"
         self._cc_target_name = name
         self.exposure_panel.set_target_label(f"JSON: {name}")
         self.statusBar().showMessage(f"Colour target loaded: {name}")
 
-    def _on_capture_reference(self):
-        """Sample the 24 swatches under the current chart and use them as the
-        match target — for matching a shot to a reference image."""
-        sw = self._sample_chart_swatches()
-        if sw is None:
-            QMessageBox.information(
-                self, "Capture reference",
-                "Place a colour chart first (Pick colour chart).",
-            )
+    # ---------- reference image ----------
+
+    def _on_load_reference_image(self):
+        """Load a regular 2D photo of a colour chart to match against."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load reference image", "",
+            "Images (*.exr *.jpg *.jpeg *.png *.tif *.tiff);;All files (*.*)",
+        )
+        if not path:
             return
-        self._cc_target_swatches = sw.astype(np.float32)
-        self._cc_target_name = "Captured reference"
-        self.exposure_panel.set_target_label("Captured reference (current chart)")
+        try:
+            ref = self._load_reference_array(Path(path))
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Load reference", str(e))
+            return
+        # Downsample for display, same width cap as the panorama.
+        H, W = ref.shape[:2]
+        if W > DISPLAY_MAX_WIDTH:
+            new_w = DISPLAY_MAX_WIDTH
+            new_h = max(2, (new_w * H) // W)
+            ref = cv2.resize(ref, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        self._ref_display = ref
+        self._ref_path = Path(path)
+        self.exposure_panel.set_reference_loaded(True)
+        self.statusBar().showMessage(f"Reference image loaded: {Path(path).name}")
+        # Jump straight to the reference view so the user can place a chart.
+        self.exposure_panel.set_reference_view(True)
+        self._on_reference_view_toggled(True)
+
+    def _load_reference_array(self, path: Path) -> np.ndarray:
+        """Load a reference image into the working space. 8-bit images are
+        treated as sRGB-encoded; float/EXR as the current input colorspace."""
+        arr = cv2.imread(
+            str(path), cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR | cv2.IMREAD_COLOR
+        )
+        if arr is None:
+            raise RuntimeError(f"Could not read {path.name}")
+        arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+        if arr.dtype == np.uint8:
+            arr = arr.astype(np.float32) / 255.0
+            src_cs = "Utility - sRGB - Texture"
+        else:
+            arr = np.ascontiguousarray(arr.astype(np.float32))
+            src_cs = self._input_cs
+        if self._ocio_ok and src_cs:
+            try:
+                return color.to_working(arr, src_cs)
+            except Exception:  # noqa: BLE001
+                pass
+        return arr
+
+    def _on_reference_view_toggled(self, show_reference: bool):
+        if show_reference and self._ref_display is None:
+            self.exposure_panel.set_reference_view(False)
+            return
+        if self.viewer.is_chart_mode():
+            self.viewer.cancel_chart_mode()
+        self._view_mode = "reference" if show_reference else "hdr"
+        self.viewer.set_flat_mode(show_reference)
+        self.exposure_panel.set_reference_view(show_reference)
+        self._invalidate_display_cache()
+        self._refresh_view()
         self.statusBar().showMessage(
-            "Reference swatches captured — load your shot, place a chart, "
-            "then Solve & apply."
+            "Reference image — place a chart, then set the target to "
+            "'Reference image'." if show_reference else ""
         )
 
     def _sample_chart_swatches(self) -> np.ndarray | None:
-        """Sample the 24 chart patches from the working-space panorama via
+        """Sample the 24 HDRI chart patches from the working-space panorama via
         spherical-bilinear blend of the corner directions — equirect-correct,
         and seam-safe (directions wrap naturally). Returns (24,3) or None."""
         dirs = self.viewer.chart_dirs()
@@ -1106,15 +1200,33 @@ class MainWindow(QMainWindow):
             return None
         return ccheck.sample_swatches_spherical(self._hdr_display, dirs)
 
+    def _sample_reference_swatches(self) -> np.ndarray | None:
+        """Sample the 24 patches from the flat reference image's chart."""
+        uv = self.viewer.chart_uv()
+        if uv is None or self._ref_display is None:
+            return None
+        H, W = self._ref_display.shape[:2]
+        corners_px = np.asarray(uv, dtype=np.float64) * np.array([W, H])
+        sw, _rect = ccheck.rectify_swatches(self._ref_display, corners_px)
+        return sw
+
     def _on_solve_chart(self):
         sw = self._sample_chart_swatches()
         if sw is None:
             QMessageBox.information(
                 self, "Solve chart",
-                "Place a colour chart first (Pick colour chart).",
+                "Place a colour chart on the HDRI panorama first "
+                "(switch to the HDRI view, then Pick colour chart).",
             )
             return
         target = self._current_target_working()
+        if target is None:
+            QMessageBox.information(
+                self, "Solve chart",
+                "The reference-image target has no chart — switch to the "
+                "reference view and place one.",
+            )
+            return
         M, rmse, flipped = ccheck.solve_correction(sw, target, self._cc_fit_mode)
         self._cc_matrix = M
         self._invalidate_display_cache()
