@@ -105,11 +105,14 @@ def bake(
     from env2lgt import color
     from env2lgt.colorchecker import apply_matrix
 
-    _ocio = color.ocio_available()
-
-    # Input transform: source colorspace -> working space (ACEScg).
-    if opts.input_colorspace and _ocio:
-        hdr = color.to_working(hdr, opts.input_colorspace)
+    # Input transform: source colorspace -> working space (ACEScg). Works
+    # under both backends; identity if the source already is the working
+    # space.
+    if opts.input_colorspace:
+        try:
+            hdr = color.to_working(hdr, opts.input_colorspace)
+        except Exception:  # noqa: BLE001
+            pass
 
     # Apply the exposure-mode baseline adjustments up front so the colour-
     # checker correction, white balance and exposure offset bake into every
@@ -123,7 +126,7 @@ def bake(
 
     def _to_output(img: np.ndarray) -> np.ndarray:
         """Working space -> output colorspace for written colour EXRs."""
-        if opts.output_colorspace and _ocio:
+        if opts.output_colorspace:
             try:
                 return color.from_working(img, opts.output_colorspace)
             except Exception:  # noqa: BLE001

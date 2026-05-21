@@ -381,29 +381,102 @@ def _depth_at_dir(distance: np.ndarray, corner_dir: np.ndarray, patch: int = 3) 
 
 
 def _fit_from_4points(pts: np.ndarray) -> tuple:
-    """Parallelogram + camera-facing normal from 4 ordered corner points
-    (TL, TR, BR, BL). Returns (center, normal, u_axis, v_axis, width, height)."""
-    center = pts.mean(axis=0)
-    # Average opposite edges → robust parallelogram axes.
-    u_edge = 0.5 * ((pts[1] - pts[0]) + (pts[2] - pts[3]))
-    v_edge = 0.5 * ((pts[3] - pts[0]) + (pts[2] - pts[1]))
-    width = float(np.linalg.norm(u_edge))
-    height = float(np.linalg.norm(v_edge))
-    u_axis = u_edge / (width + 1e-12)
-    v_axis = v_edge / (height + 1e-12)
-    normal = np.cross(u_axis, v_axis)
-    nlen = np.linalg.norm(normal)
-    if nlen < 1e-9:
-        # Degenerate (collinear) — fall back to a radial normal.
-        normal = -center / (np.linalg.norm(center) + 1e-12)
+    """*Rigid* (no-shear) rectangle from 4 corner points (any order).
+
+    The 4 points are assumed to lie (approximately) on a plane — either the
+    light's bright-region plane or a per-corner-depth plane, both fit upstream
+    in `rect_from_quad`. Their best-fit plane is taken via SVD, and the
+    rectangle's in-plane rotation is recovered by the **diagonal-bisector**
+    method (rect axes = angle bisectors of the two diagonals, equivalently
+    the averaged opposite-edge directions). Bbox of the projected points in
+    that orthonormal (u, v) frame gives width × height.
+
+    Why diagonal-bisector and not PCA? PCA fails silently on near-square
+    inputs — degenerate eigenvalues let `eigh` return an arbitrary basis
+    (typically ~45° off the rect's true edges). The diagonal-bisector method
+    uses edge directions explicitly and stays correct for squares too.
+
+    Why not the previous "averaged opposite edges" formulation? That
+    produced a *parallelogram* (sheared) — fine for spherical rasterisation
+    but illegal as a UsdLuxRectLight transform. Renderers that decompose
+    the xform into TRS (Arnold, V-Ray, Redshift, RenderMan, Karma, every
+    DCC area light) silently drop the shear and the rect lands wrong.
+
+    Returns (center, normal, u_axis, v_axis, width, height) with the
+    (u_axis, v_axis, normal) basis guaranteed orthonormal.
+    """
+    p = np.asarray(pts, dtype=np.float64).reshape(4, 3)
+    centroid = p.mean(axis=0)
+    # Plane fit: SVD of centred points; normal = smallest singular vector.
+    _, _, vt = np.linalg.svd(p - centroid, full_matrices=False)
+    n = vt[-1]
+    n = n / (np.linalg.norm(n) + 1e-12)
+    # Emission direction faces the camera (origin).
+    if float(centroid @ n) > 0.0:
+        n = -n
+
+    # Temporary in-plane basis (e1, e2) for 2D bookkeeping; the real rect
+    # axes come from the diagonal-bisector below. e2 follows world-up
+    # projected onto the plane (falls back to world-Z on horizontal planes).
+    world_up = np.array([0.0, 1.0, 0.0])
+    if abs(float(n @ world_up)) > 0.99:
+        world_up = np.array([0.0, 0.0, 1.0])
+    e2 = world_up - (world_up @ n) * n
+    e2 /= np.linalg.norm(e2) + 1e-12
+    e1 = np.cross(e2, n)
+    e1 /= np.linalg.norm(e1) + 1e-12
+
+    rel = p - centroid
+    p2 = np.stack([rel @ e1, rel @ e2], axis=1)        # (4, 2)
+
+    # CCW-order around the centroid, then diagonal-bisector.
+    angles = np.arctan2(p2[:, 1], p2[:, 0])
+    order = np.argsort(angles)
+    cc = p2[order]
+    e_u_sum = (cc[1] - cc[0]) + (cc[2] - cc[3])
+    e_v_sum = (cc[2] - cc[1]) + (cc[3] - cc[0])
+    nu, nv = float(np.linalg.norm(e_u_sum)), float(np.linalg.norm(e_v_sum))
+    if nu >= nv:
+        u2 = e_u_sum / (nu + 1e-12)
     else:
-        normal /= nlen
-    # Flip so the normal points back toward the camera/origin — the emission
-    # direction. Keep the (u, v, normal) frame right-handed after the flip.
-    if float(center @ normal) > 0.0:
-        normal = -normal
-        v_axis = -v_axis
-    return center, normal, u_axis, v_axis, max(1e-4, width), max(1e-4, height)
+        u2 = e_v_sum / (nv + 1e-12)
+    if u2[0] < 0:                                      # stable direction
+        u2 = -u2
+    v2 = np.array([-u2[1], u2[0]])
+
+    u_axis = u2[0] * e1 + u2[1] * e2
+    v_axis = v2[0] * e1 + v2[1] * e2
+
+    pu = rel @ u_axis
+    pv = rel @ v_axis
+    u_lo, u_hi = float(pu.min()), float(pu.max())
+    v_lo, v_hi = float(pv.min()), float(pv.max())
+    center = centroid + 0.5 * (u_lo + u_hi) * u_axis + 0.5 * (v_lo + v_hi) * v_axis
+    width = max(1e-4, u_hi - u_lo)
+    height = max(1e-4, v_hi - v_lo)
+    return center, n, u_axis, v_axis, width, height
+
+
+def rect_to_corner_dirs(fit: "RectFit") -> np.ndarray:
+    """Cast a `RectFit`'s 4 rigid corners back to unit direction vectors.
+
+    Used by the "Fit to rect light" viewer button to update a quad's stored
+    `corners_dirs` to the snapped rigid-rect corners — what you see on the
+    panorama = what gets authored. Corner order is TL/TR/BR/BL, matching
+    `sample_rect_texture`'s UV convention.
+    """
+    hw = float(fit.width) * 0.5
+    hh = float(fit.height) * 0.5
+    c = np.asarray(fit.center, dtype=np.float64)
+    u = np.asarray(fit.u_axis, dtype=np.float64)
+    v = np.asarray(fit.v_axis, dtype=np.float64)
+    pts = np.stack([
+        c + (-hw) * u + (+hh) * v,   # TL
+        c + (+hw) * u + (+hh) * v,   # TR
+        c + (+hw) * u + (-hh) * v,   # BR
+        c + (-hw) * u + (-hh) * v,   # BL
+    ], axis=0)
+    return pts / (np.linalg.norm(pts, axis=1, keepdims=True) + 1e-12)
 
 
 def _corner_depths(

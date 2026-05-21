@@ -58,6 +58,12 @@ class LightQuad:
     # set explicitly via the list lock toggle, and automatically the first time
     # an auto quad's vertices are edited (so a refinement survives a re-run).
     locked: bool = False
+    # True once the user has pressed "Fit to rect light" — at that point the
+    # 4 corner dirs have been snapped (via depth + plane fit + diagonal-
+    # bisector) to a *rigid* rectangle on the sphere, so what the viewer
+    # shows matches what the bake authors. Any vertex drag flips this back
+    # to False (so the user knows a re-fit is needed before the next bake).
+    is_rect_fitted: bool = False
 
     @classmethod
     def from_pano_bbox(cls, name: str, x: int, y: int, w: int, h: int, W: int, H: int) -> "LightQuad":
@@ -186,6 +192,8 @@ class PanoramaViewer(QGraphicsView):
     quad_modified = Signal(str)         # name of quad whose vertices were edited
     quad_selected = Signal(str)         # name; empty string to deselect
     quad_lock_changed = Signal(str, bool)  # name, locked — auto-lock on edit
+    quad_fit_changed = Signal(str, bool)   # name, is_rect_fitted — toggled on
+                                            # depth-snap + auto-invalidated on edit
     add_mode_changed = Signal(bool)
     pixel_probed = Signal(int, int)     # absolute pano pixel (display res) under cursor
     probe_left = Signal()               # cursor left the panorama
@@ -939,10 +947,39 @@ class PanoramaViewer(QGraphicsView):
         if q is None:
             return
         q.locked = bool(locked)
+        self._refresh_quad_outline(name)
+
+    def set_quad_fitted(self, name: str, fitted: bool, new_corners: np.ndarray | None = None) -> None:
+        """Mark a quad as rigid-rect-fitted (or not). When new_corners is
+        provided, also replace the quad's `corners_dirs` and redraw the path
+        — used by the "Fit to rect light" handler to push the snapped corners
+        back to the viewer in a single call."""
+        q = self._quads.get(name)
+        if q is None:
+            return
+        q.is_rect_fitted = bool(fitted)
+        if new_corners is not None:
+            q.corners_dirs = np.asarray(new_corners, dtype=np.float64).reshape(4, 3)
+            self._refresh_quad_path(q)
+            if name == self._selected:
+                # Move the handles to the new corner positions.
+                self._refresh_vertex_handles()
+        self._refresh_quad_outline(name)
+
+    def _refresh_quad_outline(self, name: str) -> None:
+        """Re-apply the pen/brush for a single quad based on its current
+        state. No-op if the quad is the currently-selected one (its pen is
+        the selection highlight)."""
+        q = self._quads.get(name)
         item = self._quad_items.get(name)
-        if item is not None and name != self._selected:
+        if q is None or item is None:
+            return
+        if name == self._selected:
+            item.setPen(self._quad_pen(q, selected=True))
+            item.setBrush(QBrush(QColor(255, 200, 80, 80)))
+        else:
             col = self._quad_color(q)
-            item.setPen(QPen(col, 2))
+            item.setPen(self._quad_pen(q))
             item.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(), 50)))
 
     def rename_quad(self, old_name: str, new_name: str) -> str:
@@ -999,6 +1036,13 @@ class PanoramaViewer(QGraphicsView):
         if q.source == "auto" and not q.locked:
             q.locked = True
             self.quad_lock_changed.emit(q.name, True)
+        # Any edit invalidates the rigid-rect fit — the depth-based snap
+        # was applied to the *previous* corner positions and no longer
+        # represents what the user has now. The "Fit to rect light" button
+        # needs another press to bring it back in sync.
+        if q.is_rect_fitted:
+            q.is_rect_fitted = False
+            self.quad_fit_changed.emit(q.name, False)
         # re-render the path (handles already moved); don't recreate handles —
         # we want the dragged handle to stay under the mouse.
         self._refresh_quad_path(q)
@@ -1008,20 +1052,35 @@ class PanoramaViewer(QGraphicsView):
 
     @staticmethod
     def _quad_color(q: LightQuad) -> QColor:
-        """Outline color by provenance: cyan = user, orange = unconfirmed
-        auto proposal, green = locked (kept across re-propose)."""
+        """Outline color by state. is_rect_fitted overrides provenance —
+        depth-snapped quads get a bright magenta so the rigid-rect status
+        reads at a glance regardless of source/locked. Otherwise:
+        cyan = user, orange = unconfirmed auto proposal, green = locked."""
+        if q.is_rect_fitted:
+            return QColor(230, 90, 220)
         if q.source == "auto" and not q.locked:
             return QColor(255, 150, 40)
         if q.locked:
             return QColor(80, 230, 120)
         return QColor(60, 220, 255)
 
+    @staticmethod
+    def _quad_pen(q: LightQuad, selected: bool = False) -> QPen:
+        """Pen for a quad. Fitted quads get a thicker (3-pt) outline so the
+        rigid-rect status is visible without leaning on colour alone — useful
+        for colour-blind users and against busy panorama backgrounds."""
+        if selected:
+            pen = QPen(QColor(255, 200, 80), 3)
+        else:
+            pen = QPen(PanoramaViewer._quad_color(q), 3 if q.is_rect_fitted else 2)
+        return pen
+
     def _add_quad_item(self, q: LightQuad):
         if self._W <= 0 or self._H <= 0:
             return
         path = self._great_circle_path(list(q.corners_dirs), closed=True)
         col = self._quad_color(q)
-        pen = QPen(col, 2)
+        pen = self._quad_pen(q)
         brush = QBrush(QColor(col.red(), col.green(), col.blue(), 50))
         item = self._scene.addPath(path, pen, brush)
         item.setZValue(10)
@@ -1094,13 +1153,14 @@ class PanoramaViewer(QGraphicsView):
     def _set_selected(self, name: str | None):
         self._selected = name
         for n, item in self._quad_items.items():
+            q = self._quads.get(n)
             if n == name:
-                item.setPen(QPen(QColor(255, 200, 80), 3))
+                item.setPen(self._quad_pen(q, selected=True) if q is not None
+                            else QPen(QColor(255, 200, 80), 3))
                 item.setBrush(QBrush(QColor(255, 200, 80, 80)))
             else:
-                q = self._quads.get(n)
                 col = self._quad_color(q) if q is not None else QColor(60, 220, 255)
-                item.setPen(QPen(col, 2))
+                item.setPen(self._quad_pen(q) if q is not None else QPen(col, 2))
                 item.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(), 50)))
         self._refresh_vertex_handles()
 

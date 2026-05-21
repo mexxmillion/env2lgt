@@ -26,6 +26,7 @@ https://github.com/mexxmillion/env2lgt/raw/main/docs/demo.mp4
 
 - **3D geometry estimation from depth** — A monocular panorama depth model lifts the equirectangular HDRI into 3D: every pixel gets a distance, so the room's surfaces — and the lights on them — sit at real world-space positions. The estimate can be exported as a depth-displaced mesh for validation in `usdview`.
 - **Area-light extraction & placement from geometry** — Each marked light becomes a `UsdLuxRectLight`, sized, oriented and positioned from the estimated geometry (fit to the fixture's plane and depth), with a rectilinear texture sampled straight off the panorama so it maps 1:1 onto the light surface.
+- **Rigid (no-shear) rect-light fit** — A "Fit to rect light" button depth-snaps every drawn quad to a *true* rectangle on its surface plane: orthogonal axes, no affine shear in the transform. Critical for renderers that decompose the USD xform into TRS (Arnold, V-Ray, Redshift, RenderMan, Karma, Maya/Max area lights) — they all silently drop shear, so anything authored as a parallelogram lands wrong. See [Rigid rect-light fitting](#rigid-rect-light-fitting).
 - **Auto-detect lights** — One pass thresholds the panorama's bright sources into proposed quads — seam-aware, with angular merging of clustered fixtures and a tunable settings window. Detected quads are fit in a tangent-plane projection so their corners hug a fixture's true edges. Hand-placement (4 clicks + draggable corner handles) is always available too.
 - **Dome light with Gaussian fill** — The environment is preserved as a `UsdLuxDomeLight`. The regions taken by the extracted area lights are cut out and seamlessly closed by an iterative, HDR-safe Gaussian edge-extend (Nuke `EdgeExtend`-style) — no dark holes, no rainbow inpaint artefacts.
 - **OCIO display & ACEScg colour pipeline** — Everything is processed in a scene-linear ACEScg working space, with OCIO input/output transforms on the source and baked EXRs and a Nuke/Maya-style display + view transform for the viewport.
@@ -101,6 +102,7 @@ Flush bottom-left: a Nuke-style pixel probe — colour swatch + scene-linear RGB
 - **Add quad (click 4 corners)** — hotkey **A**. Enters add mode: cursor becomes a crosshair, four left-clicks place the four corners of a new quad. The 4 corners are auto-sorted CCW so click order doesn't matter. The newly-committed quad is selected and gets draggable vertex handles.
 - **Delete selected** — hotkey **Delete**.
 - **Auto-detect lights** — **Detect lights** thresholds the panorama's bright sources into proposed quads in one pass (locked quads are preserved; unlocked auto-proposals are regenerated). **Settings…** opens a separate window with the detection knobs — brightness threshold, blur, max count, min size, merge distance, floor-reflection suppression, and a live key-mask overlay. Detection runs on the baseline-adjusted HDRI, so it matches what you see and what the bake extracts.
+- **Fit to rect light  (depth-snap)** — Pushes every unfitted quad through the depth-based rigid-rectangle fit (see [Rigid rect-light fitting](#rigid-rect-light-fitting)). First press blocks while depth is estimated (10–30 s); subsequent presses are instant. Fitted quads get a magenta 3-pt outline and a leading ✓ in the list. Dragging any corner of a fitted quad drops the ✓ — re-press to refresh just the touched ones.
 - **Window / portal** — per-quad checkbox. Normally the rect light is slid in from the quad corners' (wall) depth to the bright region's depth, so it sits on the actual light rather than the wall behind it. Tick this for windows / skylights, where the bright pixels are distant sky through the opening — the rect then stays on the wall plane (flush, portal-friendly).
 
 ### Output panel
@@ -155,6 +157,44 @@ env2lgt works internally in a scene-linear **working space** (the `$OCIO` config
 - **Display / View** — the viewport transform (toolbar dropdowns).
 
 If `$OCIO` is unset or PyOpenColorIO is unavailable, the app falls back to a fixed ACES-filmic display and the colour-management controls are disabled.
+
+---
+
+## Rigid rect-light fitting
+
+`UsdLuxRectLight` is a rectangle. The USD spec lets you put *any* `transform` on it, including one with affine shear, and Hydra/Storm will faithfully render that as a sheared parallelogram. **Every other consumer drops the shear.** When a downstream tool reads the USD prim it TRS-decomposes the transform and authors a width × height rectangle with whatever the rotation component came out as — the shear vanishes silently and the light lands in the wrong place at the wrong orientation. So a free-form 4-corner quad authored as a sheared `UsdLuxRectLight` is *non-portable*. Anywhere except usdview / Storm, it ships wrong.
+
+env2lgt fixes this with the **"Fit to rect light"** button. After drawing quads the usual way (4 clicks, drag handles to refine), one press snaps every quad to a true rectangle:
+
+1. **Depth estimate.** First press fires the depth backend (10–30 s for DA² / DAP) and caches the result. Subsequent presses are instant.
+2. **Plane fit on the bright sub-region.** The quad's mask is rasterised on the panorama; bright pixels' depths are lifted to 3D and a RANSAC plane is fit. This is the light's *surface* plane — not the wall behind it, and not biased by corners the user dragged out past the fixture edges. Falls back to per-corner depths when the bright region is too small / low-contrast.
+3. **Project corner rays onto the plane.** Each of the 4 user-placed corner directions is intersected with the plane, giving 4 in-plane points.
+4. **Recover rotation via diagonal-bisector.** The rectangle's u-axis is the average direction of opposite edges (equivalently: the angle bisector of the diagonals). We don't use PCA — it has degenerate eigenvalues on near-square inputs and silently picks an arbitrary basis ~45° off the rect's true edges. The bisector method uses edge directions explicitly and stays robust on squares.
+5. **Orthonormal frame + bbox.** With `(u, v, n)` orthonormal by construction, the bbox of the 4 projected points in `(u, v)` gives width × height. The 4 rigid corners are emitted as `center ± (w/2)·u ± (h/2)·v` and lifted back to unit dirs for the viewer to display.
+
+The viewer shows the snapped corners with a magenta 3-pt outline and a leading ✓ in the panel list. **What you see is what the bake authors** — same algorithm in both, so there's no viewer/bake drift. Dragging any corner of a fitted quad flips the flag back to *unfitted* (outline reverts to cyan/orange/green) so a re-press is obviously needed.
+
+### Why this matters — DCC / renderer support for shear
+
+| Tool | Rect-light representation | Honors shear in xform? |
+|---|---|---|
+| **USD `UsdLuxRectLight`** (Hydra/Storm) | width + height + 4×4 transform | Yes (rare; spec-correct) |
+| **Arnold** (`quad_light` via MtoA / HtoA / KtoA) | width × height + xform | No — TRS-decomposed |
+| **V-Ray** (`VRayLightRectangle`) | u_size × v_size + xform | No — no shear input in the SDK |
+| **Redshift** (`RSPhysicalLight`, area) | width × height + xform | No |
+| **RenderMan** (`PxrRectLight`) | width × height + xform | No |
+| **Karma / Houdini LOPs** | width / height attrs + xform | No — TRS UI on the prim |
+| **Maya area lights** (`aiAreaLight`, `VRayLightRect`, `RedshiftPhysicalLight`) | width / height + node TRS | No |
+| **3ds Max** (V-Ray Light Plane, Standard area) | length × width + node TRS | No |
+| **Nuke** (3D ReLight / ScanlineRender) | size + axes | No |
+
+Authoring rigid rectangles is the only portable form. env2lgt's bake produces rigid output regardless of whether you press the fit button (`_fit_from_4points` in `lights/extract.py` always returns orthonormal axes now) — the button is purely about **previewing** the same result on the panorama before you commit.
+
+### Limitations
+
+- **Plane fit needs bright contrast.** On a low-contrast fixture (e.g. a frosted ceiling tile against an off-white ceiling), the bright-region RANSAC can fall back to per-corner depths, which is noisier. Check via *Show depth* (**D**) that each quad sits on a region of plausible, consistent depth before pressing Fit.
+- **Depth quality bounds fit quality.** DA² and DAP are good but not exact. If the depth wobble around a fixture is large compared to the fixture size, the fitted plane may tilt slightly.
+- **Wide-angle quads.** Quads spanning > 90° of the sphere stress the gnomonic projection and the plane fit; the snap stays orthonormal but width × height accuracy drops at the edges.
 
 ---
 
@@ -380,7 +420,7 @@ scripts/
 ## Limitations & known issues
 
 - **Depth is relative.** DA-2 outputs scale-invariant distance. The scene-scale slider is the user's only mechanism to make it metric. There's no auto-estimation of absolute scale.
-- **Plane fit assumes user's quad is genuinely planar in 3D.** A quad drawn around a curved fixture or a multi-window arrangement will fit a single plane through the average, which may look wrong.
+- **Plane fit assumes the fixture is genuinely planar in 3D.** A quad drawn around a curved fixture (recessed bowl, hanging globe) or a multi-window arrangement that spans separate surfaces will fit a single plane through the average, which may look wrong. The rigid rect-light fit (see [Rigid rect-light fitting](#rigid-rect-light-fitting)) makes the *transform* clean but can't recover geometry the depth estimate doesn't see.
 - **Rectilinear texture works best for small angular extents.** Quads spanning > 90° in any direction will show distortion in the sampled rectangular texture (the bilinear-of-4-corners interpolation deviates from true rectilinear projection for wide quads).
 - **`triton-windows` is required for the xformers fused-attention path.** Without it inference still works, just ~17 % slower.
 - **Windows-only paths.** Forward-slash equivalents would be a small refactor in `da2_runner.py` and the launcher.

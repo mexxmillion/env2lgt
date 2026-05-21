@@ -143,13 +143,21 @@ class MainWindow(QMainWindow):
         # Pending rectangle-sample purpose: "exposure" | "wb" | "probe" | None.
         self._pending_sample: str | None = None
 
-        # ---- OCIO colour management ----
+        # ---- colour management ----
         # Everything internal is the working space (ACEScg). The source EXR is
-        # converted in on load; the bake converts out on write.
-        self._ocio_ok: bool = color.ocio_available()
-        # Default both ends to the resolved working colorspace name (a real
-        # entry in the colorspace combos, not the role alias).
-        _wcs = color.working_colorspace() if self._ocio_ok else ""
+        # input-transformed on load; the bake output-transforms on write. Two
+        # backends provide that: OCIO (config-driven) and a built-in fallback
+        # (sRGB display + ACEScg/sRGB-Linear input transforms). Default to
+        # OCIO when a valid config is present; otherwise the built-in path is
+        # always available.
+        self._ocio_available: bool = color.ocio_available()
+        self._cm_backend: str = "ocio" if self._ocio_available else "builtin"
+        try:
+            color.set_backend(self._cm_backend)
+        except Exception:  # noqa: BLE001
+            color.set_backend("builtin")
+            self._cm_backend = "builtin"
+        _wcs = color.working_colorspace()
         self._input_cs: str = _wcs
         self._output_cs: str = _wcs
         self._ocio_display: str = ""
@@ -189,12 +197,18 @@ class MainWindow(QMainWindow):
         self._worker: BakeWorker | None = None
         self._thread: QThread | None = None
         self._key_preview_on: bool = False
+        # Set True while a "Fit to rect light" press is waiting on a
+        # not-yet-computed depth field. Cleared in _on_depth_ready /
+        # _on_depth_failed; checked there so the fit fires automatically as
+        # soon as depth lands instead of forcing the user to press again.
+        self._pending_fit_to_rect: bool = False
 
         self.viewer = PanoramaViewer(self)
         self.setCentralWidget(self.viewer)
         self.viewer.quad_committed.connect(self._on_quad_committed)
         self.viewer.quad_selected.connect(self._on_quad_selected)
         self.viewer.quad_lock_changed.connect(self._on_quad_lock_changed)
+        self.viewer.quad_fit_changed.connect(self._on_quad_fit_changed)
         self.viewer.add_mode_changed.connect(self._on_add_mode_changed)
         self.viewer.pixel_probed.connect(self._on_pixel_probed)
         self.viewer.probe_left.connect(self._clear_probe)
@@ -271,12 +285,9 @@ class MainWindow(QMainWindow):
         self.exposure_panel.load_correction_requested.connect(
             self._on_load_correction
         )
-        if self._ocio_ok:
-            self.exposure_panel.populate_colorspaces(
-                color.colorspace_names(), self._input_cs, self._output_cs
-            )
-        else:
-            self.exposure_panel.set_colour_management_enabled(False)
+        self.exposure_panel.populate_colorspaces(
+            color.colorspace_names(), self._input_cs, self._output_cs
+        )
         self.panel.delete_quad.connect(self._on_delete_quad)
         self.panel.select_quad.connect(self._on_panel_selected)
         self.panel.rename_quad.connect(self._on_rename_quad)
@@ -284,6 +295,7 @@ class MainWindow(QMainWindow):
         self.panel.lock_toggled.connect(self._on_lock_toggled)
         self.panel.add_quad_requested.connect(self._on_add_quad_requested)
         self.panel.propose_quads_requested.connect(self._on_propose_quads)
+        self.panel.fit_to_rect_requested.connect(self._on_fit_to_rect)
         self.panel.key_preview_changed.connect(self._on_key_preview)
         self.panel.bake_requested.connect(self._on_bake)
         self.panel.preview_requested.connect(self._on_preview)
@@ -487,6 +499,76 @@ class MainWindow(QMainWindow):
         act_uv_both.triggered.connect(lambda: self._launch_usdview("both"))
         m_usdview.addAction(act_uv_both)
 
+        # ---- View / Colour management ----
+        from PySide6.QtGui import QActionGroup
+
+        m_view = self.menuBar().addMenu("&View")
+        m_cm = m_view.addMenu("Colour management")
+        self._cm_group = QActionGroup(self)
+        self._cm_group.setExclusive(True)
+        self._cm_action_ocio = QAction("OCIO ($OCIO config)", self, checkable=True)
+        self._cm_action_ocio.setEnabled(self._ocio_available)
+        if not self._ocio_available:
+            self._cm_action_ocio.setToolTip(
+                "PyOpenColorIO is not installed, or $OCIO is unset / invalid."
+            )
+        self._cm_action_ocio.triggered.connect(lambda: self._set_cm_backend("ocio"))
+        self._cm_group.addAction(self._cm_action_ocio)
+        m_cm.addAction(self._cm_action_ocio)
+        self._cm_action_builtin = QAction(
+            "Built-in (sRGB display, ACEScg working)", self, checkable=True
+        )
+        self._cm_action_builtin.triggered.connect(
+            lambda: self._set_cm_backend("builtin")
+        )
+        self._cm_group.addAction(self._cm_action_builtin)
+        m_cm.addAction(self._cm_action_builtin)
+        (self._cm_action_ocio if self._cm_backend == "ocio"
+         else self._cm_action_builtin).setChecked(True)
+
+    def _set_cm_backend(self, name: str) -> None:
+        """Switch the colour-management backend at runtime. Rebuilds the
+        colorspace + display/view combos against the new backend, resets the
+        active names to the new working space's defaults, and re-runs the
+        input transform on the current HDRI + reference image."""
+        if name == self._cm_backend:
+            return
+        try:
+            color.set_backend(name)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "Colour management", str(e))
+            # Snap the checkmark back to whatever's actually active.
+            (self._cm_action_ocio if self._cm_backend == "ocio"
+             else self._cm_action_builtin).setChecked(True)
+            return
+        self._cm_backend = name
+        wcs = color.working_colorspace()
+        self._input_cs = wcs
+        self._output_cs = wcs
+        self._ref_cs = wcs
+        self.exposure_panel.populate_colorspaces(
+            color.colorspace_names(), self._input_cs, self._output_cs
+        )
+        self.exposure_panel.set_reference_cs(wcs)
+        # Repopulate display/view combos against the new backend.
+        self._display_combo.blockSignals(True)
+        self._display_combo.clear()
+        for d in color.displays():
+            self._display_combo.addItem(d)
+        self._display_combo.setCurrentText(color.default_display())
+        self._ocio_display = self._display_combo.currentText()
+        self._display_combo.blockSignals(False)
+        self._refill_view_combo()
+        # Re-run the input transform under the new backend.
+        if self._hdr_display_src is not None:
+            self._hdr_display = self._to_working_display(self._hdr_display_src)
+        if self._ref_src is not None:
+            self._ref_display = self._reference_to_working(self._ref_src)
+        self._invalidate_display_cache()
+        self._refresh_view()
+        label = "OCIO" if name == "ocio" else "Built-in (sRGB / ACEScg)"
+        self._set_status(f"Colour management: {label}")
+
     def _build_toolbar(self):
         from PySide6.QtWidgets import QPushButton
 
@@ -494,22 +576,22 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
 
-        # OCIO viewport display + view — leftmost (Nuke/Maya-style dropdowns).
-        if self._ocio_ok:
-            tb.addWidget(QLabel(" Display "))
-            self._display_combo = QComboBox()
-            for d in color.displays():
-                self._display_combo.addItem(d)
-            self._display_combo.setCurrentText(color.default_display())
-            self._display_combo.currentTextChanged.connect(self._on_display_changed)
-            tb.addWidget(self._display_combo)
-            self._view_combo = QComboBox()
-            self._view_combo.currentTextChanged.connect(self._on_view_changed)
-            tb.addWidget(self._view_combo)
-            # Seed display/view + the cached processor.
-            self._ocio_display = color.default_display()
-            self._refill_view_combo()
-            tb.addSeparator()
+        # Viewport display + view — leftmost (Nuke/Maya-style dropdowns).
+        # Always shown: the builtin backend exposes "sRGB" / "ACES Filmic"
+        # even when OCIO isn't available.
+        tb.addWidget(QLabel(" Display "))
+        self._display_combo = QComboBox()
+        for d in color.displays():
+            self._display_combo.addItem(d)
+        self._display_combo.setCurrentText(color.default_display())
+        self._display_combo.currentTextChanged.connect(self._on_display_changed)
+        tb.addWidget(self._display_combo)
+        self._view_combo = QComboBox()
+        self._view_combo.currentTextChanged.connect(self._on_view_changed)
+        tb.addWidget(self._view_combo)
+        self._ocio_display = color.default_display()
+        self._refill_view_combo()
+        tb.addSeparator()
 
         tb.addWidget(QLabel(" Exposure "))
         self._view_exp_slider = QSlider(Qt.Orientation.Horizontal)
@@ -844,7 +926,7 @@ class MainWindow(QMainWindow):
 
     def _to_working_display(self, src: np.ndarray) -> np.ndarray:
         """Convert a source-colorspace buffer into the working space."""
-        if not self._ocio_ok or not self._input_cs:
+        if not self._input_cs:
             return np.asarray(src, dtype=np.float32)
         try:
             return color.to_working(src, self._input_cs)
@@ -866,7 +948,7 @@ class MainWindow(QMainWindow):
         display+view transform (or an ACES-filmic fallback), then the
         display-only viewport gamma."""
         scaled = working * (2.0 ** float(exposure))
-        if self._ocio_ok and self._display_cpu is not None:
+        if self._display_cpu is not None:
             u8 = color.display_to_u8(scaled, self._display_cpu)
         else:
             u8 = self._tonemap_hdr_uint8(scaled)
@@ -972,7 +1054,7 @@ class MainWindow(QMainWindow):
         self._rebuild_display_cpu()
 
     def _rebuild_display_cpu(self):
-        if not (self._ocio_ok and self._ocio_display and self._ocio_view):
+        if not (self._ocio_display and self._ocio_view):
             self._display_cpu = None
             return
         try:
@@ -1207,16 +1289,14 @@ class MainWindow(QMainWindow):
     def _builtin_target_working(self) -> np.ndarray:
         """The built-in CC24 reference, converted into the working space."""
         cc = ccheck.CC24_LINEAR_SRGB
-        if self._ocio_ok:
-            try:
-                return color.convert(
-                    cc.reshape(1, 24, 3),
-                    ccheck.CC24_REFERENCE_COLORSPACE,
-                    color.WORKING,
-                ).reshape(24, 3)
-            except Exception:  # noqa: BLE001
-                pass
-        return cc.astype(np.float32)
+        try:
+            return color.convert(
+                cc.reshape(1, 24, 3),
+                ccheck.CC24_REFERENCE_COLORSPACE,
+                color.WORKING,
+            ).reshape(24, 3)
+        except Exception:  # noqa: BLE001
+            return cc.astype(np.float32)
 
     def _current_target_working(self) -> np.ndarray | None:
         """The active match target (24,3) in the working space, or None if it
@@ -1254,11 +1334,10 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Load target", str(e))
             return
-        if self._ocio_ok:
-            try:
-                sw = color.convert(sw.reshape(1, 24, 3), cs, color.WORKING).reshape(24, 3)
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            sw = color.convert(sw.reshape(1, 24, 3), cs, color.WORKING).reshape(24, 3)
+        except Exception:  # noqa: BLE001
+            pass
         self._cc_target_swatches = sw.astype(np.float32)
         self._cc_target_mode = "json"
         self._cc_target_name = name
@@ -1316,7 +1395,7 @@ class MainWindow(QMainWindow):
     def _reference_to_working(self, src: np.ndarray) -> np.ndarray:
         """Convert the source-encoded reference into the working space using
         the colorspace currently chosen on the panel."""
-        if not self._ocio_ok or not self._ref_cs:
+        if not self._ref_cs:
             return np.asarray(src, dtype=np.float32)
         try:
             return color.to_working(src, self._ref_cs)
@@ -1513,19 +1592,31 @@ class MainWindow(QMainWindow):
         # Invalidate any HDR cache so the next refresh picks up depth.
         self._display_cache = None
         self._cache_key = None
-        self._view_mode = "depth"
+        # Only flip the visible view to depth if the user pressed "Show depth".
+        # When this run was kicked off implicitly by "Fit to rect light",
+        # the user's still looking at the HDR — don't yank them into depth view.
+        switching_to_depth = self._depth_btn.isChecked()
+        if switching_to_depth:
+            self._view_mode = "depth"
+            self._depth_btn.setText("Show HDR")
         self._depth_btn.setEnabled(True)
-        self._depth_btn.setText("Show HDR")
         self._set_status(
             f"Depth ready  ·  range [{distance.min():.3f}, {distance.max():.3f}] (DA-2 scale-invariant)"
         )
         self._refresh_view()
+        # Run the deferred fit if the user pressed the rect-fit button while
+        # depth was still computing.
+        if self._pending_fit_to_rect:
+            self._pending_fit_to_rect = False
+            self._on_fit_to_rect()
 
     def _on_depth_failed(self, msg: str):
         self._distance = None
         self._depth_btn.setEnabled(True)
         self._depth_btn.setChecked(False)
         self._depth_btn.setText("Show depth")
+        # Drop any deferred fit — without depth, the snap can't run.
+        self._pending_fit_to_rect = False
         QMessageBox.critical(self, "Depth failed", msg)
 
     # ---------- quad lifecycle ----------
@@ -1618,6 +1709,109 @@ class MainWindow(QMainWindow):
         if locked:
             msg += f"  ·  kept {len(locked)} locked"
         self._set_status(msg)
+
+    def _on_fit_to_rect(self):
+        """Depth-snap every unfitted quad to a rigid rectangle on its surface.
+
+        The user draws / drags 4 free corners; this button takes them, projects
+        each onto the light's surface plane (estimated by depth — bright-region
+        plane fit when there's clear contrast, per-corner depths otherwise),
+        and snaps to a rectangle with orthogonal axes via diagonal-bisector.
+        What the user sees on the panorama becomes what the bake authors —
+        no more "looks right in the viewer, ships sheared in USD".
+
+        Depth is computed lazily: the first press kicks off the depth backend
+        (10–30 s for DA-2 / DAP) and defers the fit via `_pending_fit_to_rect`;
+        subsequent presses are instant. A vertex drag flips
+        `LightQuad.is_rect_fitted` back to False, and the next press fits only
+        those that need it. Locked quads are still fitted — locking governs
+        auto-detect replacement, not whether the rect is rigid.
+        """
+        if self._hdr is None or self._exr_path is None:
+            QMessageBox.information(self, "Fit to rect", "Open an EXR first.")
+            return
+        quads = self.viewer.quads()
+        pending = [q for q in quads if not q.is_rect_fitted]
+        if not pending:
+            self._set_status("All quads already fitted to rigid rects.")
+            return
+
+        # Need depth — kick off the backend if it's not already loaded.
+        if self._distance is None:
+            if self._depth_thread is not None and self._depth_thread.isRunning():
+                # Already running (probably triggered by "Show depth"); just
+                # mark our intent and let _on_depth_ready pick it up.
+                self._pending_fit_to_rect = True
+                self._set_status("Waiting for depth to finish before fitting…")
+                return
+            self._pending_fit_to_rect = True
+            cache_dir = self._exr_path.parent / ".env2lgt_cache"
+            self._depth_thread = QThread(self)
+            self._depth_worker = DepthWorker(
+                str(self._exr_path), str(cache_dir), self._depth_backend
+            )
+            self._depth_worker.moveToThread(self._depth_thread)
+            self._depth_thread.started.connect(self._depth_worker.run)
+            self._depth_worker.finished.connect(self._on_depth_ready)
+            self._depth_worker.failed.connect(self._on_depth_failed)
+            self._depth_worker.finished.connect(self._depth_thread.quit)
+            self._depth_worker.failed.connect(self._depth_thread.quit)
+            self._depth_thread.finished.connect(self._depth_worker.deleteLater)
+            self._depth_thread.finished.connect(self._depth_thread.deleteLater)
+            self._set_status(
+                f"Estimating depth ({self._depth_backend.upper()}) for rect fit…"
+            )
+            self._depth_thread.start()
+            return
+
+        # Depth ready — do the fit now.
+        self._fit_unfitted_quads(pending)
+
+    def _fit_unfitted_quads(self, quads: list[LightQuad]) -> None:
+        """Run rect_from_quad + rect_to_corner_dirs on each pending quad and
+        push the snapped corners back to the viewer + panel. Same algorithm
+        as the bake, so the displayed result matches the authored RectLight."""
+        from env2lgt.lights.extract import (
+            luminance, rect_from_quad, rect_to_corner_dirs,
+        )
+        from env2lgt.proj import rasterize_spherical_quad
+
+        H, W = self._hdr.shape[:2]
+        # Apply the same baseline adjustments the bake uses, so the bright-
+        # region plane fit sees the same luminance the bake will.
+        hdr = self._adjusted_working(self._hdr)
+        # Depth shape might not match the HDR (DA-2 runs at a different res);
+        # resize to align with the mask before sampling.
+        distance = self._distance
+        if distance.shape != (H, W):
+            distance = cv2.resize(distance, (W, H), interpolation=cv2.INTER_LINEAR)
+        lum_full = luminance(hdr)
+
+        fitted = 0
+        for q in quads:
+            mask, _ = rasterize_spherical_quad(q.corners_dirs, H, W)
+            if not mask.any():
+                continue
+            fit = rect_from_quad(
+                q.corners_dirs,
+                mask,
+                distance,
+                self._scene_scale,
+                lum_full=lum_full,
+                treat_as_window=q.is_window,
+            )
+            new_corners = rect_to_corner_dirs(fit)
+            # Push the snapped corners + fitted flag through the viewer
+            # (single setter handles geometry + outline + handle refresh).
+            self.viewer.set_quad_fitted(q.name, True, new_corners=new_corners)
+            self.panel.set_quad_fitted(q.name, True)
+            fitted += 1
+        self._set_status(f"Fit {fitted} quad(s) to rigid rect.")
+
+    def _on_quad_fit_changed(self, name: str, fitted: bool) -> None:
+        """Viewer auto-invalidated the rect-fit (e.g. user dragged a corner).
+        Mirror the new state onto the panel row so the ✓ disappears."""
+        self.panel.set_quad_fitted(name, fitted)
 
     def _on_add_quad_requested(self):
         if self._hdr is None:
@@ -1790,30 +1984,32 @@ class MainWindow(QMainWindow):
         self.exposure_panel.set_exposure_offset(self._exposure_offset)
         self.exposure_panel.set_wb(self._wb_kelvin, self._wb_tint)
         self._recompute_wb()
-        # OCIO colour management.
-        if self._ocio_ok:
-            if proj.scene.input_colorspace:
-                self._input_cs = proj.scene.input_colorspace
-            if proj.scene.output_colorspace:
-                self._output_cs = proj.scene.output_colorspace
-            self.exposure_panel.populate_colorspaces(
-                color.colorspace_names(), self._input_cs, self._output_cs
-            )
-            self._hdr_display = self._to_working_display(self._hdr_display_src)
-            disp = proj.scene.ocio_display
-            view = proj.scene.ocio_view
-            if disp and disp in color.displays():
-                self._display_combo.blockSignals(True)
-                self._display_combo.setCurrentText(disp)
-                self._display_combo.blockSignals(False)
-                self._ocio_display = disp
-                self._refill_view_combo()
-                if view and view in color.views(disp):
-                    self._view_combo.blockSignals(True)
-                    self._view_combo.setCurrentText(view)
-                    self._view_combo.blockSignals(False)
-                    self._ocio_view = view
-                    self._rebuild_display_cpu()
+        # Colour management. Unknown colorspace names from a project authored
+        # against a different backend are tolerated — the combos only accept
+        # names that exist in the active backend, and conversion functions
+        # treat unknown names as identity.
+        if proj.scene.input_colorspace:
+            self._input_cs = proj.scene.input_colorspace
+        if proj.scene.output_colorspace:
+            self._output_cs = proj.scene.output_colorspace
+        self.exposure_panel.populate_colorspaces(
+            color.colorspace_names(), self._input_cs, self._output_cs
+        )
+        self._hdr_display = self._to_working_display(self._hdr_display_src)
+        disp = proj.scene.ocio_display
+        view = proj.scene.ocio_view
+        if disp and disp in color.displays():
+            self._display_combo.blockSignals(True)
+            self._display_combo.setCurrentText(disp)
+            self._display_combo.blockSignals(False)
+            self._ocio_display = disp
+            self._refill_view_combo()
+            if view and view in color.views(disp):
+                self._view_combo.blockSignals(True)
+                self._view_combo.setCurrentText(view)
+                self._view_combo.blockSignals(False)
+                self._ocio_view = view
+                self._rebuild_display_cpu()
         # Colour-checker chart + solved correction.
         cc = proj.colorchecker
         if cc.corners_dirs:

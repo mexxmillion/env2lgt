@@ -29,6 +29,7 @@ from env2lgt.ui.viewer import LightQuad
 # Item-data roles used on the quad-list rows.
 _ROLE_NAME = 0x0100   # canonical name (tracks renames)
 _ROLE_LOCK = 0x0101   # last-seen lock check-state (distinguishes lock vs rename)
+_ROLE_FITTED = 0x0102 # rigid-rect fit state, used to re-apply the ✓ on rename
 
 # Default auto-detect parameters — the single source of truth, used both to
 # initialise the spinboxes and to restore them via the Reset button.
@@ -74,6 +75,7 @@ class LightPanel(QWidget):
     lock_toggled = Signal(str, bool)    # quad name, locked
     add_quad_requested = Signal()
     propose_quads_requested = Signal(dict)  # auto-detect params
+    fit_to_rect_requested = Signal()        # depth-snap all unfitted quads
     key_preview_changed = Signal(bool)      # show/update the key-mask preview
     bake_requested = Signal(dict)
     preview_requested = Signal()
@@ -104,6 +106,21 @@ class LightPanel(QWidget):
         lb.addWidget(del_btn)
 
         lb.addWidget(self._build_autodetect_group())
+
+        # "Fit to rect light" — depth-snaps every unfitted quad to a rigid
+        # rectangle on its surface plane. See app._on_fit_to_rect for the
+        # algorithm; the list shows a ✓ next to fitted quads, and any handle
+        # drag drops the ✓ so the user knows a re-fit is needed.
+        self._fit_btn = QPushButton("Fit to rect light  (depth-snap)")
+        self._fit_btn.setToolTip(
+            "Project each quad onto its surface plane (computed from the depth "
+            "estimate) and snap it to a true rectangle — orthogonal axes, no "
+            "shear. What you see becomes what the bake authors. First press "
+            "may pause while depth is estimated; subsequent presses are instant. "
+            "Dragging a corner invalidates the fit; press again to refresh."
+        )
+        self._fit_btn.clicked.connect(self.fit_to_rect_requested)
+        lb.addWidget(self._fit_btn)
 
         # Per-quad window/portal flag — applies to the selected quad.
         self._sel_name = ""
@@ -393,8 +410,10 @@ class LightPanel(QWidget):
 
     def add_quad(self, q: LightQuad) -> None:
         self._suppress_item_changed = True
-        item = QListWidgetItem(q.name)
+        fitted = bool(getattr(q, "is_rect_fitted", False))
+        item = QListWidgetItem(self._row_label(q.name, fitted))
         item.setData(_ROLE_NAME, q.name)  # canonical name, used to track renames
+        item.setData(_ROLE_FITTED, fitted)
         item.setFlags(
             item.flags()
             | Qt.ItemFlag.ItemIsEditable
@@ -406,6 +425,26 @@ class LightPanel(QWidget):
         item.setData(_ROLE_LOCK, state)
         item.setToolTip("Checkbox = lock. Locked quads survive 'Propose quads'.")
         self._list.addItem(item)
+        self._suppress_item_changed = False
+
+    @staticmethod
+    def _row_label(name: str, fitted: bool) -> str:
+        """List-row label. A leading ✓ marks quads whose corners have been
+        depth-snapped to a rigid rectangle (see app._on_fit_to_rect). The ✓
+        falls off automatically the next time any vertex is dragged. The
+        canonical name lives in _ROLE_NAME — the ✓ is purely decoration and
+        is stripped on edit (`sanitize_name` ignores non-ASCII anyway)."""
+        return f"✓ {name}" if fitted else name
+
+    def set_quad_fitted(self, name: str, fitted: bool) -> None:
+        """Reflect a rect-fitted state change onto the row's display label."""
+        self._suppress_item_changed = True
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if it.data(_ROLE_NAME) == name:
+                it.setData(_ROLE_FITTED, bool(fitted))
+                it.setText(self._row_label(name, bool(fitted)))
+                break
         self._suppress_item_changed = False
 
     def set_quad_locked(self, name: str, locked: bool) -> None:
@@ -423,12 +462,14 @@ class LightPanel(QWidget):
 
     def rename(self, old_name: str, new_name: str) -> None:
         """Update the row that owns `old_name` to display `new_name`. Called
-        by the app after MainWindow propagates the rename to the viewer."""
+        by the app after MainWindow propagates the rename to the viewer.
+        Preserves the rect-fitted ✓ prefix by reading _ROLE_FITTED."""
         self._suppress_item_changed = True
         for i in range(self._list.count()):
             it = self._list.item(i)
             if it.data(_ROLE_NAME) == old_name:
-                it.setText(new_name)
+                fitted = bool(it.data(_ROLE_FITTED))
+                it.setText(self._row_label(new_name, fitted))
                 it.setData(_ROLE_NAME, new_name)
                 break
         self._suppress_item_changed = False
@@ -487,17 +528,19 @@ class LightPanel(QWidget):
         old_name = item.data(_ROLE_NAME) or ""
         typed = item.text()
         new_name = sanitize_name(typed)
+        fitted = bool(item.data(_ROLE_FITTED))
         if not new_name or new_name == old_name:
-            # Empty after sanitize, or no real change — revert visually.
+            # Empty after sanitize, or no real change — revert visually (and
+            # re-apply the ✓ prefix that sanitize would have stripped).
             self._suppress_item_changed = True
-            item.setText(old_name)
+            item.setText(self._row_label(old_name, fitted))
             self._suppress_item_changed = False
             return
         # If sanitization changed what the user typed, reflect the cleaned
-        # value in the list immediately so they can see what's being stored.
+        # value (with the ✓ if applicable) so the row shows what's stored.
         if new_name != typed:
             self._suppress_item_changed = True
-            item.setText(new_name)
+            item.setText(self._row_label(new_name, fitted))
             self._suppress_item_changed = False
         # The app calls back to rename() with the final accepted name (might
         # get a `_2` suffix on collision).
