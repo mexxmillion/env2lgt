@@ -53,6 +53,24 @@ https://github.com/mexxmillion/env2lgt/raw/main/docs/demo.mp4
 
 ---
 
+## Renderer portability — the same scene.usda everywhere
+
+Because the bake is plain OpenUSD on top of `UsdLuxDomeLight` + `UsdLuxRectLight` + `UsdGeomMesh`, the exported `scene.usda` opens identically in every USD-aware DCC and renderer. No plugin, no conversion step, no FBX detour.
+
+| `usdview` (reference Hydra/Storm) | Houdini Solaris — scene graph |
+|---|---|
+| ![scene.usda loaded in usdview](docs/render_usdview.png) | ![scene.usda loaded into Houdini's USD scene graph](docs/render_houdini_scenegraph.png) |
+| *The composed `scene.usda` opened in `usdview`: `/World/geo/panorama` (depth mesh), `/World/lights/dome` (DomeLight + dome.exr), plus the N RectLights with their per-light textures. Reference path everyone tests against.* | *Same file imported into Houdini Solaris via a `Reference` LOP — Houdini sees the prim hierarchy exactly as authored: one `Scope` for geo, one for lights, one `DomeLight` + 20× `RectLight`. No munging.* |
+
+| Houdini viewport (left) + Karma render (right) |
+|---|
+| ![Houdini GL wireframe + Karma render of the same env2lgt bake](docs/render_houdini_karma.png) |
+| *Same bake, two views in Houdini Solaris. Left: GL viewport showing the depth-displaced panorama mesh — the inside-out geometry that places lights at their world-space distances. Right: Karma render with the dome light + 20× rect lights lit by the per-light textures. The cathedral lighting in the Karma frame is all coming out of `scene.usda` — no manual relighting was done in Houdini.* |
+
+The same pattern works in Maya / Arnold, Katana / RenderMan, V-Ray, Redshift, Blender (via the USD hydra-storm bridge), Unreal Engine, and NVIDIA Omniverse — every USD consumer reads a `UsdLuxRectLight` the same way, and the rigid-rect-fit step ([below](#rigid-rect-light-fitting)) ensures the lights land in the same place regardless of which renderer's TRS decomposition gets to it.
+
+---
+
 ## What it does
 
 VFX lighting work often starts with an HDRI captured on set or generated from a CG scene. To use those panoramas as **practical lighting** in a render — i.e., lights that actually exist in 3D space and cast shadows correctly — you need three things:
