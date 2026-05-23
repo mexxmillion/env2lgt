@@ -4,13 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "env2lgt"
-version = "0.0.1"
-description = "Convert HDRI latlong panoramas into USD light rigs (rect area lights + dome + depth mesh) using DA-2 panorama depth estimation"
+version = "0.1.0"
+description = "Convert HDRI latlong panoramas into USD light rigs (rect area lights + dome + depth mesh) with panorama-aware depth estimation, OCIO colour management, and CC24 / region-pair / NLE-style auto colour matching against a reference image."
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{ name = "mexxmillion" }]
+authors = [
+    { name = "Maung Maung Hla Win", email = "mexxmillion@gmail.com" },
+]
+maintainers = [
+    { name = "Maung Maung Hla Win", email = "mexxmillion@gmail.com" },
+]
 license = { text = "Apache-2.0" }
-keywords = ["vfx", "hdri", "usd", "openusd", "lighting", "panorama", "depth-estimation"]
+keywords = [
+    "vfx", "hdri", "usd", "openusd", "lighting", "panorama",
+    "depth-estimation", "colour-matching", "color-matching", "ocio", "aces",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: Apache Software License",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Topic :: Multimedia :: Graphics :: 3D Rendering",
+]
 
 # Runtime deps for the UI/USD/EXR side only. DA-2 lives in a sibling conda env
 # (env2lgt-da2) and is invoked via subprocess from env2lgt.depth.da2_runner.
@@ -25,6 +43,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.urls]
+Homepage = "https://github.com/mexxmillion/env2lgt"
+Source = "https://github.com/mexxmillion/env2lgt"
+Issues = "https://github.com/mexxmillion/env2lgt/issues"
 
 [project.scripts]
 env2lgt = "env2lgt.app:main"

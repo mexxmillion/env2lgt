@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """env2lgt — PySide6 application entry point.
 
 Single-view UX: equirect panorama. Add a quad by clicking 4 corners (cursor in

@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Exposure + white-balance metering for the HDRI baseline.
 
 These adjustments shift the HDRI's baseline exposure (in stops) and white

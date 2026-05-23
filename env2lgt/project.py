@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """env2lgt project file format (*.env2lgt.json).
 
 A project file captures everything the user has done in a session — the

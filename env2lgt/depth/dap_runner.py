@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """DAP depth backend — persistent inference daemon.
 
 DAP ([Insta360-Research-Team/DAP](https://github.com/Insta360-Research-Team/DAP),

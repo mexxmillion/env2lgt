@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """End-to-end bake: latlong EXR + LightQuads -> USD light rig + textures."""
 
 from __future__ import annotations

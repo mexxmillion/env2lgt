@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Light extraction stubs (milestones 4–5).
 
 These will be filled out after the viewer + DA² subprocess pipeline lands.

@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Central dark theme for env2lgt — a single QSS stylesheet + palette.
 
 VFX pipeline tools (Nuke, Mari, Katana, Houdini) share a flat, low-contrast

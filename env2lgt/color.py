@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Colour management.
 
 env2lgt always works internally in ACEScg linear. Source EXRs are input-

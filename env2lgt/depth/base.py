@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Depth-backend protocol.
 
 env2lgt estimates per-pixel depth from a latlong HDRI to place rect lights

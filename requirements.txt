@@ -8,6 +8,10 @@
 # Colour management uses PyOpenColorIO (from the conda `opencolorio` package)
 # and needs the OCIO env var pointing at a config.ocio — see README.md.
 #
+# The Regions / Auto colour-match solvers and the reference-image loader use
+# numpy + OpenCV / OpenImageIO (all already required for the existing
+# pipeline) — no extra pip deps needed.
+#
 # Tested with Python 3.11.
 
 numpy>=1.26

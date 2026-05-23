@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Depth-backend registry.
 
 Pick a backend by name (``da2`` | ``dap``) or fall back to the

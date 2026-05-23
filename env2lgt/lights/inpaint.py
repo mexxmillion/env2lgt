@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Dome residual: zero the rect mask regions in the panorama, fill the holes
 with a smooth gradient extending from valid neighbors. Equivalent to Nuke's
 EdgeExtend / Mocha's PushPull — way more stable on HDR than cv2 TELEA, which

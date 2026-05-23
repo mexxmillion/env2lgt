@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """EXR I/O using OpenImageIO.
 
 OIIO is preferred over the pip `OpenEXR` wrapper because it handles arbitrary

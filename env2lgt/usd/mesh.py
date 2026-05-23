@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Depth-displaced UV-sphere mesh for panorama-as-geometry validation.
 
 Each vertex of a latlong sphere is moved radially by the DA-2 distance at its

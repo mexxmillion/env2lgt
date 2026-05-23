@@ -1,8 +1,14 @@
 # env2lgt
 
-**Convert a single equirectangular HDRI into a physically-positioned USD light rig.**
+**Convert a single equirectangular HDRI into a physically-positioned USD light rig — with full OCIO colour management and three modes of reference-image colour matching.**
 
 Built for VFX lighting pipelines: take an HDRI latlong EXR, mark the practical lights with 4 clicks each, and bake out a USD scene containing a `UsdLuxDomeLight` for the environment, one `UsdLuxRectLight` per marked light positioned in world space via monocular panorama depth (DA² or DAP — see [Depth backends](#depth-backends)), and a depth-displaced `UsdGeomMesh` of the scene for validation. Drop the result into Karma, RenderMan, Storm, or any other USD-aware renderer.
+
+Colour calibration against a reference photo is first-class: pick a 24-patch X-Rite **Chart**, drop paired **Region** sample rectangles on the HDR and the reference, or hit **Auto** for an NLE-style whole-image match. Every correction bakes into the exported textures so the rig ships colour-accurate.
+
+> Released under **Apache-2.0** in good faith for the wider VFX community.
+> Author / maintainer: **Maung Maung Hla Win** &lt;mexxmillion@gmail.com&gt;.
+> If this tool helps your work, attribution is appreciated.
 
 ![env2lgt GUI](docs/gui_preview.png)
 
@@ -30,7 +36,10 @@ https://github.com/mexxmillion/env2lgt/raw/main/docs/demo.mp4
 - **Auto-detect lights** — One pass thresholds the panorama's bright sources into proposed quads — seam-aware, with angular merging of clustered fixtures and a tunable settings window. Detected quads are fit in a tangent-plane projection so their corners hug a fixture's true edges. Hand-placement (4 clicks + draggable corner handles) is always available too.
 - **Dome light with Gaussian fill** — The environment is preserved as a `UsdLuxDomeLight`. The regions taken by the extracted area lights are cut out and seamlessly closed by an iterative, HDR-safe Gaussian edge-extend (Nuke `EdgeExtend`-style) — no dark holes, no rainbow inpaint artefacts.
 - **OCIO display & ACEScg colour pipeline** — Everything is processed in a scene-linear ACEScg working space, with OCIO input/output transforms on the source and baked EXRs and a Nuke/Maya-style display + view transform for the viewport.
-- **Colour-checker calibration with reference target** — Place a 24-patch ColorChecker and solve an exposure / white-balance / full 3×3 correction against the built-in CC24, a JSON target, or a reference photo. The correction bakes into the rig — and saves to JSON so it can be reloaded to batch-match a whole shoot.
+- **Reference-image colour matching, three ways:**
+  - **Chart** — place a 24-patch ColorChecker quad on the HDR and solve an exposure / white-balance / full 3×3 correction against the built-in CC24, a JSON target, or a chart placed on a loaded reference photo. Saves to JSON for batch-matching a whole shoot.
+  - **Regions** — drop persistent paired sample rectangles on the HDR and the reference photo (drag corners + centre `+` handle, named outliner row, per-pair RMSE). Solver fits per-channel **gain** or **gain + gamma** in log-space, with an automatic fall-back to gain-only when the gamma fit is underdetermined.
+  - **Auto** — NLE-style "match colour" with no manual picking. Per-channel match using percentile anchors with 99th-percentile clipping so suns and lamps in the HDR don't poison the gains.
 - **Auto exposure via dome integration** — A light-integration meter "convolves the dome": it renders a cosine-weighted Lambertian grey ball lit by the entire panorama and back-solves a baseline exposure + white balance from it. Spot-metering a dragged rectangle is also available.
 - **Multiple depth backends** — Two panorama depth models behind one interface: **DAP** — Depth Any Panorama (metric, the default) — and **DA²** — Depth Anything in Any Direction (scale-invariant). Switch per-bake from the toolbar.
 - **Display helpers** — Viewport display exposure, gamma, a Nuke-style pixel + area-average colour probe, and a turbo-mapped depth preview. All display-only — none of it touches the bake.
@@ -459,6 +468,19 @@ for the full text. This is the same license OpenUSD ships under, so the two
 compose cleanly. You can use, modify, and redistribute the code, including
 in commercial / closed-source pipelines, as long as you keep the copyright
 and license notice.
+
+### Author & attribution
+
+env2lgt is written and maintained by **Maung Maung Hla Win**
+(`mexxmillion@gmail.com`). It's released in good faith for the wider VFX
+community — if you use it, ship something with it, or fork it for your
+studio's pipeline, I'd appreciate keeping the author credit visible (the
+SPDX header at the top of every source file, and / or a line in your
+project credits). It helps future opportunities find me.
+
+Pull requests welcome. For bugs, design suggestions, or pipeline
+integration questions, open an issue at
+[github.com/mexxmillion/env2lgt](https://github.com/mexxmillion/env2lgt/issues).
 
 Third-party components retain their own licenses:
 

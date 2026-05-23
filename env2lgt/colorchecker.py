@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Colour-checker chart sampling + least-squares colour matching.
 
 The user places a 4-corner quad over a 24-patch colour chart (X-Rite

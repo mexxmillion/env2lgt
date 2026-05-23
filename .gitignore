@@ -55,3 +55,4 @@ Thumbs.db
 
 # --- not in scope but generated ---
 *.log
+.claude/

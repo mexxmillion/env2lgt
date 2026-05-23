@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """DA-2 depth backend — persistent inference daemon.
 
 DA-2 inference itself is ~150ms on a 3090, but starting a fresh Python +

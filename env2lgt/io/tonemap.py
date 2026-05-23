@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """HDR -> 8-bit display conversion for the viewer.
 
 This is for *display only* — the underlying float buffer is never modified.

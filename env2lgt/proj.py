@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Projection math: sphere <-> equirect <-> rectilinear.
 
 Single source of truth for the geometry. All other modules import from here.

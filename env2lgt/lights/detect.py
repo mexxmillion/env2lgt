@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Auto-detect candidate light quads from a latlong HDR panorama.
 
 Pipeline (matches the UI's "Auto-detect lights" panel):

@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Maung Maung Hla Win <mexxmillion@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
 """Exposure-mode side panel: baseline exposure offset + white balance.
 
 These adjustments shift the HDRI itself (not just the viewport) and are baked
