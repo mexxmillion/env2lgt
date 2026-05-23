@@ -12,6 +12,74 @@ import cv2
 import numpy as np
 
 
+def grow_mask_by_luminance(
+    hdr: np.ndarray,
+    mask: np.ndarray,
+    *,
+    max_radius_px: int = 32,
+    bright_factor: float = 4.0,
+) -> np.ndarray:
+    """Expand a binary mask outward to swallow the bright halo around small
+    sources (camera PSF / glow bleed). Without this, tiny bulbs in a high-res
+    pano leak hot pixels past the geometric quad edge → those pixels survive
+    the dome inpaint and double-light the scene.
+
+    Algorithm, per masked region:
+      1. Find the mask's bounding box and extract a local crop with a
+         `max_radius_px` margin.
+      2. Background luminance = median of the *unmasked* pixels in the crop —
+         the "what the dome should be here" reference.
+      3. Iteratively dilate the local mask one pixel at a time. After each
+         step, only keep newly-touched pixels whose luminance is at least
+         `bright_factor` × background. Stop when no new pixels qualify or
+         we've grown `max_radius_px` steps.
+
+    The result is unioned back into the global mask. Cost is bounded by the
+    bounding boxes (small per-quad regions, not the whole pano).
+    """
+    if not mask.any():
+        return mask
+    H, W = mask.shape[:2]
+    out = mask.copy()
+    lum = (0.2126 * hdr[..., 0] + 0.7152 * hdr[..., 1] + 0.0722 * hdr[..., 2]).astype(
+        np.float32
+    )
+
+    # Find connected components of the input mask so each bright source grows
+    # against its own local background, not the median of the whole pano.
+    num, labels = cv2.connectedComponents((mask > 0).astype(np.uint8))
+    pad = int(max_radius_px) + 2
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    for cid in range(1, num):
+        ys, xs = np.where(labels == cid)
+        if ys.size == 0:
+            continue
+        y0 = max(0, int(ys.min()) - pad)
+        y1 = min(H, int(ys.max()) + pad + 1)
+        x0 = max(0, int(xs.min()) - pad)
+        x1 = min(W, int(xs.max()) + pad + 1)
+        local_lum = lum[y0:y1, x0:x1]
+        local_mask = (labels[y0:y1, x0:x1] == cid).astype(np.uint8)
+        outside = local_lum[local_mask == 0]
+        if outside.size == 0:
+            continue
+        bg_med = float(np.median(outside))
+        threshold = bg_med * float(bright_factor) + 1e-6
+        prev = local_mask.copy()
+        for _ in range(int(max_radius_px)):
+            grown = cv2.dilate(local_mask, kernel)
+            new_pixels = (grown > 0) & (local_mask == 0)
+            keep = new_pixels & (local_lum > threshold)
+            if not keep.any():
+                break
+            local_mask = local_mask | keep.astype(np.uint8)
+            if np.array_equal(local_mask, prev):
+                break
+            prev = local_mask.copy()
+        out[y0:y1, x0:x1] = np.where(local_mask > 0, 255, out[y0:y1, x0:x1])
+    return out
+
+
 def build_mask(shape: tuple[int, int], rects: list[tuple[int, int, int, int]], dilate_px: int = 4) -> np.ndarray:
     """(Legacy axis-aligned-bbox mask builder. New pipeline uses
     `rasterize_spherical_quad` from env2lgt.proj for arbitrary quad shapes.)

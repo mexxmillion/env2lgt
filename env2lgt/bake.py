@@ -19,7 +19,7 @@ from env2lgt.lights.extract import (
     sample_rect_texture,
     total_emitted_power_masked,
 )
-from env2lgt.lights.inpaint import edge_extend
+from env2lgt.lights.inpaint import edge_extend, grow_mask_by_luminance
 from env2lgt.proj import rasterize_spherical_quad
 from env2lgt.usd.lightrig import RectLightSpec, write_light_rig
 from env2lgt.usd.mesh import write_panorama_mesh
@@ -50,9 +50,17 @@ class BakeOptions:
     depth_backend: str = "da2"
     scene_scale: float = 1.0
     intensity_normalization: float = 1.0
-    mask_dilate_px: int = 4
+    mask_dilate_px: int = 8
     inpaint_radius: int = 6
     inpaint_feather_px: int = 8
+    # Luminance-aware mask grow: after the geometric dilation, expand the
+    # mask outward into any pixel still brighter than `mask_grow_factor` ×
+    # local background luminance, up to `mask_grow_max_px` further pixels.
+    # Catches the glow/halo bleed around small bulbs that the camera PSF
+    # smears past the visible bulb edge — without it those hot pixels leak
+    # through the dome inpaint and double-light the scene. 0 disables.
+    mask_grow_max_px: int = 32
+    mask_grow_factor: float = 4.0
     # Display-only metadata recorded in masks.json. The bake itself doesn't use
     # this — quad corners are absolute.
     yaw_offset_deg: float = 0.0
@@ -246,6 +254,16 @@ def bake(
             combined = np.zeros((H, W), dtype=np.uint8)
             for m in rasterized_masks:
                 combined |= m
+            # Halo / PSF bleed catcher — expand the mask outward into any
+            # neighbouring pixel still much brighter than the local
+            # background. Cheap (per-component bbox crops) and only kicks in
+            # where there actually is bleed; flat-cropped quads grow by 0.
+            if opts.mask_grow_max_px > 0:
+                combined = grow_mask_by_luminance(
+                    hdr, combined,
+                    max_radius_px=opts.mask_grow_max_px,
+                    bright_factor=opts.mask_grow_factor,
+                )
             dome_hdr = edge_extend(
                 hdr,
                 combined,
