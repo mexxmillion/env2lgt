@@ -55,12 +55,32 @@ class SceneState:
 
 
 @dataclass
+class RegionPairState:
+    """One paired ROI used by the regions calibration mode. Rects are stored
+    as normalized [u0, v0, u1, v1] in their respective image space (HDRI =
+    equirect UV; ref = flat-image UV). Empty list = slot not drawn yet."""
+    hdri_uv: list = field(default_factory=list)
+    ref_uv: list = field(default_factory=list)
+
+
+@dataclass
 class ColorCheckerState:
-    """Persisted colour-checker chart placement + solved correction."""
+    """Persisted colour-checker chart placement + solved correction.
+
+    Two calibration sub-modes share this block:
+      mode="chart"   — `corners_dirs` (HDRI chart quad) + 3x3 `matrix`.
+      mode="regions" — `region_pairs` + per-channel `gains`/`gammas`.
+    """
     corners_dirs: list = field(default_factory=list)  # 4x3 dirs, [] if none
     matrix: list = field(default_factory=list)         # 3x3, [] if unsolved
     fit_mode: str = "matrix"
     target_name: str = "Built-in CC24"
+    # Regions sub-mode.
+    mode: str = "chart"                                # "chart" | "regions"
+    region_pairs: list = field(default_factory=list)   # list[RegionPairState-as-dict]
+    region_fit: str = "gain"                            # "gain" | "gain_gamma"
+    gains: list = field(default_factory=list)          # 3 floats or empty
+    gammas: list = field(default_factory=list)         # 3 floats or empty
 
 
 @dataclass
@@ -78,7 +98,8 @@ class ExportState:
     # Depth-mesh radial inflation, as a percentage (UI surfaces it as a %).
     geom_inflation_pct: float = 2.5
     # Drop the depth mesh's far/sky faces (open-sky, for outdoor scenes).
-    open_sky: bool = True
+    # Off by default; enable for outdoor scenes.
+    open_sky: bool = False
 
 
 @dataclass
@@ -199,6 +220,18 @@ def project_from_app_state(
             matrix=[[float(c) for c in row] for row in cc.get("matrix", [])],
             fit_mode=str(cc.get("fit_mode", "matrix")),
             target_name=str(cc.get("target_name", "Built-in CC24")),
+            mode=str(cc.get("mode", "chart")),
+            region_pairs=[
+                {
+                    "name": str(p.get("name") or f"Region {i + 1}"),
+                    "hdri_uv": [float(v) for v in p.get("hdri_uv", [])],
+                    "ref_uv": [float(v) for v in p.get("ref_uv", [])],
+                }
+                for i, p in enumerate(cc.get("region_pairs", []))
+            ],
+            region_fit=str(cc.get("region_fit", "gain")),
+            gains=[float(v) for v in cc.get("gains", [])],
+            gammas=[float(v) for v in cc.get("gammas", [])],
         ),
         quads=[
             QuadState(
@@ -219,6 +252,6 @@ def project_from_app_state(
             masks=bool(e.get("masks", True)),
             output_dir=str(e.get("output_dir", "")),
             geom_inflation_pct=float(e.get("geom_inflation_pct", 2.5)),
-            open_sky=bool(e.get("open_sky", True)),
+            open_sky=bool(e.get("open_sky", False)),
         ),
     )

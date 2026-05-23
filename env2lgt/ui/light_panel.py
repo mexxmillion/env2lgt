@@ -35,7 +35,7 @@ _ROLE_FITTED = 0x0102 # rigid-rect fit state, used to re-apply the ✓ on rename
 # initialise the spinboxes and to restore them via the Reset button.
 _DETECT_DEFAULTS = {
     "threshold": 3.0,    # %
-    "max_lights": 12,
+    "max_lights": 50,
     "blur": 1.0,         # degrees
     "min_size": 1.0,     # degrees
     "merge": 1.0,        # degrees
@@ -75,6 +75,7 @@ class LightPanel(QWidget):
     lock_toggled = Signal(str, bool)    # quad name, locked
     add_quad_requested = Signal()
     propose_quads_requested = Signal(dict)  # auto-detect params
+    clear_all_quads_requested = Signal()    # wipe all quads (with confirm)
     fit_to_rect_requested = Signal()        # depth-snap all unfitted quads
     key_preview_changed = Signal(bool)      # show/update the key-mask preview
     bake_requested = Signal(dict)
@@ -82,9 +83,12 @@ class LightPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Cap the panel width so the side dock stays a tight column. Matches
+        # the ExposurePanel cap so the dock doesn't resize between modes.
+        self.setMaximumWidth(410)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
 
         list_box = QGroupBox("Light quads", self)
         lb = QVBoxLayout(list_box)
@@ -93,6 +97,9 @@ class LightPanel(QWidget):
         self._list.setEditTriggers(
             QListWidget.EditTrigger.DoubleClicked | QListWidget.EditTrigger.EditKeyPressed
         )
+        # Multi-select so marquee-selected viewport quads sync 1:1 with the
+        # outliner rows, and Shift/Ctrl-click on the panel works as expected.
+        self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
         self._list.itemChanged.connect(self._on_item_changed)
         self._suppress_item_changed = False
@@ -101,9 +108,20 @@ class LightPanel(QWidget):
         self._add_btn.setCheckable(True)
         self._add_btn.clicked.connect(self._on_add_clicked)
         lb.addWidget(self._add_btn)
+        del_row = QHBoxLayout()
+        del_row.setSpacing(4)
         del_btn = QPushButton("Delete selected")
         del_btn.clicked.connect(self._on_delete)
-        lb.addWidget(del_btn)
+        del_row.addWidget(del_btn, stretch=1)
+        clear_all_btn = QPushButton("Clear all")
+        clear_all_btn.setObjectName("danger")
+        clear_all_btn.setToolTip(
+            "Remove every quad — useful for re-running auto-detect with "
+            "different settings."
+        )
+        clear_all_btn.clicked.connect(self.clear_all_quads_requested)
+        del_row.addWidget(clear_all_btn)
+        lb.addLayout(del_row)
 
         lb.addWidget(self._build_autodetect_group())
 
@@ -168,7 +186,7 @@ class LightPanel(QWidget):
             eb.addWidget(cb)
         # Depth-mesh sub-option: drop the sky faces for outdoor scenes.
         self.opt_open_sky = QCheckBox("    ↳ Open sky (drop far/sky faces)")
-        self.opt_open_sky.setChecked(True)
+        self.opt_open_sky.setChecked(False)
         self.opt_open_sky.setToolTip(
             "For outdoor scenes: delete the depth-mesh faces that sit at "
             "infinity (the sky), leaving the mesh open so the real dome / 3D "
@@ -176,7 +194,9 @@ class LightPanel(QWidget):
         )
         eb.addWidget(self.opt_open_sky)
         # Dome rotation knob — depends on the target renderer's convention.
-        # Empirically -180° for Storm/usdview. Quick presets buttons next to it.
+        # Empirically -180° for Storm/usdview. Label + spinbox on one row;
+        # quick-preset buttons spread on a second, narrower row so this
+        # block doesn't force a wide panel.
         dome_row = QHBoxLayout()
         dome_row.addWidget(QLabel("Dome rotateY:"))
         self.opt_dome_rotate = QDoubleSpinBox()
@@ -191,12 +211,16 @@ class LightPanel(QWidget):
             "may differ). Use the preset buttons or type a value."
         )
         dome_row.addWidget(self.opt_dome_rotate, stretch=1)
+        eb.addLayout(dome_row)
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(4)
         for preset in (-180.0, -90.0, 0.0, 90.0):
             btn = QPushButton(f"{int(preset)}°")
-            btn.setFixedWidth(48)
+            btn.setObjectName("subtle")
+            btn.setMinimumWidth(40)
             btn.clicked.connect(lambda _=False, v=preset: self.opt_dome_rotate.setValue(v))
-            dome_row.addWidget(btn)
-        eb.addLayout(dome_row)
+            preset_row.addWidget(btn, stretch=1)
+        eb.addLayout(preset_row)
 
         # Depth-mesh inflation — scales the estimated geometry slightly outward
         # so it doesn't sit coplanar with (and z-fight / intersect) the rect
@@ -547,10 +571,35 @@ class LightPanel(QWidget):
         self.rename_quad.emit(old_name, new_name)
 
     def _on_delete(self):
-        item = self._list.currentItem()
-        if item is None:
-            return
-        self.delete_quad.emit(item.data(_ROLE_NAME))
+        # Fire delete for every selected row — supports multi-selection from
+        # marquee push or panel Shift/Ctrl-click.
+        names = [
+            it.data(_ROLE_NAME) for it in self._list.selectedItems() if it is not None
+        ]
+        if not names:
+            item = self._list.currentItem()
+            if item is None:
+                return
+            names = [item.data(_ROLE_NAME)]
+        for n in names:
+            self.delete_quad.emit(n)
+
+    def set_multi_selection(self, names: list) -> None:
+        """Replace the list's selection set (panel-only — does not fire the
+        select_quad signal, since this is driven from the viewer marquee)."""
+        self._list.blockSignals(True)
+        self._list.clearSelection()
+        wanted = set(names or [])
+        first = None
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if it.data(_ROLE_NAME) in wanted:
+                it.setSelected(True)
+                if first is None:
+                    first = it
+        if first is not None:
+            self._list.setCurrentItem(first)
+        self._list.blockSignals(False)
 
     def _on_add_clicked(self):
         # Only emit on transition to checked; if user clicks again, cancel.
@@ -603,7 +652,7 @@ class LightPanel(QWidget):
         infl = state.get("geom_inflation_pct")
         if infl is not None:
             self.opt_geom_inflation.setValue(float(infl))
-        self.opt_open_sky.setChecked(bool(state.get("open_sky", True)))
+        self.opt_open_sky.setChecked(bool(state.get("open_sky", False)))
 
     def set_output_path(self, path: str) -> None:
         # Only auto-populate if the user hasn't already entered something custom.

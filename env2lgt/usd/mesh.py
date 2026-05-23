@@ -31,7 +31,7 @@ def write_panorama_mesh(
     radius_floor: float = 0.0,
     use_emissive: bool = True,
     geom_inflation: float = 1.0,
-    open_sky: bool = True,
+    open_sky: bool = False,
     sky_depth_frac: float = 0.45,
 ) -> Path:
     """Author the depth-displaced sphere mesh USD.

@@ -317,44 +317,52 @@ def _output_size_for_quad(width: float, height: float, max_dim: int = 1024) -> t
 
 def sample_rect_texture(
     hdr_pano: np.ndarray,
-    corners_dirs: np.ndarray,
+    fit: "RectFit",
     out_h: int,
     out_w: int,
 ) -> np.ndarray:
-    """Bake an HDR rectilinear texture for a `UsdLuxRectLight`.
+    """Bake an HDR rectilinear texture for a `UsdLuxRectLight` via *true*
+    perspective projection onto the fitted rect's plane.
 
-    Corners must be the 4 unit directions, ordered consistently with the
-    output's UV space — corner index meaning (TL, TR, BR, BL):
-        (s=0, t=0) -> corner[0]      top-left
-        (s=1, t=0) -> corner[1]      top-right
-        (s=1, t=1) -> corner[2]      bottom-right
-        (s=0, t=1) -> corner[3]      bottom-left
+    For each output pixel (s, t) in [0, 1]², compute the 3D point on the
+    rect's plane (`center + (s-0.5)·width·u_axis + (0.5-t)·height·v_axis`),
+    cast a ray from the camera origin through it, convert that direction to
+    an equirect pixel, and remap. This is exact rectilinear projection —
+    what the camera at origin actually sees of the rect's emissive surface.
 
-    Sampling: for each output pixel, bilinear-interpolate the 4 unit-vector
-    corners, renormalize, convert to equirect pixel, and remap via
-    `cv2.BORDER_WRAP` so seam-spanning quads sample cleanly.
+    The previous bilinear-of-4-corner-dirs implementation was an
+    approximation that warped the interior of the texture relative to true
+    perspective: the bilinear blend of unit vectors only matches rectilinear
+    on the corners, and the deviation grows with the rect's angular extent.
+    After `_fit_from_4points` produces a rigid 3D rectangle (orthonormal
+    `(u, v, n)` + width / height), we can sample the panorama exactly, so
+    when the texture maps 1:1 onto the `UsdLuxRectLight` it reproduces what
+    the original panorama shows of that fixture, regardless of its angular
+    size.
+
+    Texture orientation matches the corners returned by `rect_to_corner_dirs`
+    (TL/TR/BR/BL): `(s=0, t=0)` is top-left, `(s=1, t=1)` is bottom-right.
     """
     H, W = hdr_pano.shape[:2]
-    corners = np.asarray(corners_dirs, dtype=np.float64).reshape(4, 3)
-    tl, tr, br, bl = corners[0], corners[1], corners[2], corners[3]
-
     j, i = np.meshgrid(np.arange(out_h), np.arange(out_w), indexing="ij")
-    s = (i + 0.5) / out_w
-    t = (j + 0.5) / out_h
-    s = s[..., None]
-    t = t[..., None]
-    # Bilinear interp of the 4 corner dirs over the (s, t) parameterization.
-    dirs = (
-        (1.0 - s) * (1.0 - t) * tl
-        + s * (1.0 - t) * tr
-        + s * t * br
-        + (1.0 - s) * t * bl
-    )
-    dirs /= np.linalg.norm(dirs, axis=-1, keepdims=True) + 1e-12
+    s = (i.astype(np.float64) + 0.5) / out_w
+    t = (j.astype(np.float64) + 0.5) / out_h
+
+    # Rect-frame offsets. Image convention: t=0 (top of texture) → +v_axis
+    # side of the rect, matching corner[0] = TL = -hw·u + +hh·v.
+    pu = (s - 0.5) * float(fit.width)
+    pv = (0.5 - t) * float(fit.height)
+
+    center = np.asarray(fit.center, dtype=np.float64)
+    u_axis = np.asarray(fit.u_axis, dtype=np.float64)
+    v_axis = np.asarray(fit.v_axis, dtype=np.float64)
+    # P(s, t) on the rect plane in world space (output shape: H_out, W_out, 3).
+    P = center[None, None, :] + pu[..., None] * u_axis + pv[..., None] * v_axis
+    # Ray from camera at origin → unit direction.
+    dirs = P / (np.linalg.norm(P, axis=-1, keepdims=True) + 1e-12)
 
     yaw, pitch = angles_from_dir(dirs)
     u_eq, v_eq = angles_to_pix(yaw, pitch, W, H)
-
     return cv2.remap(
         hdr_pano,
         u_eq.astype(np.float32),

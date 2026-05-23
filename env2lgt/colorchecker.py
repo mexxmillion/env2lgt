@@ -216,6 +216,180 @@ def apply_matrix(img: np.ndarray, M: np.ndarray) -> np.ndarray:
     return np.clip(out, 0.0, None).reshape(a.shape).astype(np.float32)
 
 
+# ---------- region-pair calibration ----------
+
+def solve_regions(
+    src: np.ndarray, dst: np.ndarray, mode: str = "gain_gamma"
+) -> tuple[np.ndarray, np.ndarray, float, np.ndarray, str, str]:
+    """Per-channel fit so ``apply_gain_gamma(src) ≈ dst`` over N region pairs.
+
+    src/dst are (N,3) mean RGB measurements — typically from paired ROIs on the
+    HDRI (src) and the reference image (dst), both in the working space.
+
+    mode "gain"       fits one gain per channel (gamma fixed at 1).
+    mode "gain_gamma" fits log(dst) = log(gain) + gamma * log(src) per channel.
+
+    Returns (gains (3,), gammas (3,), rmse, per_pair_rmse (N,),
+             effective_mode, note). gammas is all ones in "gain" mode.
+    RMSE is in linear space. ``effective_mode`` may differ from ``mode`` if the
+    solver had to fall back (e.g. too few pairs for gamma to be identifiable).
+    ``note`` is a short human-readable explanation when that happens.
+    """
+    s = np.clip(np.asarray(src, dtype=np.float64).reshape(-1, 3), 1e-8, None)
+    d = np.clip(np.asarray(dst, dtype=np.float64).reshape(-1, 3), 1e-8, None)
+    n = s.shape[0]
+    if n == 0:
+        raise ValueError("Need at least one region pair to solve.")
+
+    gains = np.ones(3, dtype=np.float64)
+    gammas = np.ones(3, dtype=np.float64)
+    effective = mode
+    note = ""
+
+    # Per-channel log-luma spread (used to detect a degenerate gamma fit). With
+    # too few samples or samples clustered in luminance, the slope (gamma) of
+    # the log-log fit is unstable — one channel can pin to a wild value while
+    # another lands sensibly, which produces the "funky colours" symptom.
+    # Threshold: require at least one channel to span ~1.5 stops between its
+    # min and max sample (log spread ≥ ln(2.83)).
+    LOG_SPREAD_MIN = float(np.log(2.83))
+    if mode == "gain_gamma":
+        log_spread = float(np.ptp(np.log(s), axis=0).max()) if n >= 2 else 0.0
+        if n < 3:
+            effective = "gain"
+            note = (
+                f"Only {n} pair(s) - gamma underdetermined, fitting gain only. "
+                "Add 3+ pairs at different brightnesses for a gamma fit."
+            )
+        elif log_spread < LOG_SPREAD_MIN:
+            effective = "gain"
+            note = (
+                "HDRI sample luminances are too close - gamma fit unstable. "
+                "Include a darker and a brighter region for gamma."
+            )
+
+    if effective == "gain":
+        # Closed-form weighted mean of per-pair log-ratios.
+        gains = np.exp(np.mean(np.log(d / s), axis=0))
+    else:
+        ls = np.log(s)
+        ld = np.log(d)
+        for c in range(3):
+            A = np.stack([np.ones(n), ls[:, c]], axis=1)
+            coef, *_ = np.linalg.lstsq(A, ld[:, c], rcond=None)
+            gains[c] = float(np.exp(coef[0]))
+            gammas[c] = float(coef[1])
+
+    fit = gains * np.power(s, gammas)
+    resid = fit - d
+    per_pair = np.sqrt(np.mean(resid * resid, axis=1))
+    rmse = float(np.sqrt(np.mean(resid * resid)))
+    return (
+        gains.astype(np.float32),
+        gammas.astype(np.float32),
+        rmse,
+        per_pair.astype(np.float32),
+        effective,
+        note,
+    )
+
+
+def solve_auto_match(
+    hdr: np.ndarray,
+    ref: np.ndarray,
+    mode: str = "gain",
+    *,
+    clip_high_percentile: float = 99.0,
+    anchor_low: float = 25.0,
+    anchor_high: float = 50.0,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """NLE-style auto colour-match: per-channel match between two whole images
+    using percentile anchors. No paired regions needed — the user just loads a
+    reference photo and presses "match".
+
+    Strategy
+    --------
+    Working linearly per channel:
+      1. Clip the HDR at its `clip_high_percentile` (default 99th) so suns,
+         lamps and other bright outliers don't drag the mean / quantiles.
+      2. Take two anchor quantiles in each image — low (Q25) and high (Q50).
+      3. Solve a per-channel mapping that takes (hdr_qLow, hdr_qHigh) onto
+         (ref_qLow, ref_qHigh).
+
+    mode "gain":
+        gain = ref_qHigh / hdr_qHigh, gamma = 1.
+        Simplest, recovers a pure per-channel scale (white-balance + EV).
+    mode "gain_gamma":
+        gamma = log(ref_qHigh/ref_qLow) / log(hdr_qHigh/hdr_qLow)
+        gain  = ref_qHigh / hdr_qHigh ** gamma
+        Lets a curved EOTF mismatch fold in.
+
+    Returns (gains (3,), gammas (3,), info) where `info` has the anchor
+    values used (for the status string).
+    """
+    a = np.asarray(hdr, dtype=np.float32).reshape(-1, 3)
+    b = np.asarray(ref, dtype=np.float32).reshape(-1, 3)
+    a = a[np.isfinite(a).all(axis=1)]
+    b = b[np.isfinite(b).all(axis=1)]
+    if a.size == 0 or b.size == 0:
+        raise ValueError("Auto match needs non-empty HDR and reference data.")
+
+    # Robust upper clip on the HDR so bright-light outliers don't dominate.
+    hi = np.percentile(a, clip_high_percentile, axis=0)
+    a_clipped = np.minimum(a, hi)
+
+    a_lo = np.percentile(a_clipped, anchor_low, axis=0)
+    a_hi = np.percentile(a_clipped, anchor_high, axis=0)
+    b_lo = np.percentile(b, anchor_low, axis=0)
+    b_hi = np.percentile(b, anchor_high, axis=0)
+
+    eps = 1e-6
+    a_lo = np.clip(a_lo, eps, None)
+    a_hi = np.clip(a_hi, eps, None)
+    b_lo = np.clip(b_lo, eps, None)
+    b_hi = np.clip(b_hi, eps, None)
+
+    gains = np.ones(3, dtype=np.float32)
+    gammas = np.ones(3, dtype=np.float32)
+    if mode == "gain_gamma":
+        # Per-channel slope in log-log space — gamma. Falls back to 1 if the
+        # anchors collapse (no spread between Q25 and Q50).
+        for c in range(3):
+            num = float(np.log(b_hi[c] / b_lo[c]))
+            den = float(np.log(a_hi[c] / a_lo[c]))
+            gammas[c] = float(num / den) if abs(den) > 1e-6 else 1.0
+            gains[c] = float(b_hi[c]) / (float(a_hi[c]) ** gammas[c])
+    else:
+        gains[:] = (b_hi / a_hi).astype(np.float32)
+
+    info = {
+        "hdr_anchors": (a_lo.tolist(), a_hi.tolist()),
+        "ref_anchors": (b_lo.tolist(), b_hi.tolist()),
+        "clip_high_percentile": float(clip_high_percentile),
+    }
+    return gains, gammas, info
+
+
+def apply_gain_gamma(
+    img: np.ndarray, gains: np.ndarray, gammas: np.ndarray
+) -> np.ndarray:
+    """Apply per-channel ``out = gain * img ** gamma``. Negatives clamped.
+    Gain-only fast path (all gammas == 1) skips ``np.power`` — saves a full-
+    image allocation+compute on the preview hot path."""
+    a = np.asarray(img, dtype=np.float32)
+    if a.ndim == 2:
+        a = a[..., None]
+    g = np.asarray(gains, dtype=np.float32).reshape(1, 1, 3)
+    p = np.asarray(gammas, dtype=np.float32).reshape(-1)
+    if np.allclose(p, 1.0, atol=1e-6):
+        # Pure per-channel gain; one multiply, no clip needed (negatives stay
+        # negative under a positive scalar, matching the linear-light model).
+        return (a * g).astype(np.float32)
+    # Generic gain * pow path. Clip negatives so the power is well-defined.
+    a = np.clip(a, 0.0, None)
+    return (g * np.power(a, p.reshape(1, 1, 3))).astype(np.float32)
+
+
 # ---------- JSON targets ----------
 
 def load_target(path: str | Path) -> tuple[np.ndarray, str, str]:

@@ -118,7 +118,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("env2lgt — HDRI → USD light rig")
-        self.resize(1600, 900)
+        self.resize(1920, 1080)
         self.setAcceptDrops(True)
 
         self._hdr: np.ndarray | None = None              # full-res HDR (used for bake metadata only)
@@ -175,6 +175,19 @@ class MainWindow(QMainWindow):
         self._cc_target_name: str = "Built-in CC24"
         self._cc_target_mode: str = "builtin"   # builtin | json | reference
         self._cc_fit_mode: str = "matrix"
+        # ---- regions calibration sub-mode ----
+        # The Calibration group has two sub-modes; only one drives the apply
+        # path at a time. `_cc_mode` selects which. Region pairs each carry
+        # an HDRI rect (normalized UV in equirect) and a reference rect.
+        self._cc_mode: str = "chart"             # "chart" | "regions"
+        self._region_pairs: list[dict] = []      # [{hdri_uv:[...], ref_uv:[...]}]
+        self._region_fit_mode: str = "gain"
+        self._region_gains: np.ndarray | None = None     # (3,) float32 or None
+        self._region_gammas: np.ndarray | None = None    # (3,) float32 or None
+        self._region_rmse: float | None = None
+        self._region_effective_fit: str | None = None
+        self._region_per_pair: list = []                  # list of float or None
+        self._region_selected: int = -1                   # selected pair, -1 = none
         # Flat reference image for chart matching. `_ref_src` is the
         # source-encoded display-res copy (so the colorspace can be re-picked
         # without reloading); `_ref_display` is the working-space version.
@@ -204,7 +217,23 @@ class MainWindow(QMainWindow):
         self._pending_fit_to_rect: bool = False
 
         self.viewer = PanoramaViewer(self)
-        self.setCentralWidget(self.viewer)
+        # Wrap the viewer + a thin indeterminate "busy strip" in a vertical
+        # container so we can flag long-running work (depth compute, fit-to-
+        # rect waiting on depth, etc.) without taking screen real estate.
+        from PySide6.QtWidgets import QVBoxLayout as _QVBox, QWidget as _QW
+        central = _QW(self)
+        vlay = _QVBox(central)
+        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setSpacing(0)
+        vlay.addWidget(self.viewer, stretch=1)
+        self._busy_strip = QProgressBar(central)
+        self._busy_strip.setObjectName("busyStrip")
+        self._busy_strip.setRange(0, 0)          # indeterminate marquee
+        self._busy_strip.setTextVisible(False)
+        self._busy_strip.setFixedHeight(3)
+        self._busy_strip.setVisible(False)
+        vlay.addWidget(self._busy_strip)
+        self.setCentralWidget(central)
         self.viewer.quad_committed.connect(self._on_quad_committed)
         self.viewer.quad_selected.connect(self._on_quad_selected)
         self.viewer.quad_lock_changed.connect(self._on_quad_lock_changed)
@@ -216,6 +245,12 @@ class MainWindow(QMainWindow):
         self.viewer.sample_mode_changed.connect(self._on_sample_mode_changed)
         self.viewer.chart_committed.connect(self._on_chart_committed)
         self.viewer.chart_mode_changed.connect(self._on_chart_mode_changed)
+        self.viewer.region_pair_selected.connect(self._on_region_pair_selected)
+        self.viewer.region_pair_modified.connect(self._on_region_pair_modified)
+        self.viewer.region_pair_delete_requested.connect(self._on_region_delete)
+        self.viewer.quads_delete_requested.connect(self._on_quads_delete_requested)
+        # `self.panel` is built a few lines down; the viewer↔panel marquee
+        # link is wired right after the panel is constructed.
 
         # Lights + Exposure panels live in ONE dock, swapped via a stacked
         # widget. A single fixed-geometry dock means toggling exposure mode
@@ -226,6 +261,8 @@ class MainWindow(QMainWindow):
 
         self.panel = LightPanel(self)
         self.exposure_panel = ExposurePanel(self)
+        # Marquee-multi-select in the viewer mirrors into the panel outliner.
+        self.viewer.quads_marquee_changed.connect(self.panel.set_multi_selection)
         panel_scroll = QScrollArea()
         panel_scroll.setWidgetResizable(True)
         panel_scroll.setWidget(self.panel)
@@ -248,8 +285,11 @@ class MainWindow(QMainWindow):
         self._dock = dock
         # Give the tool column a comfortable default width — the side panels
         # are cramped at Qt's size-hint default.
-        self._panel_stack.setMinimumWidth(340)
-        self.resizeDocks([dock], [400], Qt.Orientation.Horizontal)
+        # Initial dock width; minimum is intentionally small so the user can
+        # shrink the panel right down. Individual rows pick their own sane
+        # minimums via stretch + fixed-width children.
+        self._panel_stack.setMinimumWidth(260)
+        self.resizeDocks([dock], [360], Qt.Orientation.Horizontal)
         self.exposure_panel.exposure_offset_changed.connect(self._on_exposure_offset)
         self.exposure_panel.wb_changed.connect(self._on_wb_changed)
         self.exposure_panel.sample_exposure_requested.connect(
@@ -285,10 +325,30 @@ class MainWindow(QMainWindow):
         self.exposure_panel.load_correction_requested.connect(
             self._on_load_correction
         )
+        self.exposure_panel.calibration_mode_changed.connect(
+            self._on_calibration_mode_changed
+        )
+        self.exposure_panel.add_region_pair_requested.connect(
+            self._on_add_region_pair
+        )
+        self.exposure_panel.region_select_requested.connect(
+            self._on_region_select_requested
+        )
+        self.exposure_panel.region_rename_requested.connect(
+            self._on_region_renamed
+        )
+        self.exposure_panel.region_delete_requested.connect(
+            self._on_region_delete
+        )
+        self.exposure_panel.region_fit_changed.connect(self._on_region_fit_changed)
+        self.exposure_panel.solve_regions_requested.connect(self._on_solve_regions)
+        self.exposure_panel.clear_regions_requested.connect(self._on_clear_regions)
+        self.exposure_panel.auto_match_requested.connect(self._on_auto_match)
         self.exposure_panel.populate_colorspaces(
             color.colorspace_names(), self._input_cs, self._output_cs
         )
         self.panel.delete_quad.connect(self._on_delete_quad)
+        self.panel.clear_all_quads_requested.connect(self._on_clear_all_quads)
         self.panel.select_quad.connect(self._on_panel_selected)
         self.panel.rename_quad.connect(self._on_rename_quad)
         self.panel.window_toggled.connect(self._on_window_toggled)
@@ -359,6 +419,29 @@ class MainWindow(QMainWindow):
         """Set the status-bar message. Replaces QStatusBar.showMessage so the
         bottom-left probe widget is never hidden."""
         self._status_msg.setText(msg)
+
+    def _depth_thread_running(self) -> bool:
+        """Safe check for an in-flight depth worker. The QThread's C++ side
+        is deleteLater-scheduled on finish, so a naive `isRunning()` can hit
+        a dead PySide wrapper if the slot order ever changes. Defaults to
+        'not running' on any error so callers fall through to a fresh start
+        rather than crashing."""
+        t = self._depth_thread
+        if t is None:
+            return False
+        try:
+            return bool(t.isRunning())
+        except RuntimeError:
+            # C++ object already deleted — treat as not running.
+            self._depth_thread = None
+            self._depth_worker = None
+            return False
+
+    def _set_busy(self, busy: bool) -> None:
+        """Toggle the thin indeterminate busy strip at the bottom of the
+        viewer. Used to flag long async work (depth compute, deferred fit,
+        etc.) that has no meaningful progress %."""
+        self._busy_strip.setVisible(bool(busy))
 
     @staticmethod
     def _make_eyedropper_icon() -> QIcon:
@@ -581,15 +664,25 @@ class MainWindow(QMainWindow):
         # even when OCIO isn't available.
         tb.addWidget(QLabel(" Display "))
         self._display_combo = QComboBox()
-        for d in color.displays():
+        all_displays = color.displays()
+        for d in all_displays:
             self._display_combo.addItem(d)
-        self._display_combo.setCurrentText(color.default_display())
+        # Prefer a Rec.709-flavoured display (video reference standard) over
+        # sRGB. Falls back to the OCIO-config default if no Rec.709 exists.
+        def _pick_default_display() -> str:
+            for needle in ("rec.709", "rec709", "rec.1886", "rec 709"):
+                for d in all_displays:
+                    if needle in d.lower():
+                        return d
+            return color.default_display()
+        default_display = _pick_default_display()
+        self._display_combo.setCurrentText(default_display)
         self._display_combo.currentTextChanged.connect(self._on_display_changed)
         tb.addWidget(self._display_combo)
         self._view_combo = QComboBox()
         self._view_combo.currentTextChanged.connect(self._on_view_changed)
         tb.addWidget(self._view_combo)
-        self._ocio_display = color.default_display()
+        self._ocio_display = default_display
         self._refill_view_combo()
         tb.addSeparator()
 
@@ -743,16 +836,59 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Open EXR", f"Failed to load {path.name}:\n{e}")
             return
-        # If a file was already loaded with quads, ask before discarding them.
-        if self._hdr is not None and self.viewer.quads():
-            ret = QMessageBox.question(
-                self,
-                "Open new EXR",
-                f"Discard {len(self.viewer.quads())} drawn quad(s) and load {path.name}?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        # If a file was already loaded with work-in-progress (quads or a
+        # calibration correction), prompt Save / Discard / Cancel before
+        # tearing it down.
+        has_work = (
+            self._hdr is not None and self._exr_path is not None
+            and (
+                bool(self.viewer.quads())
+                or self._cc_matrix is not None
+                or self._region_gains is not None
+                or bool(self._region_pairs)
             )
-            if ret != QMessageBox.StandardButton.Yes:
+        )
+        if has_work:
+            n_quads = len(self.viewer.quads())
+            bits = []
+            if n_quads:
+                bits.append(f"{n_quads} drawn quad(s)")
+            if self._cc_matrix is not None or self._region_gains is not None:
+                bits.append("a calibration correction")
+            elif self._region_pairs:
+                bits.append(f"{len(self._region_pairs)} region pair(s)")
+            summary = " and ".join(bits) if bits else "your work"
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("Open new EXR")
+            box.setText(
+                f"You have {summary} on {self._exr_path.name}.\n\n"
+                f"Save it before loading {path.name}?"
+            )
+            save_btn = box.addButton(
+                "Save", QMessageBox.ButtonRole.AcceptRole
+            )
+            discard_btn = box.addButton(
+                "Discard", QMessageBox.ButtonRole.DestructiveRole
+            )
+            cancel_btn = box.addButton(
+                "Cancel", QMessageBox.ButtonRole.RejectRole
+            )
+            box.setDefaultButton(save_btn)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is cancel_btn:
                 return
+            if clicked is save_btn:
+                try:
+                    self._save_project_to(default_project_path(self._exr_path))
+                except Exception as e:  # noqa: BLE001
+                    QMessageBox.critical(
+                        self, "Save project",
+                        f"Failed to save project for {self._exr_path.name}:\n{e}",
+                    )
+                    return
+            # Discard falls through to the load.
         self._hdr = hdr
         # Downsampled display copy so exposure + yaw scrubs stay snappy. Kept
         # in the *source* colorspace so the input transform can be re-chosen
@@ -774,6 +910,21 @@ class MainWindow(QMainWindow):
         self._exr_path = path
         self._push_recent(path)
         # --- reset everything tied to the previous EXR ---
+        # Viewport-only display controls (exposure + gamma) back to neutral.
+        self._exposure = 0.0
+        self._view_gamma = 1.0
+        if hasattr(self, "_view_exp_slider"):
+            self._view_exp_slider.blockSignals(True)
+            self._view_exp_slider.setValue(0)
+            self._view_exp_slider.blockSignals(False)
+        if hasattr(self, "_exposure_label"):
+            self._exposure_label.setText(" 0.0 EV ")
+        if hasattr(self, "_gamma_slider"):
+            self._gamma_slider.blockSignals(True)
+            self._gamma_slider.setValue(100)
+            self._gamma_slider.blockSignals(False)
+        if hasattr(self, "_gamma_label"):
+            self._gamma_label.setText(" 1.00 ")
         # Yaw offset back to 0 (a stale offset would confuse quad placement).
         if hasattr(self, "_yaw_slider"):
             self._yaw_slider.blockSignals(True)
@@ -793,6 +944,16 @@ class MainWindow(QMainWindow):
         self._cc_matrix = None
         self._cc_target_mode = "builtin"
         self._cc_target_name = "Built-in CC24"
+        # Regions calibration is tied to the panorama too — clear pairs and
+        # any solved gain/gamma so the new EXR starts clean.
+        self._cc_mode = "chart"
+        self._region_pairs = []
+        self._region_gains = None
+        self._region_gammas = None
+        self._region_rmse = None
+        self._region_per_pair = []
+        self._region_selected = -1
+        self._region_effective_fit = None
         if hasattr(self, "viewer"):
             self.viewer.set_flat_mode(False)
         if hasattr(self, "exposure_panel"):
@@ -803,6 +964,13 @@ class MainWindow(QMainWindow):
             self.exposure_panel.set_target_label("Built-in CC24")
             self.exposure_panel.set_correction_available(False)
             self.exposure_panel.set_reference_view(False)
+            # Regions sub-panel — clear list, status, and snap back to Chart.
+            self.exposure_panel.set_calibration_mode("chart")
+            self.exposure_panel.set_region_pairs([])
+            self.exposure_panel.set_regions_status("No regions solved.")
+            self.exposure_panel.set_active_correction_label("No correction.")
+        if hasattr(self, "viewer"):
+            self.viewer.set_region_pairs([])
         # Drop cached depth — it's for the previous EXR.
         self._distance = None
         self._view_mode = "hdr"
@@ -879,11 +1047,24 @@ class MainWindow(QMainWindow):
         - Yaw offset rolls the cached uint8 (column-wise) and wraps in a
           QImage. Cheap (~5 ms at 2K) — runs on every yaw-slider tick.
         """
-        # Reference-image view (flat 2D) — bypasses the pano cache + yaw roll.
+        # Reference-image view (flat 2D) — bypasses the yaw roll but reuses
+        # the same display cache so exposure / gamma / OCIO display+view
+        # interactions are responsive (was un-cached, hence the lag).
         if self._view_mode == "reference":
             if self._ref_display is None:
                 return
-            u8 = self._working_to_u8(self._ref_display, 0.0)
+            ref_key = (
+                "reference",
+                round(self._exposure, 3),
+                (self._ocio_display, self._ocio_view),
+                round(self._view_gamma, 3),
+            )
+            if self._display_cache is None or self._cache_key != ref_key:
+                self._display_cache = self._working_to_u8(
+                    self._ref_display, self._exposure
+                )
+                self._cache_key = ref_key
+            u8 = self._display_cache
             H, W, _ = u8.shape
             qimg = QImage(u8.data, W, H, W * 3, QImage.Format.Format_RGB888).copy()
             self.viewer.set_yaw_offset_px(0)
@@ -895,12 +1076,23 @@ class MainWindow(QMainWindow):
 
         is_hdr = self._view_mode == "hdr"
         cc_id = None if self._cc_matrix is None else hash(self._cc_matrix.tobytes())
+        rg_id = (
+            None if self._region_gains is None
+            else hash(self._region_gains.tobytes())
+        )
+        rp_id = (
+            None if self._region_gammas is None
+            else hash(self._region_gammas.tobytes())
+        )
         cache_key = (
             self._view_mode,
             round(self._exposure, 3) if is_hdr else None,
             round(self._exposure_offset, 3) if is_hdr else None,
             tuple(round(float(c), 4) for c in self._wb_scale) if is_hdr else None,
+            self._cc_mode if is_hdr else None,
             cc_id if is_hdr else None,
+            rg_id if is_hdr else None,
+            rp_id if is_hdr else None,
             (self._ocio_display, self._ocio_view) if is_hdr else None,
             round(self._view_gamma, 3),
         )
@@ -933,13 +1125,35 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             return np.asarray(src, dtype=np.float32)
 
+    def _active_cc_for_bake(self) -> tuple:
+        """Return (matrix, gains, gammas) for the active calibration sub-mode.
+        At most one of (matrix) / (gains+gammas) is non-None — the bake
+        applies whichever is present."""
+        if self._cc_mode == "chart" and self._cc_matrix is not None:
+            return (self._cc_matrix, None, None)
+        if (
+            self._cc_mode in ("regions", "auto")
+            and self._region_gains is not None
+            and self._region_gammas is not None
+        ):
+            return (None, self._region_gains, self._region_gammas)
+        return (None, None, None)
+
     def _adjusted_working(self, hdr: np.ndarray) -> np.ndarray:
-        """Apply the baked baseline adjustments (colour-checker matrix, white
-        balance, exposure offset) to a working-space buffer. Display-only
+        """Apply the baked baseline adjustments (active calibration correction,
+        white balance, exposure offset) to a working-space buffer. Display-only
         viewport exposure is NOT included here."""
         out = hdr
-        if self._cc_matrix is not None:
+        if self._cc_mode == "chart" and self._cc_matrix is not None:
             out = ccheck.apply_matrix(out, self._cc_matrix)
+        elif (
+            self._cc_mode in ("regions", "auto")
+            and self._region_gains is not None
+            and self._region_gammas is not None
+        ):
+            out = ccheck.apply_gain_gamma(
+                out, self._region_gains, self._region_gammas
+            )
         out = out * self._wb_scale.reshape(1, 1, 3) * (2.0 ** self._exposure_offset)
         return out
 
@@ -1110,8 +1324,11 @@ class MainWindow(QMainWindow):
 
     def _on_exposure_mode(self, checked: bool):
         self._exposure_mode = bool(checked)
-        # The light quads are irrelevant while metering — hide them.
+        # The light quads are irrelevant while metering — hide them. Symmetric
+        # for calibration overlays (chart + region rects): only shown while
+        # the Exposure dock is up, so the Lights view stays uncluttered.
         self.viewer.set_quads_visible(not checked)
+        self.viewer.set_calibration_visible(checked)
         # Swap the panel via the stacked widget — the dock geometry (and so
         # the viewport) is untouched, so zoom/pan never jumps.
         self._panel_stack.setCurrentIndex(1 if checked else 0)
@@ -1234,12 +1451,14 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Auto meter", "Open an EXR first.")
             return
         self._set_status("Auto meter — convolving the dome…")
+        self._set_busy(True)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         QApplication.processEvents()
         try:
             result = convolve_dome_meter(self._hdr_display)
         finally:
             QApplication.restoreOverrideCursor()
+            self._set_busy(False)
         self._exposure_offset = float(result["offset_ev"])
         kelvin, tint = scale_to_temp_tint(result["wb_scale"])
         self._wb_kelvin, self._wb_tint = kelvin, tint
@@ -1282,6 +1501,7 @@ class MainWindow(QMainWindow):
         self.exposure_panel.set_correction_available(False)
         self._invalidate_display_cache()
         self._refresh_view()
+        self._refresh_active_correction_label()
 
     def _on_fit_mode_changed(self, mode: str):
         self._cc_fit_mode = mode
@@ -1382,11 +1602,52 @@ class MainWindow(QMainWindow):
         """Read a reference image as a source-encoded float RGB array, plus a
         best-guess source colorspace: 8-bit images are treated as sRGB-encoded;
         float / EXR as the current input colorspace."""
-        arr = cv2.imread(
-            str(path), cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR | cv2.IMREAD_COLOR
+        ext = path.suffix.lower()
+        # EXR / HDR / TIFF-float: use OpenImageIO (cv2's OpenEXR codec is
+        # disabled by default in OpenCV 4.13+ for security reasons, and OIIO
+        # handles odd channel layouts + half-float promotion correctly).
+        if ext in (".exr", ".hdr"):
+            import OpenImageIO as oiio  # type: ignore[import-not-found]
+            inp = oiio.ImageInput.open(str(path))
+            if inp is None:
+                raise RuntimeError(
+                    f"Could not open {path.name}: {oiio.geterror()}"
+                )
+            try:
+                spec = inp.spec()
+                pixels = inp.read_image(format="float")
+            finally:
+                inp.close()
+            h, w = spec.height, spec.width
+            nch = spec.nchannels
+            arr = np.asarray(pixels, dtype=np.float32).reshape(h, w, nch)
+            if nch >= 3:
+                arr = arr[..., :3]
+            elif nch == 1:
+                arr = np.repeat(arr, 3, axis=-1)
+            else:
+                raise RuntimeError(
+                    f"{path.name}: unexpected channel count {nch}"
+                )
+            return np.ascontiguousarray(arr), self._input_cs
+
+        # LDR / 8-bit + 16-bit non-EXR formats via OpenCV. cv2.imread is not
+        # Unicode-safe on Windows and trips on commas/spaces in some
+        # filenames; read bytes with Python and decode in memory.
+        try:
+            data = np.fromfile(str(path), dtype=np.uint8)
+        except OSError as e:
+            raise RuntimeError(f"Could not open {path.name}: {e}") from e
+        if data.size == 0:
+            raise RuntimeError(f"Empty file: {path.name}")
+        arr = cv2.imdecode(
+            data, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR | cv2.IMREAD_COLOR
         )
         if arr is None:
-            raise RuntimeError(f"Could not read {path.name}")
+            raise RuntimeError(
+                f"Could not decode {path.name} — unsupported format or "
+                "corrupt file."
+            )
         arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
         if arr.dtype == np.uint8:
             return arr.astype(np.float32) / 255.0, "Utility - sRGB - Texture"
@@ -1465,18 +1726,324 @@ class MainWindow(QMainWindow):
             )
             return
         M, rmse, flipped = ccheck.solve_correction(sw, target, self._cc_fit_mode)
+        # Sanity guards — chart placed over a uniform surface (e.g. grass) or
+        # otherwise degenerate produces a near-singular lstsq with wild matrix
+        # entries. Refuse to apply and tell the user, instead of nuking the
+        # panorama with the resulting garbage matrix.
+        sample_std = float(np.std(sw, axis=0).max())
+        matrix_max = float(np.max(np.abs(M)))
+        if self._cc_fit_mode == "matrix" and (
+            sample_std < 0.02 or matrix_max > 10.0 or rmse > 0.15
+        ):
+            QMessageBox.warning(
+                self, "Suspicious chart match",
+                "The chart match looks degenerate:\n"
+                f"  • sample variance across patches: {sample_std:.3f}\n"
+                f"  • max matrix entry: {matrix_max:.2f}\n"
+                f"  • RMSE: {rmse:.3f}\n\n"
+                "The 24 sampled patches look too similar to a real CC chart, "
+                "which makes the 3×3 fit unstable. The reference cells you "
+                "see drawn in the viewer are alignment guides on top of the "
+                "HDR — the actual samples come from underneath them, so the "
+                "chart needs to be placed over a real 24-patch X-Rite chart "
+                "visible in the panorama.\n\n"
+                "Not applying. Try a Regions or Auto match if your HDRI "
+                "doesn't contain a physical chart."
+            )
+            return
         self._cc_matrix = M
         self._last_rmse = rmse
+        # Chart solve makes chart the active correction path.
+        self._cc_mode = "chart"
+        self.exposure_panel.set_calibration_mode("chart")
         self._invalidate_display_cache()
         self._refresh_view()
         self.exposure_panel.set_chart_status(has_chart=True, rmse=rmse)
         self.exposure_panel.set_correction_available(True)
+        self._refresh_active_correction_label()
         msg = (
             f"Chart match applied ({self._cc_fit_mode}) — RMSE {rmse:.4f}"
             f"  ·  target: {self._cc_target_name}"
         )
         if flipped:
             msg += "  ·  chart detected upside-down (auto-corrected)"
+        self._set_status(msg)
+
+    # ---------- region-pair calibration ----------
+
+    def _refresh_active_correction_label(self) -> None:
+        if self._cc_mode == "chart" and self._cc_matrix is not None:
+            txt = "Chart matrix applied"
+            if self._last_rmse is not None:
+                txt += f" — RMSE {self._last_rmse:.4f}"
+        elif (
+            self._cc_mode in ("regions", "auto")
+            and self._region_gains is not None
+            and self._region_gammas is not None
+        ):
+            eff = getattr(self, "_region_effective_fit", None) or self._region_fit_mode
+            label = "Auto match" if self._cc_mode == "auto" else "Regions"
+            txt = f"{label} ({eff}) applied"
+            if self._region_rmse is not None:
+                txt += f" — RMSE {self._region_rmse:.4f}"
+        else:
+            txt = "No correction."
+        self.exposure_panel.set_active_correction_label(txt)
+
+    def _on_calibration_mode_changed(self, mode: str) -> None:
+        if mode not in ("chart", "regions", "auto"):
+            return
+        self._cc_mode = mode
+        # Deselect any region when leaving the regions sub-mode.
+        if mode != "regions":
+            self.viewer.set_region_selection(-1)
+            self._region_selected = -1
+        self._invalidate_display_cache()
+        self._refresh_view()
+        self._refresh_active_correction_label()
+
+    def _on_region_fit_changed(self, mode: str) -> None:
+        self._region_fit_mode = mode
+
+    def _region_palette_for_pairs(self) -> list:
+        from env2lgt.ui.viewer import PanoramaViewer
+        return [
+            PanoramaViewer.region_pair_color(i)
+            for i in range(len(self._region_pairs))
+        ]
+
+    def _refresh_region_list_ui(self) -> None:
+        self.exposure_panel.set_region_pairs(
+            self._region_pairs,
+            selected=self._region_selected,
+            residuals=self._region_per_pair or None,
+            colors=self._region_palette_for_pairs(),
+        )
+
+    @staticmethod
+    def _default_centred_uv(frac: float = 0.15) -> list:
+        """A centred, axis-aligned UV rect that covers `frac` of each axis."""
+        half = float(frac) * 0.5
+        return [0.5 - half, 0.5 - half, 0.5 + half, 0.5 + half]
+
+    def _default_centred_hdri_uv(self, frac: float = 0.15) -> list:
+        """Centred in the user's *current* HDR view — i.e. accounts for the
+        viewer yaw offset, so the rect lands where the user is looking, not
+        wherever 0.5 in absolute pano UV happens to be after a yaw roll."""
+        half = float(frac) * 0.5
+        W = max(1, self.viewer._W)
+        yaw_px = self.viewer.yaw_offset_px()
+        # Display centre x = W/2 → absolute u = (W/2 - yaw_px)/W mod 1.
+        u_abs = ((W * 0.5 - yaw_px) % W) / W
+        u0 = (u_abs - half) % 1.0
+        u1 = (u_abs + half) % 1.0
+        # No-wrap rect: if the centred placement would straddle the seam,
+        # clamp it to a non-wrapping interval inside [0,1].
+        if u1 < u0:
+            u0, u1 = 0.5 - half, 0.5 + half
+        return [u0, 0.5 - half, u1, 0.5 + half]
+
+    def _on_add_region_pair(self) -> None:
+        idx = len(self._region_pairs) + 1
+        self._region_pairs.append({
+            "name": f"Region {idx}",
+            "hdri_uv": self._default_centred_hdri_uv(),
+            "ref_uv": self._default_centred_uv(),
+        })
+        self._region_per_pair = []
+        self._region_selected = len(self._region_pairs) - 1
+        self.viewer.set_region_pairs(self._region_pairs, selected=self._region_selected)
+        self._refresh_region_list_ui()
+
+    def _on_region_delete(self, pair_index: int) -> None:
+        if not (0 <= pair_index < len(self._region_pairs)):
+            return
+        del self._region_pairs[pair_index]
+        self._region_per_pair = []
+        if self._region_selected >= len(self._region_pairs):
+            self._region_selected = len(self._region_pairs) - 1
+        self.viewer.set_region_pairs(self._region_pairs, selected=self._region_selected)
+        self._refresh_region_list_ui()
+
+    def _on_region_select_requested(self, pair_index: int) -> None:
+        if not (0 <= pair_index < len(self._region_pairs)):
+            pair_index = -1
+        self._region_selected = pair_index
+        self.viewer.set_region_selection(pair_index)
+        self._refresh_region_list_ui()
+
+    def _on_region_pair_selected(self, pair_index: int) -> None:
+        # Viewer notified us of a click-selection; mirror into the panel.
+        self._region_selected = int(pair_index)
+        self._refresh_region_list_ui()
+
+    def _on_region_pair_modified(self, pair_index: int, slot: str) -> None:
+        # Pull the latest uv from the viewer's authoritative copy.
+        live = self.viewer.region_pairs()
+        if 0 <= pair_index < len(live) and pair_index < len(self._region_pairs):
+            key = f"{slot}_uv"
+            self._region_pairs[pair_index][key] = list(live[pair_index].get(key) or [])
+            # Solved correction is now stale relative to the moved rect.
+            self._region_per_pair = []
+
+    def _on_region_renamed(self, pair_index: int, name: str) -> None:
+        if not (0 <= pair_index < len(self._region_pairs)):
+            return
+        self._region_pairs[pair_index]["name"] = name or f"Region {pair_index + 1}"
+        # Re-render label on the viewer.
+        self.viewer.set_region_pairs(self._region_pairs, selected=self._region_selected)
+
+    def _on_auto_match(self, fit_mode: str) -> None:
+        """NLE-style whole-image auto match. Feeds into the same gain/gamma
+        apply path as Regions — the only difference is how the gains were
+        computed (percentile anchors over the whole frame vs paired ROIs)."""
+        if self._hdr_display is None:
+            QMessageBox.information(self, "Auto match", "Open an EXR first.")
+            return
+        if self._ref_display is None:
+            QMessageBox.information(
+                self, "Auto match",
+                "Load a reference image before running Auto match.",
+            )
+            return
+        try:
+            gains, gammas, info = ccheck.solve_auto_match(
+                self._hdr_display, self._ref_display, fit_mode,
+            )
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Auto match", str(e))
+            return
+        self._region_gains = gains
+        self._region_gammas = gammas
+        self._region_rmse = None
+        self._region_per_pair = []
+        self._region_effective_fit = fit_mode
+        # Auto match acts through the same gain/gamma path as Regions.
+        # We still keep its identity by storing the sub-mode separately so
+        # the active-correction pill and bake report it correctly.
+        self._cc_mode = "auto"
+        self.exposure_panel.set_calibration_mode("auto")
+        self._invalidate_display_cache()
+        self._refresh_view()
+        status = (
+            f"Auto match ({fit_mode}) applied  ·  "
+            f"gain {gains[0]:.3f}/{gains[1]:.3f}/{gains[2]:.3f}"
+        )
+        if fit_mode == "gain_gamma":
+            status += (
+                f"  ·  gamma {gammas[0]:.3f}/{gammas[1]:.3f}/{gammas[2]:.3f}"
+            )
+        self.exposure_panel.set_auto_status(status)
+        self._refresh_active_correction_label()
+        self._set_status(status)
+
+    def _on_clear_regions(self) -> None:
+        self._region_pairs = []
+        self._region_gains = None
+        self._region_gammas = None
+        self._region_rmse = None
+        self._region_per_pair = []
+        self._region_selected = -1
+        self.viewer.set_region_pairs([])
+        self._refresh_region_list_ui()
+        self.exposure_panel.set_regions_status("No regions solved.")
+        self._refresh_active_correction_label()
+        self._invalidate_display_cache()
+        self._refresh_view()
+
+    def _sample_region_mean(self, uv: list, source: np.ndarray) -> np.ndarray | None:
+        """Mean RGB of the rect `uv = [u0,v0,u1,v1]` on `source` (HxWx3,
+        working space). Handles equirect seam wrap when source is the HDRI."""
+        if source is None or len(uv) != 4:
+            return None
+        H, W = source.shape[:2]
+        u0, v0, u1, v1 = uv
+        x0 = int(np.clip(round(u0 * W), 0, W - 1))
+        x1 = int(np.clip(round(u1 * W), 0, W - 1))
+        y0 = int(np.clip(round(v0 * H), 0, H - 1))
+        y1 = int(np.clip(round(v1 * H), 0, H - 1))
+        if y1 < y0:
+            y0, y1 = y1, y0
+        y1 = max(y0 + 1, y1)
+        if x1 >= x0:
+            patch = source[y0:y1 + 1, x0:x1 + 1]
+        else:
+            # Seam wrap on the panorama: stitch the two halves.
+            left = source[y0:y1 + 1, x0:W]
+            right = source[y0:y1 + 1, 0:x1 + 1]
+            patch = np.concatenate([left, right], axis=1)
+        if patch.size == 0:
+            return None
+        return patch.reshape(-1, 3).mean(axis=0).astype(np.float32)
+
+    def _on_solve_regions(self) -> None:
+        if self._hdr_display is None:
+            QMessageBox.information(self, "Solve regions", "Open an EXR first.")
+            return
+        if self._ref_display is None:
+            QMessageBox.information(
+                self, "Solve regions",
+                "Load a reference image before solving region calibration.",
+            )
+            return
+        src_means, dst_means = [], []
+        kept_idx = []
+        for i, p in enumerate(self._region_pairs):
+            h_uv = p.get("hdri_uv") or []
+            r_uv = p.get("ref_uv") or []
+            if len(h_uv) != 4 or len(r_uv) != 4:
+                continue
+            s = self._sample_region_mean(h_uv, self._hdr_display)
+            d = self._sample_region_mean(r_uv, self._ref_display)
+            if s is None or d is None:
+                continue
+            src_means.append(s)
+            dst_means.append(d)
+            kept_idx.append(i)
+        if not src_means:
+            QMessageBox.information(
+                self, "Solve regions",
+                "Need at least one complete pair (both HDR and REF rects drawn).",
+            )
+            return
+        src = np.stack(src_means, axis=0)
+        dst = np.stack(dst_means, axis=0)
+        gains, gammas, rmse, per_pair, effective, note = ccheck.solve_regions(
+            src, dst, self._region_fit_mode
+        )
+        self._region_gains = gains
+        self._region_gammas = gammas
+        self._region_rmse = float(rmse)
+        self._region_effective_fit = effective
+        # Reassemble per-pair residuals indexed by full pair list.
+        per_full = [None] * len(self._region_pairs)
+        for k, idx in enumerate(kept_idx):
+            per_full[idx] = float(per_pair[k])
+        self._region_per_pair = per_full
+        # Switch the apply path to regions and refresh.
+        self._cc_mode = "regions"
+        self.exposure_panel.set_calibration_mode("regions")
+        self._invalidate_display_cache()
+        self._refresh_view()
+        self._refresh_region_list_ui()
+        status = (
+            f"Solved {len(src_means)} pair(s) — RMSE {rmse:.4f}  ·  "
+            f"gain {gains[0]:.3f}/{gains[1]:.3f}/{gains[2]:.3f}"
+        )
+        if effective == "gain_gamma":
+            status += (
+                f"  ·  gamma {gammas[0]:.3f}/{gammas[1]:.3f}/{gammas[2]:.3f}"
+            )
+        if note:
+            status += f"\n{note}"
+        self.exposure_panel.set_regions_status(status)
+        self._refresh_active_correction_label()
+        msg = (
+            f"Regions match applied ({effective}) — RMSE {rmse:.4f} "
+            f"over {len(src_means)} pair(s)"
+        )
+        if note:
+            msg += f" — {note}"
         self._set_status(msg)
 
     def _on_save_correction(self):
@@ -1560,6 +2127,7 @@ class MainWindow(QMainWindow):
         # Need to compute — kick off background DA-2.
         self._depth_btn.setText("Computing depth…")
         self._depth_btn.setEnabled(False)
+        self._set_busy(True)
         cache_dir = self._exr_path.parent / ".env2lgt_cache"
         self._depth_thread = QThread(self)
         self._depth_worker = DepthWorker(
@@ -1579,6 +2147,11 @@ class MainWindow(QMainWindow):
         self._depth_thread.start()
 
     def _on_depth_ready(self, distance):
+        self._set_busy(False)
+        # Worker / thread are about to be deleted (deleteLater chain on
+        # finished). Drop our refs so we don't ever poke a dangling wrapper.
+        self._depth_worker = None
+        self._depth_thread = None
         self._distance = distance
         # Build the display-res depth at the same dimensions as _hdr_display
         # so the cache + roll path is symmetric with HDR mode.
@@ -1611,6 +2184,10 @@ class MainWindow(QMainWindow):
             self._on_fit_to_rect()
 
     def _on_depth_failed(self, msg: str):
+        self._set_busy(False)
+        # Same cleanup as the success path — the deleteLater chain has fired.
+        self._depth_worker = None
+        self._depth_thread = None
         self._distance = None
         self._depth_btn.setEnabled(True)
         self._depth_btn.setChecked(False)
@@ -1738,13 +2315,15 @@ class MainWindow(QMainWindow):
 
         # Need depth — kick off the backend if it's not already loaded.
         if self._distance is None:
-            if self._depth_thread is not None and self._depth_thread.isRunning():
+            if self._depth_thread_running():
                 # Already running (probably triggered by "Show depth"); just
                 # mark our intent and let _on_depth_ready pick it up.
                 self._pending_fit_to_rect = True
+                self._set_busy(True)
                 self._set_status("Waiting for depth to finish before fitting…")
                 return
             self._pending_fit_to_rect = True
+            self._set_busy(True)
             cache_dir = self._exr_path.parent / ".env2lgt_cache"
             self._depth_thread = QThread(self)
             self._depth_worker = DepthWorker(
@@ -1864,6 +2443,47 @@ class MainWindow(QMainWindow):
             return
         self._on_delete_quad(sel)
 
+    def _on_clear_all_quads(self) -> None:
+        """Wipe every quad. Useful for re-running auto-detect with new
+        settings without manually deleting each one."""
+        quads = self.viewer.quads()
+        if not quads:
+            self._set_status("No quads to clear.")
+            return
+        ret = QMessageBox.warning(
+            self,
+            "Clear all quads",
+            f"Remove all {len(quads)} quad(s)?\n\nThis can't be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        for q in list(quads):
+            self.viewer.remove_quad(q.name)
+            self.panel.remove_quad(q.name)
+        self._refresh_window_checkbox("")
+        self._set_status(f"Cleared {len(quads)} quad(s).")
+
+    def _on_quads_delete_requested(self, names: list) -> None:
+        """Drag-marquee Delete handler — remove every quad in the list."""
+        if not names:
+            return
+        if len(names) > 1:
+            ret = QMessageBox.question(
+                self,
+                "Delete quads",
+                f"Delete {len(names)} selected quad(s)?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+        for n in names:
+            self.viewer.remove_quad(n)
+            self.panel.remove_quad(n)
+        self._refresh_window_checkbox(self.viewer.selected() or "")
+        self._set_status(f"Deleted {len(names)} quad(s).")
+
     # ---------- bake ----------
 
     # ---------- project file (save / open / restore) ----------
@@ -1957,6 +2577,18 @@ class MainWindow(QMainWindow):
             "matrix": [] if self._cc_matrix is None else self._cc_matrix.tolist(),
             "fit_mode": self._cc_fit_mode,
             "target_name": self._cc_target_name,
+            "mode": self._cc_mode,
+            "region_pairs": [
+                {
+                    "name": str(p.get("name") or f"Region {i + 1}"),
+                    "hdri_uv": list(p.get("hdri_uv") or []),
+                    "ref_uv": list(p.get("ref_uv") or []),
+                }
+                for i, p in enumerate(self._region_pairs)
+            ],
+            "region_fit": self._region_fit_mode,
+            "gains": [] if self._region_gains is None else self._region_gains.tolist(),
+            "gammas": [] if self._region_gammas is None else self._region_gammas.tolist(),
         }
 
     def _apply_project_state(self, proj: Project) -> None:
@@ -2025,6 +2657,37 @@ class MainWindow(QMainWindow):
             applied=self._cc_matrix is not None,
         )
         self.exposure_panel.set_correction_available(self._cc_matrix is not None)
+        # Regions sub-mode state.
+        self._cc_mode = cc.mode or "chart"
+        self._region_pairs = [
+            {
+                "hdri_uv": list(p.get("hdri_uv") or []),
+                "ref_uv": list(p.get("ref_uv") or []),
+            }
+            for p in (cc.region_pairs or [])
+        ]
+        self._region_fit_mode = cc.region_fit or "gain_gamma"
+        self._region_gains = (
+            np.asarray(cc.gains, dtype=np.float32) if cc.gains else None
+        )
+        self._region_gammas = (
+            np.asarray(cc.gammas, dtype=np.float32) if cc.gammas else None
+        )
+        self._region_rmse = None
+        self._region_per_pair = []
+        self._region_selected = -1
+        self.exposure_panel.set_calibration_mode(self._cc_mode)
+        self.exposure_panel.set_region_fit(self._region_fit_mode)
+        self.viewer.set_region_pairs(self._region_pairs, selected=-1)
+        self._refresh_region_list_ui()
+        if (
+            self._cc_mode == "regions"
+            and self._region_gains is not None
+        ):
+            self.exposure_panel.set_regions_status(
+                "Correction restored from project."
+            )
+        self._refresh_active_correction_label()
         # Depth backend (tolerate an unknown name from a newer/edited project).
         backend = (proj.scene.depth_backend or "da2").strip().lower()
         if backend not in AVAILABLE_BACKENDS:
@@ -2083,6 +2746,7 @@ class MainWindow(QMainWindow):
             QuadSpec(name=q.name, corners_dirs=q.corners_dirs, is_window=q.is_window)
             for q in quads
         ]
+        cc_M, cc_g, cc_p = self._active_cc_for_bake()
         opts = BakeOptions(
             write_dome=False,
             write_rects=False,
@@ -2095,7 +2759,9 @@ class MainWindow(QMainWindow):
             yaw_offset_deg=self._yaw_offset_deg,
             exposure_offset_ev=self._exposure_offset,
             wb_scale=tuple(float(c) for c in self._wb_scale),
-            cc_matrix=self._cc_matrix,
+            cc_matrix=cc_M,
+            cc_gains=cc_g,
+            cc_gammas=cc_p,
             input_colorspace=self._input_cs,
             output_colorspace=self._output_cs,
         )
@@ -2219,10 +2885,12 @@ class MainWindow(QMainWindow):
             yaw_offset_deg=self._yaw_offset_deg,
             dome_rotate_y_deg=opts.get("dome_rotate_y_deg", -180.0),
             geom_inflation=1.0 + opts.get("geom_inflation_pct", 2.5) / 100.0,
-            open_sky=bool(opts.get("open_sky", True)),
+            open_sky=bool(opts.get("open_sky", False)),
             exposure_offset_ev=self._exposure_offset,
             wb_scale=tuple(float(c) for c in self._wb_scale),
-            cc_matrix=self._cc_matrix,
+            cc_matrix=self._active_cc_for_bake()[0],
+            cc_gains=self._active_cc_for_bake()[1],
+            cc_gammas=self._active_cc_for_bake()[2],
             input_colorspace=self._input_cs,
             output_colorspace=self._output_cs,
         )
@@ -2285,21 +2953,31 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _write_combined_layer(self) -> Path | None:
-        """Write a tiny stage that sublayers the light rig over the depth mesh,
-        so usdview can show both at once. Returns the combined layer's path."""
-        if self._last_usd is None or self._last_mesh is None:
+        """Return the combined-scene USD if it exists (bake writes one any
+        time at least one of light rig / depth mesh was exported). Falls back
+        to writing a minimal sublayer file pointing at whichever piece exists
+        — handy if the user clicked "Open both in usdview" before re-baking."""
+        base = None
+        if self._last_usd is not None:
+            base = self._last_usd.parent
+        elif self._last_mesh is not None:
+            base = self._last_mesh.parent
+        if base is None:
             return None
-        out = self._last_usd.parent / "usdview_layered.usda"
-        out.write_text(
-            "#usda 1.0\n"
-            "(\n"
-            "    subLayers = [\n"
-            f"        @./{self._last_usd.name}@,\n"
-            f"        @./{self._last_mesh.name}@\n"
-            "    ]\n"
-            ")\n"
-        )
-        return out
+        combined = base / "scene.usda"
+        if combined.exists():
+            return combined
+        # Fallback: build it on the fly from whatever paths the app has.
+        layers = [p for p in (self._last_usd, self._last_mesh) if p is not None]
+        if not layers:
+            return None
+        lines = ["#usda 1.0", "(", "    subLayers = ["]
+        for i, p in enumerate(layers):
+            sep = "," if i < len(layers) - 1 else ""
+            lines.append(f"        @./{p.name}@{sep}")
+        lines += ["    ]", ")", ""]
+        combined.write_text("\n".join(lines))
+        return combined
 
     def _launch_usdview(self, kind: str = "light"):
         """Open a baked stage in usdview. `kind` is 'light', 'mesh', or 'both'

@@ -29,6 +29,10 @@ ACCENT      = "#4f9fe0"   # primary accent (selection, focus, primary button)
 ACCENT_HOT  = "#63b0ee"   # accent hover
 ACCENT_DEEP = "#2f6ea6"   # accent pressed
 
+DANGER      = "#a04545"   # destructive intent (Clear, Delete) — faint red tint
+DANGER_HOT  = "#b75555"
+DANGER_DEEP = "#7e3434"
+
 _STYLESHEET = f"""
 * {{
     outline: 0;
@@ -56,8 +60,8 @@ QGroupBox {{
     background-color: {BG_SURFACE};
     border: 1px solid {BORDER};
     border-radius: 5px;
-    margin-top: 14px;
-    padding: 10px 8px 8px 8px;
+    margin-top: 12px;
+    padding: 8px 6px 6px 6px;
     font-weight: 600;
 }}
 QGroupBox::title {{
@@ -76,8 +80,8 @@ QPushButton {{
     background-color: {BG_RAISED};
     border: 1px solid {BORDER};
     border-radius: 4px;
-    padding: 6px 12px;
-    min-height: 16px;
+    padding: 4px 10px;
+    min-height: 14px;
 }}
 QPushButton:hover {{
     background-color: {BG_HOVER};
@@ -112,6 +116,37 @@ QPushButton#primary:disabled {{
     background-color: {BG_RAISED};
     border-color: {BORDER};
     color: {TEXT_DIM};
+}}
+/* Destructive actions (Clear, Delete) — faint red. */
+QPushButton#danger {{
+    background-color: {DANGER};
+    border-color: {DANGER_DEEP};
+    color: #ffffff;
+}}
+QPushButton#danger:hover {{
+    background-color: {DANGER_HOT};
+}}
+QPushButton#danger:pressed {{
+    background-color: {DANGER_DEEP};
+}}
+QPushButton#danger:disabled {{
+    background-color: {BG_RAISED};
+    border-color: {BORDER};
+    color: {TEXT_DIM};
+}}
+/* Subtle / secondary actions (presets, low-emphasis buttons). */
+QPushButton#subtle {{
+    background-color: transparent;
+    border: 1px solid {BORDER_SOFT};
+    color: {TEXT_MUTED};
+    padding: 4px 8px;
+}}
+QPushButton#subtle:hover {{
+    background-color: {BG_HOVER};
+    color: {TEXT};
+}}
+QPushButton#subtle:pressed {{
+    background-color: {BG_INPUT};
 }}
 
 /* ---- toolbar ---- */
@@ -334,6 +369,21 @@ QProgressBar {{
 QProgressBar::chunk {{
     background-color: {ACCENT};
     border-radius: 3px;
+}}
+/* Thin indeterminate marquee at the bottom of the viewer. Borderless so it
+   sits flush across the full window width. */
+QProgressBar#busyStrip {{
+    background-color: {BG_INPUT};
+    border: 0;
+    border-top: 1px solid {BORDER};
+    border-radius: 0;
+    height: 3px;
+    margin: 0;
+}}
+QProgressBar#busyStrip::chunk {{
+    background-color: {ACCENT};
+    border-radius: 0;
+    margin: 0;
 }}
 
 /* ---- scroll bars ---- */

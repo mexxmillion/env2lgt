@@ -185,12 +185,144 @@ class _ChartHandle(QGraphicsEllipseItem):
         return super().itemChange(change, value)
 
 
+class _RegionHandle(QGraphicsEllipseItem):
+    """Draggable corner handle for a region rect (calibration regions mode).
+    Constant-pixel-size; routes drags to the owning viewer."""
+
+    def __init__(self, pair_index: int, slot: str, corner_index: int, owner: "PanoramaViewer"):
+        super().__init__(-HANDLE_R, -HANDLE_R, HANDLE_R * 2, HANDLE_R * 2)
+        self._pair_index = int(pair_index)
+        self._slot = str(slot)
+        self._corner_index = int(corner_index)
+        self._owner = owner
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsScenePositionChanges, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self.setZValue(220)
+        self._suppress_notify = False
+
+    def set_scene_pos_silent(self, x: float, y: float) -> None:
+        self._suppress_notify = True
+        self.setPos(QPointF(x, y))
+        self._suppress_notify = False
+
+    def itemChange(self, change, value):  # noqa: N802
+        if (
+            change == QGraphicsItem.GraphicsItemChange.ItemScenePositionHasChanged
+            and not self._suppress_notify
+        ):
+            self._owner._on_region_handle_moved(
+                self._pair_index, self._slot, self._corner_index, self.scenePos()
+            )
+        return super().itemChange(change, value)
+
+    def mousePressEvent(self, event):  # noqa: N802
+        # Click on a handle also selects the pair.
+        self._owner._on_region_selected(self._pair_index)
+        super().mousePressEvent(event)
+
+
+class _RegionMoveHandle(QGraphicsPathItem):
+    """A "+" glyph drawn at the centre of a region rect. Drag to move the
+    whole rect; constant pixel size so it stays grabbable at any zoom."""
+
+    def __init__(self, pair_index: int, slot: str, owner: "PanoramaViewer"):
+        super().__init__()
+        self._pair_index = int(pair_index)
+        self._slot = str(slot)
+        self._owner = owner
+        r = HANDLE_R + 2
+        path = QPainterPath()
+        path.moveTo(-r, 0); path.lineTo(r, 0)
+        path.moveTo(0, -r); path.lineTo(0, r)
+        self.setPath(path)
+        # A small invisible square enlarges the hit area beyond the thin glyph.
+        self._hit_radius = r + 2
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsScenePositionChanges, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self.setZValue(225)
+        self._suppress_notify = False
+        # Last known centre (scene coords) so we can compute drag deltas.
+        self._last_centre = QPointF(0.0, 0.0)
+
+    def boundingRect(self):  # noqa: N802
+        r = self._hit_radius
+        return QRectF(-r, -r, 2 * r, 2 * r)
+
+    def shape(self):  # noqa: N802
+        # Wider hit shape than the glyph so the user can grab it easily.
+        r = self._hit_radius
+        path = QPainterPath()
+        path.addRect(QRectF(-r, -r, 2 * r, 2 * r))
+        return path
+
+    def set_scene_pos_silent(self, x: float, y: float) -> None:
+        self._suppress_notify = True
+        self.setPos(QPointF(x, y))
+        self._last_centre = QPointF(x, y)
+        self._suppress_notify = False
+
+    def itemChange(self, change, value):  # noqa: N802
+        if (
+            change == QGraphicsItem.GraphicsItemChange.ItemScenePositionHasChanged
+            and not self._suppress_notify
+        ):
+            self._owner._on_region_move_handle_dragged(
+                self._pair_index, self._slot, self.scenePos(), self._last_centre
+            )
+        return super().itemChange(change, value)
+
+    def mousePressEvent(self, event):  # noqa: N802
+        self._owner._on_region_selected(self._pair_index)
+        super().mousePressEvent(event)
+
+
+class _RegionBodyItem(QGraphicsRectItem):
+    """The rect body of one region in one slot (HDR or REF). Drag-to-move."""
+
+    def __init__(self, pair_index: int, slot: str, owner: "PanoramaViewer"):
+        super().__init__(0.0, 0.0, 1.0, 1.0)
+        self._pair_index = int(pair_index)
+        self._slot = str(slot)
+        self._owner = owner
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsScenePositionChanges, True)
+        self._suppress_notify = False
+
+    def set_pos_silent(self, x: float, y: float) -> None:
+        self._suppress_notify = True
+        self.setPos(QPointF(x, y))
+        self._suppress_notify = False
+
+    def set_rect_silent(self, x: float, y: float, w: float, h: float) -> None:
+        self._suppress_notify = True
+        self.setRect(0.0, 0.0, max(2.0, w), max(2.0, h))
+        self.setPos(QPointF(x, y))
+        self._suppress_notify = False
+
+    def itemChange(self, change, value):  # noqa: N802
+        if (
+            change == QGraphicsItem.GraphicsItemChange.ItemScenePositionHasChanged
+            and not self._suppress_notify
+        ):
+            self._owner._on_region_body_moved(self._pair_index, self._slot)
+        return super().itemChange(change, value)
+
+    def mousePressEvent(self, event):  # noqa: N802
+        # Body click selects the pair (in addition to letting Qt start a drag).
+        self._owner._on_region_selected(self._pair_index)
+        super().mousePressEvent(event)
+
+
 # ---------- viewer ----------
 
 class PanoramaViewer(QGraphicsView):
     quad_committed = Signal(LightQuad)  # new quad finished (4-click placement)
     quad_modified = Signal(str)         # name of quad whose vertices were edited
     quad_selected = Signal(str)         # name; empty string to deselect
+    quads_delete_requested = Signal(list)  # marquee-selected names, Del key
+    quads_marquee_changed = Signal(list)   # marquee selection set changed
     quad_lock_changed = Signal(str, bool)  # name, locked — auto-lock on edit
     quad_fit_changed = Signal(str, bool)   # name, is_rect_fitted — toggled on
                                             # depth-snap + auto-invalidated on edit
@@ -202,6 +334,11 @@ class PanoramaViewer(QGraphicsView):
     chart_committed = Signal()          # colour-chart 4 corners finished
     chart_modified = Signal()           # colour-chart corner dragged
     chart_mode_changed = Signal(bool)
+    # Region-pair calibration. Pair rects are persistent + draggable; the
+    # viewer reports edits live. Selection is shared across HDR / REF views.
+    region_pair_selected = Signal(int)            # pair_index, -1 = deselect
+    region_pair_modified = Signal(int, str)       # pair_index, "hdri"|"ref"
+    region_pair_delete_requested = Signal(int)    # Delete-key on selected pair
 
     MODE_SELECT = "select"
     MODE_ADD = "add"
@@ -239,6 +376,12 @@ class PanoramaViewer(QGraphicsView):
         self._quads: dict[str, LightQuad] = {}
         self._quad_items: dict[str, QGraphicsPathItem] = {}
         self._selected: str | None = None
+        # Multi-selection set built by drag-marquee in select mode. Separate
+        # from `_selected` (which still drives the per-corner edit handles).
+        self._marquee_selected: set[str] = set()
+        self._marquee_active: bool = False
+        self._marquee_start: QPointF | None = None
+        self._marquee_rect_item: QGraphicsRectItem | None = None
         # Vertex handles for the currently selected quad (rebuilt on selection change).
         self._vertex_handles: list[_VertexHandle] = []
         # Auto-detect key-mask preview overlay (an RGBA QImage, display res).
@@ -248,8 +391,12 @@ class PanoramaViewer(QGraphicsView):
         self._sampling = False
         self._sample_start: QPointF | None = None
         self._sample_rect_item: QGraphicsRectItem | None = None
-        # Quads hidden in exposure mode.
+        # Quads hidden in exposure mode; chart + region items hidden outside it.
         self._quads_visible = True
+        self._calibration_visible = True
+        # Last-rendered yaw, so the fast-path swap can re-project quad/chart/
+        # region paths only when yaw actually changed (cheap when it hasn't).
+        self._last_rendered_yaw_px = 0
         # Colour-checker chart. Two independent slots so the HDRI chart and a
         # flat reference-image chart both survive a view switch:
         #   _chart_dirs : (4,3) corner dirs   — used on the equirect panorama
@@ -264,6 +411,15 @@ class PanoramaViewer(QGraphicsView):
         self._chart_handles: list[_ChartHandle] = []
         self._placing_chart: list[np.ndarray] = []
         self._placing_chart_dots: list[QGraphicsEllipseItem] = []
+        # Region-pair calibration state. Pairs are persistent + editable;
+        # selecting a pair highlights its rect on whichever view is showing.
+        #   _region_pairs: list of {"name": str, "hdri_uv": [u0,v0,u1,v1],
+        #                           "ref_uv": [u0,v0,u1,v1]}
+        #   _region_items: dict[(pair_i, slot)] -> {"body": item, "handles": [..],
+        #                                            "label": item}
+        self._region_pairs: list[dict] = []
+        self._region_items: dict = {}
+        self._region_selected: int = -1
 
     # ---------- mode ----------
 
@@ -336,6 +492,30 @@ class PanoramaViewer(QGraphicsView):
             item.setVisible(self._quads_visible)
         for h in self._vertex_handles:
             h.setVisible(self._quads_visible)
+
+    def set_calibration_visible(self, visible: bool) -> None:
+        """Show/hide all chart + region-pair items. Used to keep calibration
+        overlays confined to exposure mode (so the lights view is uncluttered).
+        Data is preserved; only scene visibility changes."""
+        self._calibration_visible = bool(visible)
+        # Chart items.
+        for it in (self._chart_item, self._chart_grid_item):
+            if it is not None:
+                it.setVisible(self._calibration_visible)
+        for it in self._chart_cell_items:
+            it.setVisible(self._calibration_visible)
+        for h in self._chart_handles:
+            h.setVisible(self._calibration_visible)
+        for d in self._placing_chart_dots:
+            d.setVisible(self._calibration_visible)
+        # Region items.
+        for entry in self._region_items.values():
+            for k in ("body", "label", "move"):
+                it = entry.get(k)
+                if it is not None:
+                    it.setVisible(self._calibration_visible)
+            for h in entry.get("handles", []):
+                h.setVisible(self._calibration_visible)
 
     # ---------- colour-checker chart ----------
 
@@ -410,6 +590,9 @@ class PanoramaViewer(QGraphicsView):
         chart) vs the equirect panorama (spherical chart). Call before
         set_image() for the new view."""
         self._flat_mode = bool(flat)
+        # Region overlays are filtered by view; re-render so the inactive
+        # view's rects are hidden and the active view's are shown.
+        self._refresh_regions()
 
     def _active_chart(self):
         return self._chart_uv if self._flat_mode else self._chart_dirs
@@ -556,6 +739,10 @@ class PanoramaViewer(QGraphicsView):
             self._scene.addItem(h)
             h.set_pano_pos_silent(*self._chart_corner_display(i))
             self._chart_handles.append(h)
+        # Rebuilt items default to visible — re-apply the calibration-visible
+        # flag so the chart stays hidden when we're not in exposure mode.
+        if not self._calibration_visible:
+            self.set_calibration_visible(False)
 
     def on_chart_vertex_dragged(self, index: int, scene_pos: QPointF) -> None:
         if self._active_chart() is None:
@@ -576,19 +763,365 @@ class PanoramaViewer(QGraphicsView):
         self._build_chart_shapes()
         self.chart_modified.emit()
 
+    # ---------- region-pair calibration ----------
+
+    # A small palette cycled per-pair; mirrors the Lights outliner colour rules.
+    _REGION_PALETTE = [
+        (120, 220, 255),  # cyan
+        (255, 170, 80),   # orange
+        (140, 230, 140),  # green
+        (240, 130, 240),  # magenta
+        (240, 220, 120),  # yellow
+        (180, 160, 255),  # lavender
+    ]
+
+    @classmethod
+    def region_pair_color(cls, pair_index: int) -> tuple:
+        return cls._REGION_PALETTE[pair_index % len(cls._REGION_PALETTE)]
+
+    def set_region_pairs(
+        self, pairs: list, selected: int = -1
+    ) -> None:
+        """Replace the region-pair list. Each pair is a dict with "hdri_uv"
+        and "ref_uv" (each [u0,v0,u1,v1] normalised, or empty). `selected` is
+        the pair index to highlight (-1 = none)."""
+        self._region_pairs = [
+            {
+                "name": str(p.get("name") or f"Region {i + 1}"),
+                "hdri_uv": list(p.get("hdri_uv", []) or []),
+                "ref_uv": list(p.get("ref_uv", []) or []),
+            }
+            for i, p in enumerate(pairs or [])
+        ]
+        self._region_selected = int(selected)
+        self._refresh_regions()
+
+    def set_region_selection(self, pair_index: int) -> None:
+        """Highlight a pair without rebuilding (panel -> viewer sync)."""
+        new = int(pair_index)
+        if new == self._region_selected:
+            return
+        self._region_selected = new
+        self._restyle_regions()
+
+    def region_pairs(self) -> list:
+        return [dict(p) for p in self._region_pairs]
+
+    def region_selected(self) -> int:
+        return self._region_selected
+
+    def _clear_region_items(self) -> None:
+        for entry in self._region_items.values():
+            for k in ("body", "label", "move"):
+                it = entry.get(k)
+                if it is not None:
+                    self._scene.removeItem(it)
+            for h in entry.get("handles", []):
+                self._scene.removeItem(h)
+        self._region_items = {}
+
+    def _refresh_regions(self) -> None:
+        """Rebuild rect items for the currently shown view."""
+        self._clear_region_items()
+        if self._W <= 0:
+            return
+        slot = "ref" if self._flat_mode else "hdri"
+        for i, pair in enumerate(self._region_pairs):
+            uv = pair.get(f"{slot}_uv") or []
+            if len(uv) != 4:
+                continue
+            self._build_region_items(i, slot, uv)
+        self._restyle_regions()
+        # Rebuilt items default to visible — re-apply the calibration-visible
+        # flag so regions stay hidden when we're not in exposure mode (e.g.
+        # after a project restore that calls set_region_pairs directly).
+        if not self._calibration_visible:
+            self.set_calibration_visible(False)
+
+    def _build_region_items(self, pair_index: int, slot: str, uv: list) -> None:
+        u0, v0, u1, v1 = uv
+        v0, v1 = sorted((float(v0), float(v1)))
+        u0, u1 = float(u0), float(u1)
+        # For HDR, u1 may be < u0 — that means the rect wraps across the abs
+        # equirect seam, which is a valid 2D rect on the cyclic panorama.
+        # Use cyclic distance so we never sort-and-stretch.
+        if slot == "hdri":
+            width_fraction = (u1 - u0) if u1 >= u0 else (1.0 - u0 + u1)
+            x0 = self._abs_to_display_x(u0 * self._W)
+        else:
+            # Flat reference image — no wrap.
+            if u1 < u0:
+                u0, u1 = u1, u0
+            width_fraction = u1 - u0
+            x0 = u0 * self._W
+        # Sanity cap absurdly wide stored rects (legacy bug data).
+        if width_fraction > 0.9:
+            width_fraction = 0.15
+            half = width_fraction * 0.5
+            u0 = 0.5 - half
+            u1 = 0.5 + half
+            x0 = self._abs_to_display_x(u0 * self._W) if slot == "hdri" else u0 * self._W
+            self._region_pairs[pair_index][f"{slot}_uv"] = [
+                float(u0), float(v0), float(u1), float(v1)
+            ]
+        width_px = max(2.0, width_fraction * self._W)
+        y0 = v0 * self._H
+        y1 = v1 * self._H
+        body = _RegionBodyItem(pair_index, slot, self)
+        body.setRect(0.0, 0.0, width_px, max(2.0, y1 - y0))
+        body.setPos(QPointF(x0, y0))
+        body.setZValue(18)
+        self._scene.addItem(body)
+        handles = []
+        for ci in range(4):
+            h = _RegionHandle(pair_index, slot, ci, self)
+            self._scene.addItem(h)
+            handles.append(h)
+        move = _RegionMoveHandle(pair_index, slot, self)
+        self._scene.addItem(move)
+        label = self._scene.addSimpleText(
+            self._region_pairs[pair_index].get("name") or f"Region {pair_index + 1}"
+        )
+        label.setBrush(QBrush(QColor(255, 255, 255)))
+        label.setPen(QPen(QColor(0, 0, 0), 1))
+        label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        label.setZValue(19)
+        self._region_items[(pair_index, slot)] = {
+            "body": body, "handles": handles, "move": move, "label": label,
+        }
+        self._sync_region_handles(pair_index, slot)
+
+    def _sync_region_handles(self, pair_index: int, slot: str) -> None:
+        """Reposition the 4 corner handles + centre + label from the body."""
+        entry = self._region_items.get((pair_index, slot))
+        if entry is None:
+            return
+        body = entry["body"]
+        pos = body.scenePos()
+        r = body.rect()
+        x0, y0 = pos.x(), pos.y()
+        x1, y1 = x0 + r.width(), y0 + r.height()
+        corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        for h, (cx, cy) in zip(entry["handles"], corners):
+            h.set_scene_pos_silent(cx, cy)
+        cx_c, cy_c = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+        move = entry.get("move")
+        if move is not None:
+            move.set_scene_pos_silent(cx_c, cy_c)
+        entry["label"].setPos(QPointF(x0 + 4, y0 + 2))
+
+    def _restyle_regions(self) -> None:
+        for (pair_i, _slot), entry in self._region_items.items():
+            sel = (pair_i == self._region_selected)
+            col = QColor(*self.region_pair_color(pair_i))
+            stroke = QPen(col, 3 if sel else 1.5)
+            stroke.setCosmetic(True)
+            fill_col = QColor(col)
+            fill_col.setAlpha(80 if sel else 36)
+            entry["body"].setPen(stroke)
+            entry["body"].setBrush(QBrush(fill_col))
+            handle_fill = QColor(col) if sel else QColor(30, 30, 30)
+            for h in entry["handles"]:
+                h.setBrush(QBrush(handle_fill))
+                h.setPen(QPen(col, 2 if sel else 1))
+            move = entry.get("move")
+            if move is not None:
+                move_pen = QPen(col, 3 if sel else 2)
+                move_pen.setCosmetic(True)
+                move.setPen(move_pen)
+
+    # ---------- region edit callbacks (from items) ----------
+
+    def _on_region_body_moved(self, pair_index: int, slot: str) -> None:
+        entry = self._region_items.get((pair_index, slot))
+        if entry is None:
+            return
+        body = entry["body"]
+        pos = body.scenePos()
+        r = body.rect()
+        width, height = r.width(), r.height()
+        # Clamp purely in display space so the rect stays inside the image
+        # the user is looking at — no snapping. The stored UV is then derived
+        # from the display position and may cross the abs equirect seam
+        # (u1 < u0); rendering and sampling both handle that case.
+        new_x = float(np.clip(pos.x(), 0.0, max(0.0, self._W - width)))
+        new_y = float(np.clip(pos.y(), 0.0, max(0.0, self._H - height)))
+        if new_x != pos.x() or new_y != pos.y():
+            body.set_pos_silent(new_x, new_y)
+        if slot == "hdri":
+            abs_x0 = self._display_to_abs_x(new_x)
+            u0 = abs_x0 / self._W
+            u1 = ((abs_x0 + width) / self._W) % 1.0
+        else:
+            u0 = new_x / self._W
+            u1 = (new_x + width) / self._W
+        v0 = new_y / self._H
+        v1 = (new_y + height) / self._H
+        self._region_pairs[pair_index][f"{slot}_uv"] = [
+            float(u0), float(v0), float(u1), float(v1)
+        ]
+        self._sync_region_handles(pair_index, slot)
+        self.region_pair_modified.emit(pair_index, slot)
+
+    def _on_region_handle_moved(
+        self, pair_index: int, slot: str, corner_index: int, scene_pos: QPointF
+    ) -> None:
+        entry = self._region_items.get((pair_index, slot))
+        if entry is None:
+            return
+        body = entry["body"]
+        pos = body.scenePos()
+        r = body.rect()
+        x0, y0 = pos.x(), pos.y()
+        x1, y1 = x0 + r.width(), y0 + r.height()
+        nx = float(np.clip(scene_pos.x(), 0.0, self._W - 1))
+        ny = float(np.clip(scene_pos.y(), 0.0, self._H - 1))
+        if corner_index == 0:   # TL
+            x0, y0 = nx, ny
+        elif corner_index == 1:  # TR
+            x1, y0 = nx, ny
+        elif corner_index == 2:  # BR
+            x1, y1 = nx, ny
+        else:                    # BL
+            x0, y1 = nx, ny
+        if x1 < x0:
+            x0, x1 = x1, x0
+        if y1 < y0:
+            y0, y1 = y1, y0
+        x1 = max(x0 + 2.0, x1)
+        y1 = max(y0 + 2.0, y1)
+        if slot == "hdri":
+            abs_x0 = self._display_to_abs_x(x0)
+            width = x1 - x0
+            u0 = abs_x0 / self._W
+            u1 = ((abs_x0 + width) / self._W) % 1.0
+        else:
+            u0, u1 = x0 / self._W, x1 / self._W
+        v0, v1 = y0 / self._H, y1 / self._H
+        body.set_rect_silent(x0, y0, x1 - x0, y1 - y0)
+        self._region_pairs[pair_index][f"{slot}_uv"] = [
+            float(u0), float(v0), float(u1), float(v1)
+        ]
+        self._sync_region_handles(pair_index, slot)
+        self.region_pair_modified.emit(pair_index, slot)
+
+    def _on_region_move_handle_dragged(
+        self, pair_index: int, slot: str,
+        new_centre: QPointF, last_centre: QPointF,
+    ) -> None:
+        """Centre "+" handle dragged — translate the body by the delta."""
+        entry = self._region_items.get((pair_index, slot))
+        if entry is None:
+            return
+        body = entry["body"]
+        r = body.rect()
+        pos = body.scenePos()
+        # Translate body so its centre tracks the handle.
+        new_x = float(np.clip(
+            new_centre.x() - 0.5 * r.width(),
+            0.0, max(0.0, self._W - r.width()),
+        ))
+        new_y = float(np.clip(
+            new_centre.y() - 0.5 * r.height(),
+            0.0, max(0.0, self._H - r.height()),
+        ))
+        body.set_pos_silent(new_x, new_y)
+        # Recompute uv and resync everything (incl. the centre handle itself).
+        self._on_region_body_moved(pair_index, slot)
+
+    # ---------- quad marquee multi-selection ----------
+
+    def _clear_marquee_selection(self) -> None:
+        if not self._marquee_selected:
+            return
+        prev = self._marquee_selected
+        self._marquee_selected = set()
+        for name in prev:
+            item = self._quad_items.get(name)
+            if item is not None:
+                # Restore default pen (color from quad style).
+                self._apply_default_quad_pen(name)
+        self.quads_marquee_changed.emit([])
+
+    def _restyle_marquee_selection(self) -> None:
+        # Mark selected items with a distinct accent stroke.
+        pen = QPen(QColor(120, 220, 255), 3)
+        pen.setCosmetic(True)
+        for name, item in self._quad_items.items():
+            if name in self._marquee_selected:
+                item.setPen(pen)
+            else:
+                self._apply_default_quad_pen(name)
+
+    def marquee_selected_quads(self) -> list[str]:
+        return list(self._marquee_selected)
+
+    def _apply_default_quad_pen(self, name: str) -> None:
+        """Restore a quad's normal outline (used to revert marquee highlight).
+        Delegates to the shared `_quad_pen` so user/auto/locked/fitted styles
+        stay consistent."""
+        item = self._quad_items.get(name)
+        q = self._quads.get(name)
+        if item is None or q is None:
+            return
+        item.setPen(self._quad_pen(q, selected=(name == self._selected)))
+
+    def _on_region_selected(self, pair_index: int) -> None:
+        if self._region_selected == pair_index:
+            return
+        self._region_selected = pair_index
+        self._restyle_regions()
+        self.region_pair_selected.emit(pair_index)
+
     # ---------- image ----------
 
     def set_image(self, qimg: QImage) -> None:
+        # Hot path: exposure / yaw / wb sliders re-push a QImage every tick at
+        # the SAME resolution. Don't tear down the whole scene every time —
+        # just swap the pixmap on the existing bg item. This keeps quads,
+        # chart, region rects, handles etc. alive (Qt is fast at swapping a
+        # pixmap; it's slow at recreating dozens of QGraphicsItems per frame).
+        if (
+            self._bg_item is not None
+            and qimg.width() == self._W and qimg.height() == self._H
+            and self._W > 0
+        ):
+            self._bg_item.setPixmap(QPixmap.fromImage(qimg))
+            # Yaw-dependent overlays (quad paths, vertex handles, chart, HDR
+            # region rects) need re-projection only when yaw actually moved.
+            yaw_changed = self._yaw_offset_px != self._last_rendered_yaw_px
+            if yaw_changed:
+                # Quads — re-project their great-circle paths.
+                for name, q in self._quads.items():
+                    if name in self._quad_items:
+                        self._refresh_quad_path(q)
+                # Selected quad's draggable vertex handles.
+                if self._selected and self._selected in self._quads:
+                    q = self._quads[self._selected]
+                    for h, d in zip(self._vertex_handles, q.corners_dirs):
+                        x, y = self._dir_to_display_pix(d)
+                        h.set_pano_pos_silent(x, y)
+                # Chart — only the HDR-slot chart depends on yaw.
+                if self._chart_dirs is not None and not self._flat_mode:
+                    self._clear_chart_shapes()
+                    self._build_chart_shapes()
+                    for i, h in enumerate(self._chart_handles):
+                        h.set_pano_pos_silent(*self._chart_corner_display(i))
+                # HDR region rects.
+                if self._region_pairs:
+                    for (pair_i, slot) in list(self._region_items.keys()):
+                        if slot == "hdri":
+                            self._reposition_region_for_yaw(pair_i)
+                self._last_rendered_yaw_px = self._yaw_offset_px
+            return
+
         had_quads = dict(self._quads)
         sel = self._selected
-        # Preserve zoom/pan across a re-render at the same resolution (the
-        # exposure / yaw sliders re-push an image every tick — the view must
-        # not snap back to fit). Only fit on a genuine resolution change.
-        prev_w, prev_h = self._W, self._H
-        keep_view = prev_w == qimg.width() and prev_h == qimg.height() and prev_w > 0
         saved_transform = self.transform()
         saved_h = self.horizontalScrollBar().value()
         saved_v = self.verticalScrollBar().value()
+        prev_w, prev_h = self._W, self._H
+        keep_view = prev_w == qimg.width() and prev_h == qimg.height() and prev_w > 0
         self._scene.clear()
         self._quad_items.clear()
         self._vertex_handles.clear()
@@ -612,6 +1145,9 @@ class PanoramaViewer(QGraphicsView):
             self._set_selected(sel)
         if self._active_chart() is not None:
             self._refresh_chart()
+        self._region_items = {}
+        if self._region_pairs:
+            self._refresh_regions()
         if keep_view:
             self.setTransform(saved_transform)
             self.horizontalScrollBar().setValue(saved_h)
@@ -620,6 +1156,28 @@ class PanoramaViewer(QGraphicsView):
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         if not self._quads_visible:
             self.set_quads_visible(False)
+        if not self._calibration_visible:
+            self.set_calibration_visible(False)
+        self._last_rendered_yaw_px = self._yaw_offset_px
+
+    def _reposition_region_for_yaw(self, pair_index: int) -> None:
+        """Cheap re-sync of an HDR-slot region rect after a yaw change — moves
+        the existing items instead of recreating them."""
+        entry = self._region_items.get((pair_index, "hdri"))
+        if entry is None:
+            return
+        pair = self._region_pairs[pair_index] if pair_index < len(self._region_pairs) else None
+        if not pair:
+            return
+        uv = pair.get("hdri_uv") or []
+        if len(uv) != 4:
+            return
+        u0, v0, u1, v1 = uv
+        body = entry["body"]
+        x0 = self._abs_to_display_x(float(u0) * self._W)
+        y0 = float(v0) * self._H
+        body.set_pos_silent(x0, y0)
+        self._sync_region_handles(pair_index, "hdri")
 
     # ---------- auto-detect key-mask overlay ----------
 
@@ -685,6 +1243,9 @@ class PanoramaViewer(QGraphicsView):
         self._chart_handles = []
         self._placing_chart = []
         self._placing_chart_dots = []
+        self._region_pairs = []
+        self._region_items = {}
+        self._region_selected = -1
 
     def fit_view(self) -> None:
         """Fit the whole panorama in the viewport (reset zoom/pan)."""
@@ -738,10 +1299,18 @@ class PanoramaViewer(QGraphicsView):
             event.accept()
             return
 
-        # Let vertex handles handle their own clicks (handled by Qt's item system
-        # because the handles have ItemIsMovable + are above the bg).
+        # Let interactive scene items (drag handles, region bodies) handle
+        # their own clicks via Qt's item-event flow. Without this early-out
+        # the empty-area marquee branch below would swallow clicks that
+        # belong to a region rect or chart corner.
         item = self.itemAt(event.position().toPoint())
-        if isinstance(item, _VertexHandle):
+        if isinstance(item, (
+            _VertexHandle,
+            _ChartHandle,
+            _RegionHandle,
+            _RegionMoveHandle,
+            _RegionBodyItem,
+        )):
             return super().mousePressEvent(event)
 
         # Select mode: hit-test for selection
@@ -749,6 +1318,25 @@ class PanoramaViewer(QGraphicsView):
         if hit is not None:
             self._set_selected(hit)
             self.quad_selected.emit(hit)
+            self._clear_marquee_selection()
+            return
+        # Empty area click — start a drag-marquee for multi-select. The
+        # release handler intersects the final rect against each quad's
+        # display-space bounding box.
+        if self._quads:
+            self._marquee_active = True
+            self._marquee_start = scene_pt
+            pen = QPen(QColor(120, 220, 255), 0, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            self._marquee_rect_item = self._scene.addRect(
+                QRectF(scene_pt, scene_pt), pen,
+                QBrush(QColor(120, 220, 255, 40)),
+            )
+            self._marquee_rect_item.setZValue(230)
+            self._set_selected(None)
+            self.quad_selected.emit("")
+            self._clear_marquee_selection()
+            event.accept()
             return
         self._set_selected(None)
         self.quad_selected.emit("")
@@ -763,6 +1351,14 @@ class PanoramaViewer(QGraphicsView):
             vbar = self.verticalScrollBar()
             hbar.setValue(hbar.value() - int(delta.x()))
             vbar.setValue(vbar.value() - int(delta.y()))
+            event.accept()
+            return
+        # Drag-marquee: grow the rubber-band rectangle.
+        if self._marquee_active and self._marquee_start is not None:
+            sp = self.mapToScene(event.position().toPoint())
+            rect = QRectF(self._marquee_start, sp).normalized()
+            if self._marquee_rect_item is not None:
+                self._marquee_rect_item.setRect(rect)
             event.accept()
             return
         # Sample mode: grow the rubber-band rectangle.
@@ -796,6 +1392,34 @@ class PanoramaViewer(QGraphicsView):
             return
         if (
             event.button() == Qt.MouseButton.LeftButton
+            and self._marquee_active
+            and self._marquee_start is not None
+        ):
+            self._marquee_active = False
+            sp = self.mapToScene(event.position().toPoint())
+            rect = QRectF(self._marquee_start, sp).normalized()
+            self._marquee_start = None
+            if self._marquee_rect_item is not None:
+                self._scene.removeItem(self._marquee_rect_item)
+                self._marquee_rect_item = None
+            # Pick quads whose display-space bbox intersects the marquee.
+            hits = []
+            if rect.width() > 1.0 and rect.height() > 1.0:
+                for name, item in self._quad_items.items():
+                    if not item.isVisible():
+                        continue
+                    if rect.intersects(item.boundingRect()):
+                        hits.append(name)
+            self._marquee_selected = set(hits)
+            self._restyle_marquee_selection()
+            self.quads_marquee_changed.emit(list(self._marquee_selected))
+            # Keep keyboard focus on the viewer so Delete fires here without
+            # the user having to click back into the panorama first.
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            event.accept()
+            return
+        if (
+            event.button() == Qt.MouseButton.LeftButton
             and self._sampling
             and self._sample_start is not None
         ):
@@ -817,6 +1441,20 @@ class PanoramaViewer(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):  # noqa: N802
+        # Marquee-multi-select delete: when a drag-selected group exists,
+        # Delete / Backspace fires `quads_delete_requested(list[str])` so the
+        # app can remove them all and refresh the panel.
+        if (
+            event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
+            and self._marquee_selected
+        ):
+            names = list(self._marquee_selected)
+            self._clear_marquee_selection()
+            self.quads_delete_requested.emit(names)
+            return
+        if event.key() == Qt.Key.Key_Escape and self._marquee_selected:
+            self._clear_marquee_selection()
+            return
         if event.key() == Qt.Key.Key_Escape and self._mode == self.MODE_ADD:
             self.cancel_add_mode()
             return
@@ -826,6 +1464,25 @@ class PanoramaViewer(QGraphicsView):
         if event.key() == Qt.Key.Key_Escape and self._mode == self.MODE_CHART:
             self.cancel_chart_mode()
             return
+        # Region pairs: arrow keys nudge the selected rect; Del removes it.
+        if self._region_selected >= 0 and self._region_pairs:
+            step = 10.0 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1.0
+            slot = "ref" if self._flat_mode else "hdri"
+            entry = self._region_items.get((self._region_selected, slot))
+            if entry is not None and event.key() in (
+                Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down
+            ):
+                dx = -step if event.key() == Qt.Key.Key_Left else step if event.key() == Qt.Key.Key_Right else 0.0
+                dy = -step if event.key() == Qt.Key.Key_Up else step if event.key() == Qt.Key.Key_Down else 0.0
+                body = entry["body"]
+                body.setPos(body.scenePos() + QPointF(dx, dy))
+                return
+            if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                self.region_pair_delete_requested.emit(self._region_selected)
+                return
+            if event.key() == Qt.Key.Key_Escape:
+                self._on_region_selected(-1)
+                return
         super().keyPressEvent(event)
 
     # ---------- 4-click placement ----------
@@ -1066,13 +1723,13 @@ class PanoramaViewer(QGraphicsView):
 
     @staticmethod
     def _quad_pen(q: LightQuad, selected: bool = False) -> QPen:
-        """Pen for a quad. Fitted quads get a thicker (3-pt) outline so the
-        rigid-rect status is visible without leaning on colour alone — useful
-        for colour-blind users and against busy panorama backgrounds."""
+        """Pen for a quad. Fitted quads get a slightly thicker outline so
+        the rigid-rect status is visible without leaning on colour alone —
+        useful for colour-blind users and against busy panorama backgrounds."""
         if selected:
-            pen = QPen(QColor(255, 200, 80), 3)
+            pen = QPen(QColor(255, 200, 80), 2.25)
         else:
-            pen = QPen(PanoramaViewer._quad_color(q), 3 if q.is_rect_fitted else 2)
+            pen = QPen(PanoramaViewer._quad_color(q), 2.25 if q.is_rect_fitted else 1.5)
         return pen
 
     def _add_quad_item(self, q: LightQuad):
@@ -1156,11 +1813,11 @@ class PanoramaViewer(QGraphicsView):
             q = self._quads.get(n)
             if n == name:
                 item.setPen(self._quad_pen(q, selected=True) if q is not None
-                            else QPen(QColor(255, 200, 80), 3))
+                            else QPen(QColor(255, 200, 80), 2.25))
                 item.setBrush(QBrush(QColor(255, 200, 80, 80)))
             else:
                 col = self._quad_color(q) if q is not None else QColor(60, 220, 255)
-                item.setPen(self._quad_pen(q) if q is not None else QPen(col, 2))
+                item.setPen(self._quad_pen(q) if q is not None else QPen(col, 1.5))
                 item.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(), 50)))
         self._refresh_vertex_handles()
 

@@ -65,8 +65,10 @@ class BakeOptions:
     # with them (avoids z-fighting / intersection in the viewport). 1.025 ≈ 2.5%.
     geom_inflation: float = 1.025
     # Drop the depth mesh's far/sky faces, leaving it open so the real dome
-    # shows through (for outdoor scenes).
-    open_sky: bool = True
+    # shows through (for outdoor scenes). Off by default — indoor / enclosed
+    # scenes are more common and benefit from a closed mesh; outdoor users
+    # enable explicitly.
+    open_sky: bool = False
     # Baseline HDRI adjustments from exposure mode, applied to the panorama
     # before any extraction so they bake into the dome / rect textures and
     # the derived intensities. exposure_offset_ev is in stops; wb_scale is a
@@ -75,6 +77,11 @@ class BakeOptions:
     wb_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
     # Colour-checker correction: 3x3 matrix (row-vector convention) or None.
     cc_matrix: object = None
+    # Region-pair calibration: per-channel gains+gammas (each (3,)) or None.
+    # Mutually exclusive with `cc_matrix` in practice — the app sets at most
+    # one based on the active calibration sub-mode.
+    cc_gains: object = None
+    cc_gammas: object = None
     # OCIO colorspaces. The source EXR is converted input -> working (ACEScg)
     # on load; baked dome / rect EXRs are converted working -> output on write.
     # Empty strings disable the transform (treat the EXR as already-working).
@@ -103,7 +110,7 @@ def bake(
     H, W, _ = hdr.shape
 
     from env2lgt import color
-    from env2lgt.colorchecker import apply_matrix
+    from env2lgt.colorchecker import apply_gain_gamma, apply_matrix
 
     # Input transform: source colorspace -> working space (ACEScg). Works
     # under both backends; identity if the source already is the working
@@ -119,6 +126,12 @@ def bake(
     # downstream product (dome, rect textures, integrated intensities).
     if opts.cc_matrix is not None:
         hdr = apply_matrix(hdr, np.asarray(opts.cc_matrix, dtype=np.float32))
+    if opts.cc_gains is not None and opts.cc_gammas is not None:
+        hdr = apply_gain_gamma(
+            hdr,
+            np.asarray(opts.cc_gains, dtype=np.float32),
+            np.asarray(opts.cc_gammas, dtype=np.float32),
+        )
     wb = np.asarray(opts.wb_scale, dtype=np.float32).reshape(1, 1, 3)
     gain = float(2.0 ** opts.exposure_offset_ev)
     if gain != 1.0 or not np.allclose(wb, 1.0):
@@ -179,7 +192,11 @@ def bake(
         tex_path: Path | None = None
         if opts.write_rects:
             out_h, out_w = _output_size_for_quad(fit.width, fit.height, max_dim=1024)
-            tex = sample_rect_texture(hdr, q.corners_dirs, out_h, out_w)
+            # True rectilinear projection onto the *fitted* rect plane —
+            # uses the rigid 3D rectangle (center + axes + width/height)
+            # rather than bilinear-blending the 4 corner dirs (an
+            # approximation that warps the interior for wide quads).
+            tex = sample_rect_texture(hdr, fit, out_h, out_w)
             tex_path = out_dir / f"{q.name}.exr"
             save_exr(tex_path, _to_output(tex))
 
@@ -264,6 +281,22 @@ def bake(
             geom_inflation=opts.geom_inflation,
             open_sky=opts.open_sky,
         )
+
+    # ---------- combined composition USD ----------
+    # A tiny stage that sublayers whatever was just written. Loads both the
+    # light rig and the depth mesh at once in usdview / Hydra / etc., and
+    # degrades gracefully when one of the two wasn't exported (it just
+    # sublayers the surviving file).
+    combined_path: Path | None = None
+    layers: list[Path] = [p for p in (usd_path, mesh_path) if p is not None]
+    if layers:
+        combined_path = out_dir / "scene.usda"
+        lines = ["#usda 1.0", "(", "    subLayers = ["]
+        for i, p in enumerate(layers):
+            sep = "," if i < len(layers) - 1 else ""
+            lines.append(f"        @./{p.name}@{sep}")
+        lines += ["    ]", ")", ""]
+        combined_path.write_text("\n".join(lines))
 
     # ---------- mask sidecar ----------
     if opts.write_mask_json:
