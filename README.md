@@ -10,9 +10,14 @@ Colour calibration against a reference photo is first-class: pick a 24-patch X-R
 > Author / maintainer: **Maung Maung Hla Win** &lt;mexxmillion@gmail.com&gt;.
 > If this tool helps your work, attribution is appreciated.
 
-![env2lgt GUI](docs/gui_preview.png)
+![env2lgt — light quads mode](docs/gui_lights.png)
 
-> *Above: the env2lgt main window. A 4K HDRI is loaded and auto-detect has proposed light quads on the ceiling fixtures. The toolbar carries the OCIO display, viewport exposure / gamma / yaw and depth controls; the right dock holds the quad list, auto-detect, output path and per-rig export options.*
+> *Light-rig mode: HDRI loaded, light quads drawn over the ceiling fixtures (auto-detect proposed the small ones, one large hand-placed quad highlights the selected fixture). The toolbar carries the OCIO display, viewport exposure / gamma / yaw, depth and exposure-mode controls; the right dock has the quad outliner, auto-detect settings, output path, and per-rig export options.*
+
+| Exposure mode — Regions | Exposure mode — CC24 chart |
+|---|---|
+| ![Exposure mode with paired-region colour match](docs/gui_exposure_regions.png) | ![Exposure mode with CC24 chart placed](docs/gui_exposure_chart.png) |
+| *Paired sample rectangles on HDR + reference (whichever view is showing). Outliner row per pair with a colour swatch, name, and per-pair RMSE. Solver fits per-channel gain or gain + gamma.* | *24-patch CC24 chart placed on a real X-Rite target visible in the HDR. Cells show the reference colours overlaid for alignment — drag the white corner handles to refine. Fit modes: exposure, white-balance, or full 3×3 matrix.* |
 
 <!--
 GitHub's README renderer only inlines <video> tags whose src is an absolute
