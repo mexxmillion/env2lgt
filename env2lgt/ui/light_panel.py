@@ -539,6 +539,18 @@ class LightPanel(QWidget):
         if self._sel_name:
             self.window_toggled.emit(self._sel_name, checked)
 
+    def set_window_checkbox(self, name: str, is_window: bool) -> None:
+        """Point the window checkbox at `name` (empty string → disabled)."""
+        self._sel_name = name or ""
+        self._window_cb.blockSignals(True)
+        self._window_cb.setEnabled(bool(name))
+        self._window_cb.setChecked(bool(is_window))
+        self._window_cb.blockSignals(False)
+
+    def _on_window_toggled(self, checked: bool):
+        if self._sel_name:
+            self.window_toggled.emit(self._sel_name, checked)
+
     def _on_item_changed(self, item: QListWidgetItem):
         if self._suppress_item_changed:
             return
