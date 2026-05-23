@@ -574,15 +574,17 @@ class MainWindow(QMainWindow):
         m_tools.addAction(act_exposure)
         m_tools.addSeparator()
         m_usdview = m_tools.addMenu("Open last bake in usdview")
-        act_uv_light = QAction("Light rig", self)
+        # Composed stage is the default — sublayers light rig + depth mesh.
+        act_uv_scene = QAction("Scene (light rig + depth mesh)", self)
+        act_uv_scene.triggered.connect(lambda: self._launch_usdview("scene"))
+        m_usdview.addAction(act_uv_scene)
+        m_usdview.addSeparator()
+        act_uv_light = QAction("Light rig only", self)
         act_uv_light.triggered.connect(lambda: self._launch_usdview("light"))
         m_usdview.addAction(act_uv_light)
-        act_uv_mesh = QAction("Depth mesh", self)
+        act_uv_mesh = QAction("Depth mesh only", self)
         act_uv_mesh.triggered.connect(lambda: self._launch_usdview("mesh"))
         m_usdview.addAction(act_uv_mesh)
-        act_uv_both = QAction("Light rig + depth mesh (layered)", self)
-        act_uv_both.triggered.connect(lambda: self._launch_usdview("both"))
-        m_usdview.addAction(act_uv_both)
 
         # ---- View / Colour management ----
         from PySide6.QtGui import QActionGroup
@@ -2938,7 +2940,11 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Bake complete",
-            f"USD: {usd}\nDome: {summary.get('dome')}\nRect lights: {n}\n\nOpen via Tools → usdview.",
+            f"Composed scene: {Path(usd).parent / 'scene.usda'}\n"
+            f"Light rig:      {usd}\n"
+            f"Dome:           {summary.get('dome')}\n"
+            f"Rect lights:    {n}\n\n"
+            "Open via Tools → usdview (defaults to the composed scene).",
         )
 
     def _on_bake_failed(self, msg: str):
@@ -2981,15 +2987,21 @@ class MainWindow(QMainWindow):
         combined.write_text("\n".join(lines))
         return combined
 
-    def _launch_usdview(self, kind: str = "light"):
-        """Open a baked stage in usdview. `kind` is 'light', 'mesh', or 'both'
-        (the light rig layered over the depth mesh)."""
+    def _launch_usdview(self, kind: str = "scene"):
+        """Open a baked stage in usdview. `kind` is one of:
+          'scene'  — the composed scene.usda (light rig + depth mesh
+                     sublayered; degrades to whichever was exported). The
+                     default — what the user usually wants.
+          'light'  — just the light rig (no geometry).
+          'mesh'   — just the depth-mesh validation stage.
+          'both'   — alias of 'scene', kept for the menu wording."""
         if kind == "mesh":
             target, label = self._last_mesh, "depth mesh"
-        elif kind == "both":
-            target, label = self._write_combined_layer(), "light rig + depth mesh"
-        else:
+        elif kind == "light":
             target, label = self._last_usd, "light rig"
+        else:
+            # 'scene' / 'both' / anything unknown → load the composed stage.
+            target, label = self._write_combined_layer(), "scene (light rig + depth mesh)"
         if target is None or not Path(target).exists():
             QMessageBox.information(
                 self, "usdview",

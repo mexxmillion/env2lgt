@@ -147,14 +147,57 @@ Press **E** (or the toolbar button / *Tools → Exposure mode*) to enter exposur
 - **White balance** — Lightroom-style **Temperature** + **Tint** sliders. The **WB eyedropper** samples a rectangle over something neutral and back-solves the sliders.
 - **Auto exposure + WB** — "convolve the dome": renders a cosine-weighted Lambertian gray ball lit by the whole panorama and sets exposure + WB from it.
 
-### Colour-checker chart
+### Reference colour matching
+
+Three workflows for matching an HDRI to a known chart or a reference plate. They live under the **Calibration** group in the exposure panel and share a single "active correction" pill at the top so you always know which sub-mode is driving the displayed image. All three feed into the same apply path (preview + bake), so flipping between modes is non-destructive — each keeps its own state until you press *Clear*.
+
+All three operate **after** the OCIO input transform, in the scene-linear working space. Load a reference photo with *Load reference…* (8-bit images auto-tagged as sRGB, EXR/HDR through OpenImageIO, override the colorspace from the panel if the auto-detect is wrong).
+
+#### Chart — 24-patch ColorChecker
 
 Match an HDRI to a known chart or a reference plate (MMColorTarget-style):
 
-1. **Pick colour chart** — click the 4 corners of a 24-patch ColorChecker on the panorama (dark-skin patch first, then clockwise). The overlay curves along the equirect projection and fills each cell with the reference colour so you can line it up by eye; drag the handles to refine.
-2. **Target** — the built-in **CC24** reference, a custom 24-swatch **JSON** target, or a **reference image**: *Load reference image…* opens a regular 2D photo into the viewer (HDRI ⇄ Reference toggle), where you place a flat chart and match against it.
-3. **Fit** — exposure-only, white-balance, or a full **3×3 matrix**, solved by least squares. The RMSE is reported; the correction bakes into the rig.
-4. **Save / load correction** — export the solved correction (matrix + fit mode + target) to a JSON file, and reload it on other HDRIs. Solve once, then batch-match every panorama from the same shoot without re-placing a chart.
+1. **Pick chart** — click the 4 corners of a 24-patch ColorChecker on the panorama (dark-skin patch first, then clockwise). The overlay curves along the equirect projection and fills each cell with the reference colour so you can line it up by eye; drag the handles to refine.
+2. **Target** — the built-in **CC24** reference, a custom 24-swatch **JSON** target, or a **Reference** photo: place a flat chart on the loaded reference image and match against it.
+3. **Fit** — exposure-only, white-balance, or a full **3×3 matrix**, solved by least squares. The RMSE is reported; the correction bakes into the rig. A guard refuses to apply if the fit is obviously degenerate (low sample variance, runaway matrix entries, or RMSE above a sane threshold) — chart-on-grass user error gets caught instead of nuking the panorama.
+4. **Save / load correction** — export the solved correction (matrix + fit mode + target) to JSON and reload it on other HDRIs. Solve once, batch-match every panorama from the same shoot without re-placing a chart.
+
+#### Regions — paired sample rectangles
+
+When the HDRI **doesn't contain a physical chart** but you still have a reference photo of the same scene (or any matching object — a wall colour, a car panel), drop **paired sample rectangles** instead. Common case: on-set bracketed photo for grade reference vs. an HDRI captured an hour later.
+
+1. **Add pair** — drops a centred rectangle on **both** views (HDR and reference) using the current yaw as the anchor. Each pair gets a colour from a cycling palette, a numbered/named row in the outliner, and a per-pair RMSE column after solving.
+2. **Refine** — every rect has 4 corner handles **and** a centre `+` handle for body-drag. Move them so each pair points at the *same physical surface* in both images (a flat-painted wall, a car panel, a uniform piece of carpet). The HDR rects are stored in **absolute** UV so they follow the panorama when you scrub the yaw slider; you can roll yaw to bring a region of interest into view before placing.
+3. **Solve** — per-channel **gain** (one scalar per channel, the honest default for properly-IDT'd linear data) or **gain + gamma** (fits `log(ref) = log(gain) + γ · log(hdr)` per channel by least squares — opt in when "linear" isn't really linear, e.g. a JPEG mis-tagged as sRGB or a tone-curve baked into the HDR).
+4. **Robustness** — the solver auto-falls-back to gain-only when the gamma fit would be underdetermined (n < 3 pairs, or pairs too clustered in log-luma to identify the slope). The effective fit mode + a one-line note are surfaced in the status so you know what actually happened.
+5. **Outliner selection** — drag-marquee a region in the viewport and the outliner row ticks. Press **Delete** to remove. Selection round-trips both ways.
+
+Best practice: pick 3+ pairs of dissimilar luminance (one dark surface, one mid, one bright). Avoid speculars, edges, and saturated colours (the model is a per-channel gain; cross-channel mixing isn't captured). The "Active correction" pill reports `Regions (gain) applied — RMSE 0.0042` etc.
+
+#### Auto — NLE-style whole-image match
+
+When you want a fast "make the HDRI look like the reference" with no manual picking, hit **⚡ Auto match**. Inspired by Avid / Final Cut "match colour" and Resolve's auto-grade.
+
+The algorithm, per channel, in linear working space:
+
+1. **Clip the HDR at the 99th percentile.** Suns, lamps, and other bright outliers wildly skew global statistics — the percentile clamp keeps them from poisoning the gains.
+2. **Take two anchor quantiles** in each image — `Q25` and `Q50`.
+3. **Fit** in *gain* mode: `gain = ref_Q50 / hdr_Q50`. Or in *gain + gamma* mode: `gamma = log(ref_Q50/ref_Q25) / log(hdr_Q50/hdr_Q25)`, then `gain = ref_Q50 / hdr_Q50 ** gamma`.
+
+The output feeds the same `apply_gain_gamma` pipeline as Regions, so preview and bake just work.
+
+When to use which:
+
+| Situation                                          | Best mode |
+|----------------------------------------------------|-----------|
+| Physical CC24 in the HDRI                          | **Chart** |
+| Reference photo of the same scene, no chart        | **Regions** |
+| Wildly different framing in HDR vs reference       | **Auto**  |
+| Quick first-pass grade match                       | **Auto**  |
+| Precise colour-managed delivery                    | Chart > Regions > Auto |
+| HDR with practicals already burned into the dome   | Regions (avoid sampling those areas) |
+
+> Note on linear-pipeline honesty: **gain only is the right default** in a properly OCIO-managed scene-linear flow. The only physically meaningful difference between two correctly-IDT'd linear captures is a per-channel scalar (exposure + white-balance drift). Gamma is a non-linearity fudge knob — useful when something upstream isn't actually linear (mis-tagged JPEG, log curve, baked tone-curve), but if you've done the colour management correctly the recovered gammas should land near 1.0.
 
 ### Colour management
 
