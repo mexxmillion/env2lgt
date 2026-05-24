@@ -810,6 +810,11 @@ class MainWindow(QMainWindow):
         )
 
     def _open_recent(self, path: str) -> None:
+        """Open a recently-used EXR. If there's a sibling .env2lgt.json
+        project, auto-apply it without prompting — the user already worked
+        on this file before, restoring their saved quads / calibration is
+        the obviously-wanted behaviour. Falls back to a plain EXR open if
+        no sibling project exists."""
         p = Path(path)
         if not p.exists():
             QMessageBox.warning(
@@ -818,6 +823,28 @@ class MainWindow(QMainWindow):
             recent = [r for r in self._recent_paths() if r != str(p.resolve())]
             self._settings().setValue("recentFiles", recent)
             self._rebuild_recent_menu()
+            return
+        sibling = default_project_path(p)
+        if sibling.exists():
+            try:
+                proj = load_project(sibling)
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.warning(
+                    self, "Open recent",
+                    f"Found {sibling.name} but couldn't read it:\n{e}\n\n"
+                    "Loading the EXR alone instead.",
+                )
+                self._load_exr(p)
+                return
+            # Suppress the sibling-restore prompt — we're going to apply the
+            # project explicitly. _apply_project_state is idempotent, so the
+            # double-apply guard is defence in depth.
+            self._load_exr(p, prompt_sibling_restore=False)
+            self._apply_project_state(proj)
+            self._set_status(
+                f"{p.name}  ·  restored {len(proj.quads)} quad(s) "
+                f"from {sibling.name}"
+            )
             return
         self._load_exr(p)
 
