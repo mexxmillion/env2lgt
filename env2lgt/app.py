@@ -834,7 +834,12 @@ class MainWindow(QMainWindow):
         if path:
             self._load_exr(Path(path))
 
-    def _load_exr(self, path: Path):
+    def _load_exr(self, path: Path, *, prompt_sibling_restore: bool = True):
+        """Load an EXR. By default, if a sibling .env2lgt.json project is
+        found, prompt the user whether to restore from it. Pass
+        ``prompt_sibling_restore=False`` when the caller is already going to
+        apply a project explicitly (e.g. Open Project) — otherwise the prompt
+        fires and the explicit apply runs after, doubling everything."""
         try:
             hdr = load_latlong(path)
         except Exception as e:  # noqa: BLE001
@@ -1001,25 +1006,28 @@ class MainWindow(QMainWindow):
         h, w, _ = self._hdr.shape
         self._set_status(f"{path.name}  ·  {w}×{h}  ·  float32")
 
-        # Look for a sibling project file and offer to restore.
-        sibling = default_project_path(path)
-        if sibling.exists():
-            ret = QMessageBox.question(
-                self,
-                "Restore project?",
-                f"Found a saved env2lgt project for this EXR:\n  {sibling.name}\n\n"
-                "Restore the quads + settings from it?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if ret == QMessageBox.StandardButton.Yes:
-                try:
-                    proj = load_project(sibling)
-                    self._apply_project_state(proj)
-                    self._set_status(
-                        f"Restored {len(proj.quads)} quad(s) from {sibling.name}"
-                    )
-                except Exception as e:  # noqa: BLE001
-                    QMessageBox.warning(self, "Load project", f"Failed to read {sibling.name}:\n{e}")
+        # Look for a sibling project file and offer to restore (only on a
+        # plain EXR open — Open Project applies its own project explicitly
+        # and passes prompt_sibling_restore=False to avoid a double-apply).
+        if prompt_sibling_restore:
+            sibling = default_project_path(path)
+            if sibling.exists():
+                ret = QMessageBox.question(
+                    self,
+                    "Restore project?",
+                    f"Found a saved env2lgt project for this EXR:\n  {sibling.name}\n\n"
+                    "Restore the quads + settings from it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if ret == QMessageBox.StandardButton.Yes:
+                    try:
+                        proj = load_project(sibling)
+                        self._apply_project_state(proj)
+                        self._set_status(
+                            f"Restored {len(proj.quads)} quad(s) from {sibling.name}"
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        QMessageBox.warning(self, "Load project", f"Failed to read {sibling.name}:\n{e}")
 
     # drag-and-drop
     def dragEnterEvent(self, e):  # noqa: N802
@@ -2541,10 +2549,10 @@ class MainWindow(QMainWindow):
                     "Move/restore the EXR or save a new project.",
                 )
                 return
-        self._load_exr(exr_path)
-        # `_load_exr` also probes for a sibling project and may prompt to
-        # restore from it (could be the same file we just opened, or a different
-        # one). Either way, force-apply the project the user explicitly opened.
+        # Suppress the sibling-restore prompt — we're about to apply this
+        # project explicitly. (Without this we'd prompt the user and then
+        # apply on top, doubling every quad / chart / region.)
+        self._load_exr(exr_path, prompt_sibling_restore=False)
         self._apply_project_state(proj)
         self._set_status(
             f"Project loaded: {Path(path).name}  ·  {len(proj.quads)} quad(s)"
@@ -2597,7 +2605,25 @@ class MainWindow(QMainWindow):
 
     def _apply_project_state(self, proj: Project) -> None:
         """Restore quads + scene + export state from a parsed Project. Assumes
-        the matching EXR is already loaded (state cleared by _load_exr)."""
+        the matching EXR is already loaded (state cleared by _load_exr).
+
+        Idempotent: any quads / regions / chart that happen to already exist
+        in the viewer get wiped first so a double-apply (e.g. the user said
+        Yes to sibling-restore *and* then loaded a project explicitly) can't
+        duplicate things. _load_exr already resets most baseline state but
+        not the viewer scene items themselves."""
+        # Wipe any pre-existing scene state before applying. Don't trust the
+        # earlier _load_exr to have cleared it — a sibling-restore could
+        # have populated it between the two calls.
+        for q in list(self.viewer.quads()):
+            self.viewer.remove_quad(q.name)
+            self.panel.remove_quad(q.name)
+        self.viewer.clear_chart()
+        self.viewer.set_region_pairs([])
+        self._region_pairs = []
+        self._region_gains = None
+        self._region_gammas = None
+        self._cc_matrix = None
         # Scene state
         self._scene_scale = float(proj.scene.scene_scale)
         self.panel.opt_scene_scale.setValue(self._scene_scale)
